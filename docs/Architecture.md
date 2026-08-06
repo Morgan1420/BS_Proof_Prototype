@@ -137,6 +137,27 @@ Claims are assigned directional scores ($+1.0$ positive, $0.0$ neutral, $-1.0$ a
 
 $$\text{Consensus Score} = \frac{\sum (\text{Directional Value} \times W_{\text{paper}})}{\sum W_{\text{paper}}}$$
 
+### 3. Composite Score, Grade & Confidence (implementation note, Step 4)
+
+This spec originally left several calibration constants unspecified. `app/services/consensus_engine.py` fills them in as follows; treat these as tunable, not canonical:
+
+* *Sample Size penalty magnitude:* the spec says "penalty if $n < 30$" but not by how much -- implemented as a **0.75x** multiplier on $W_{paper}$ (25% reduction). A paper with no detectable sample size is not penalized.
+* *Journal Quality (SCImago/DOAJ) filtering:* **not implemented** -- out of scope for Step 4; `W_{paper}` is currently just $W_{tier} \times$ (sample-size modifier) $\times$ (COI modifier).
+* *Composite score (0-100):* the ingredient-level Consensus Score (pooled across all evaluated papers, range $[-1, 1]$) is linearly rescaled: $\text{composite\_score} = (\text{Consensus Score} + 1) / 2 \times 100$.
+* *Evidence grade (A-F):* thresholded directly from `composite_score` using conventional bands (A $\geq$ 90, B $\geq$ 80, C $\geq$ 70, D $\geq$ 60, else F).
+* *Evidence confidence score (0-1):* distinct from the composite score -- reflects evidence *volume and quality*, not directionality: $\text{confidence} = \text{avg}(W_{paper}) \times \min(1, \text{papers\_evaluated} / 10)$, where 10 mirrors the "Top 10 Papers" retrieval target from Phase 2.
+* *Per-claim evidence_level (High/Moderate/Low):* thresholded from the claim group's average $W_{paper}$ (High $\geq$ 0.75, Moderate $\geq$ 0.40, else Low).
+* *No evaluable papers* (empty PubMed result, or the LLM Paper Evaluator call fails outright): degrades to `composite_score: 0`, `overall_confidence_score: 0`, `evidence_grade: "F"`, `validated_claims: []`, rather than raising -- consistent with this project's Non-Blocking Fallbacks decision.
+* *`dosage_benchmarks` / `safety_and_side_effects` (implementation note, Step 5):* the Consensus Engine does not compute these -- dose-response and adverse-event extraction is a separate, not-yet-built step. Both fields are nullable on `IngredientGradeSchema` and are `None` (not a fabricated placeholder) until that step exists.
+
+### API Surface (implementation note, Step 5)
+
+`app/main.py` + `app/api/v1/endpoints/scan.py` expose the Phase 1 -> Phase 2 pipeline over HTTP:
+
+* `POST /api/v1/scan` -- accepts a label image upload, runs Vision Parsing (Phase 1) synchronously, and returns a `job_id` plus the raw ingredient list immediately (HTTP 202). PubMed retrieval + Consensus Engine scoring (Phase 2) for every ingredient then runs as a FastAPI `BackgroundTasks` job.
+* `GET /api/v1/ingredients/{ingredient_id}` -- returns the `IngredientGradeSchema` once background grading completes (200), a lightweight `{status: "processing"}` body while it's still running (202), a `{status: "failed", error}` body if grading errored for that ingredient (200), or 404 if the id is unknown.
+* Job/ingredient state is held in a process-local in-memory store (`app/services/pipeline.py`) -- **not persistent, not multi-worker safe**. This stands in for the "Store SIFG JSON in Database Cache" step in the Phase 2 diagram until real persistence (e.g. Postgres via SQLAlchemy, per `database_url` in `Settings`) is added.
+
 ### JSON Schema: Standardized Ingredient Grade Schema (SIFG)
 
 ```json
@@ -145,6 +166,7 @@ $$\text{Consensus Score} = \frac{\sum (\text{Directional Value} \times W_{\text{
   "canonical_name": "Withania Somnifera",
   "evidence_summary": {
     "total_papers_analyzed": 10,
+    "composite_score": 91.5,
     "evidence_grade": "A",
     "overall_confidence_score": 0.88
   },
