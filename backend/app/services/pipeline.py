@@ -69,10 +69,19 @@ class ScanJobStatus(str, Enum):
 
 
 class IngredientJobEntry(BaseModel):
-    """A single ingredient's status within one scan job."""
+    """A single ingredient's status within one scan job.
+
+    ``dose_amount`` / ``dose_unit`` are carried straight through from the
+    Phase 1 vision extraction (``ProductIngredient``) -- this is what was
+    actually printed on the label, not an evidence-based recommendation,
+    so it's safe to surface as-is (unlike ``dosage_benchmarks`` on the
+    SIFG grade, which this pipeline deliberately never fabricates).
+    """
 
     ingredient_id: str
     raw_name: str
+    dose_amount: Optional[float] = None
+    dose_unit: Optional[str] = None
     status: IngredientStatus = IngredientStatus.PENDING
     error: Optional[str] = None
 
@@ -207,7 +216,12 @@ class GradingPipeline:
         payload = await self._vision_parser.parse_label_image(image)
 
         ingredients = [
-            IngredientJobEntry(ingredient_id=self._resolve_ingredient_id(ing), raw_name=ing.raw_name)
+            IngredientJobEntry(
+                ingredient_id=self._resolve_ingredient_id(ing),
+                raw_name=ing.raw_name,
+                dose_amount=ing.dose_amount,
+                dose_unit=ing.dose_unit,
+            )
             for ing in payload.product_ingredients
         ]
 

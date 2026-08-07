@@ -129,6 +129,8 @@ class TestScanEndpoint:
         assert body["product_metadata"]["brand_name"] == "Example Labs"
         assert len(body["ingredients"]) == 1
         assert body["ingredients"][0]["raw_name"] == "Ashwagandha"
+        assert body["ingredients"][0]["dose_amount"] == 600
+        assert body["ingredients"][0]["dose_unit"] == "mg"
         assert body["ingredients"][0]["status"] == "pending"
         assert body["ingredients"][0]["ingredient_id"].startswith("ing_")
 
