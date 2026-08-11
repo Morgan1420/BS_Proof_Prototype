@@ -2,7 +2,7 @@ import React from "react";
 import { Pressable, StyleSheet, Text } from "react-native";
 
 /** The primary action button, positioned directly below the upload section. */
-export default function ScanButton({ onPress, disabled, label = "Scan Label & Grade" }) {
+export default function ScanButton({ onPress, disabled, label = "Scan Label" }) {
   return (
     <Pressable
       onPress={onPress}

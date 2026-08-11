@@ -2,7 +2,6 @@ annotated-doc==0.0.5
 annotated-types==0.8.0
 anyio==4.13.0
 argcomplete==3.6.3
-biopython==1.87
 blivet @ file:///builddir/build/BUILD/python-blivet-3.13.2-build/blivet-3.13.2
 Brlapi==0.8.7
 certifi==2026.1.4

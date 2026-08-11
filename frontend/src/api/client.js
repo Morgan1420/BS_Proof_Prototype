@@ -1,19 +1,24 @@
-// Thin API client for the FastAPI backend (see backend/app/api/v1/endpoints/scan.py).
+// Thin API client for the FastAPI backend (see backend/app/api/routes.py).
 import axios from "axios";
 import { Platform } from "react-native";
 import { API_BASE_URL } from "../config";
 
 const client = axios.create({
   baseURL: API_BASE_URL,
-  timeout: 30000,
+  // A single Gemini vision call can still legitimately take a while once
+  // the backend's rate-limit handling kicks in (see gemini_client.py's
+  // RATE_LIMIT_MAX_RETRIES / instant model rotation). 10 minutes gives
+  // real headroom without disabling the timeout outright (timeout: 0),
+  // which would leave the UI stuck forever on a truly dead connection.
+  timeout: 600000,
 });
 
 /**
- * Upload a label image and kick off Phase 1 (vision parsing, synchronous)
- * plus Phase 2 (PubMed retrieval + consensus scoring, background) grading.
+ * Upload a label image and get back the extracted ScanResult immediately.
  *
- * Returns the backend's ScanResponse:
- *   { job_id, status, product_metadata, match_status, ingredients }
+ * The backend now does ONE thing per scan -- a single Gemini vision call
+ * (POST /api/scan) -- and returns the full result synchronously; there's
+ * no job id, no background grading, and nothing to poll for.
  *
  * `image` is an asset object from expo-image-picker's launch*Async result
  * (`result.assets[0]`) -- needs `.uri`, and ideally `.fileName` / `.mimeType`
@@ -43,30 +48,32 @@ export async function scanLabel(image) {
 }
 
 /**
- * Fetch the current status/grade for one ingredient
- * (GET /api/v1/ingredients/{ingredient_id}).
+ * Fetch every scan saved so far (GET /api/ingredients), straight from
+ * the backend's data/scanned_ingredients.json.
  *
- * Normalizes the backend's three possible response shapes into one:
- *   - { done: true,  failed: false, grade: <IngredientGradeSchema> }
- *   - { done: true,  failed: true,  error: string }
- *   - { done: false, status: "pending" | "processing" }
+ * Returns an array of ScanResult objects:
+ *   [{ scan_id, scanned_at, product: {...}, ingredients: [...] }, ...]
  */
-export async function getIngredientGrade(ingredientId) {
-  const response = await client.get(`/ingredients/${ingredientId}`, {
-    validateStatus: (status) => status === 200 || status === 202 || status === 404,
-  });
+export async function getIngredients() {
+  const response = await client.get("/ingredients");
+  return response.data;
+}
 
-  if (response.status === 404) {
-    return { done: true, failed: true, error: "Ingredient not found." };
-  }
-  if (response.status === 202) {
-    return { done: false, status: response.data.status };
-  }
-  // 200: either a completed IngredientGradeSchema, or a {status:"failed", error} body.
-  if (response.data && response.data.status === "failed") {
-    return { done: true, failed: true, error: response.data.error || "Grading failed." };
-  }
-  return { done: true, failed: false, grade: response.data };
+/**
+ * Grade exactly one saved ingredient (POST /api/ingredients/{id}/grade):
+ * a real PubMed literature search + one Gemini SIFG evaluation call for
+ * that ingredient only. Can legitimately take a while (same Gemini
+ * rate-limit pause as a scan), which is why this shares the client's
+ * long default timeout.
+ *
+ * Returns the updated ingredient object -- `grade_status: "graded"` plus
+ * `sifg_grade` / `sifg_score` / `efficacy_safety_evaluation` /
+ * `dosage_appropriateness` / `evidence_summary` / `raw_consensus` /
+ * `graded_at` -- ready to replace the ingredient's row in place.
+ */
+export async function gradeIngredient(ingredientId) {
+  const response = await client.post(`/ingredients/${ingredientId}/grade`);
+  return response.data;
 }
 
 function guessMimeType(fileName) {

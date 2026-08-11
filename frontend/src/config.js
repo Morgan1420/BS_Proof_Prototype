@@ -17,10 +17,4 @@ import { Platform } from "react-native";
 const DEFAULT_HOST = Platform.OS === "android" ? "10.0.2.2" : "localhost";
 
 export const API_BASE_URL =
-  process.env.EXPO_PUBLIC_API_BASE_URL || `http://${DEFAULT_HOST}:8000/api/v1`;
-
-// How often (ms) to poll GET /ingredients/{id} while a scan is in progress.
-export const POLL_INTERVAL_MS = 2500;
-
-// Give up polling a single ingredient after this long (ms) and surface a timeout.
-export const POLL_TIMEOUT_MS = 120000; // 2 minutes
+  process.env.EXPO_PUBLIC_API_BASE_URL || `http://${DEFAULT_HOST}:8000/api`;
