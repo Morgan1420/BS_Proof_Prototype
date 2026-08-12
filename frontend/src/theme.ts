@@ -43,3 +43,15 @@ export const spacing = {
   lg: 24,
   xl: 32,
 } as const;
+
+/**
+ * Global layout rules shared across screens.
+ *
+ * `screenHorizontalPadding` is applied to each screen's main body
+ * container (Home's info section, Scan's body, Library's body, Results'
+ * header + list). It is deliberately NOT applied to NavBar, Footer, or
+ * HomeScreen's Hero section — those stay full-width edge-to-edge.
+ */
+export const layout = {
+  screenHorizontalPadding: '20%',
+} as const;

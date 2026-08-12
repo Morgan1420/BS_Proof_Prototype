@@ -12,7 +12,7 @@ import {
 import ImageUploader from '../components/ImageUploader';
 import Footer from '../components/Footer';
 import { uploadSupplementImage } from '../services/api';
-import { colors, spacing, typography } from '../theme';
+import { colors, layout, spacing, typography } from '../theme';
 
 /**
  * Screen state. `result` is intentionally `unknown` rather than the
@@ -62,41 +62,46 @@ const ScanScreen: React.FC = () => {
 
   return (
     <ScrollView style={styles.screen} contentContainerStyle={styles.content}>
-      <Text style={styles.title}>Scan Supplement</Text>
+      {/* Centered/padded scan UI lives in its own wrapper so Footer (a
+          sibling below it) isn't shrink-wrapped or inset by this
+          container's alignItems/padding. */}
+      <View style={styles.body}>
+        <Text style={styles.title}>Scan Supplement</Text>
 
-      <ImageUploader
-        imageUri={imageUri}
-        onImageSelected={handleImageSelected}
-      />
+        <ImageUploader
+          imageUri={imageUri}
+          onImageSelected={handleImageSelected}
+        />
 
-      <Pressable
-        style={[
-          styles.analyzeButton,
-          isAnalyzeDisabled && styles.analyzeButtonDisabled,
-        ]}
-        onPress={handleAnalyze}
-        disabled={isAnalyzeDisabled}
-        accessibilityRole="button"
-        accessibilityLabel="Analyze Label"
-        accessibilityState={{ disabled: isAnalyzeDisabled, busy: isLoading }}
-      >
-        {isLoading ? (
-          <ActivityIndicator color={colors.offWhite} />
-        ) : (
-          <Text style={styles.analyzeButtonText}>Analyze Label</Text>
+        <Pressable
+          style={[
+            styles.analyzeButton,
+            isAnalyzeDisabled && styles.analyzeButtonDisabled,
+          ]}
+          onPress={handleAnalyze}
+          disabled={isAnalyzeDisabled}
+          accessibilityRole="button"
+          accessibilityLabel="Analyze Label"
+          accessibilityState={{ disabled: isAnalyzeDisabled, busy: isLoading }}
+        >
+          {isLoading ? (
+            <ActivityIndicator color={colors.offWhite} />
+          ) : (
+            <Text style={styles.analyzeButtonText}>Analyze Label</Text>
+          )}
+        </Pressable>
+
+        {result !== null && (
+          <View style={styles.resultsContainer}>
+            <Text style={styles.resultsTitle}>Result</Text>
+            <ScrollView style={styles.resultsScroll}>
+              <Text style={styles.resultsText}>
+                {JSON.stringify(result, null, 2)}
+              </Text>
+            </ScrollView>
+          </View>
         )}
-      </Pressable>
-
-      {result !== null && (
-        <View style={styles.resultsContainer}>
-          <Text style={styles.resultsTitle}>Result</Text>
-          <ScrollView style={styles.resultsScroll}>
-            <Text style={styles.resultsText}>
-              {JSON.stringify(result, null, 2)}
-            </Text>
-          </ScrollView>
-        </View>
-      )}
+      </View>
 
       <View style={styles.footerSpacer} />
       <Footer />
@@ -109,11 +114,16 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: colors.offWhite,
   },
+  // No alignItems/padding here — those live on `body` below. Keeping this
+  // container plain (default alignItems: 'stretch', no horizontal inset)
+  // is what lets Footer span the full screen width edge-to-edge.
   content: {
     flexGrow: 1,
+  },
+  body: {
     alignItems: 'center',
     paddingTop: spacing.lg,
-    paddingHorizontal: spacing.lg,
+    paddingHorizontal: layout.screenHorizontalPadding,
     gap: spacing.lg,
   },
   title: {

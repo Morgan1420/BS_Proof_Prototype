@@ -9,6 +9,7 @@ import NavBar from './components/NavBar';
 import HomeScreen from './screens/HomeScreen';
 import ScanScreen from './screens/ScanScreen';
 import LibraryScreen from './screens/LibraryScreen';
+import ResultsScreen from './screens/ResultsScreen';
 import { navigationRef } from './navigation/navigationRef';
 import type { RootStackParamList } from './navigation/types';
 import { colors } from './theme';
@@ -36,6 +37,7 @@ const App: React.FC = () => {
               <Stack.Screen name="HomeScreen" component={HomeScreen} />
               <Stack.Screen name="ScanScreen" component={ScanScreen} />
               <Stack.Screen name="LibraryScreen" component={LibraryScreen} />
+              <Stack.Screen name="ResultsScreen" component={ResultsScreen} />
             </Stack.Navigator>
           </View>
         </View>

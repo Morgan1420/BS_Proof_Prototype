@@ -143,3 +143,238 @@ export async function uploadSupplementImage(
 
   return (await response.json()) as ScanResponse;
 }
+
+// ---------------------------------------------------------------------
+// Supplement search / suggest (GET /api/v1/supplements/*)
+// ---------------------------------------------------------------------
+
+/** Mirrors the backend's FilterType enum (app/schemas/search.py). */
+export type FilterType = 'all' | 'products' | 'ingredients';
+
+/** Mirrors the backend's ResultType enum (app/schemas/search.py). */
+export type ResultType = 'product' | 'ingredient';
+
+/** Shape of the JSON body returned by GET /api/v1/supplements/suggest. */
+export interface SuggestResponse {
+  query: string;
+  suggestions: string[];
+}
+
+/**
+ * A single Ingredient joined with one Product's specific dosage for it —
+ * mirrors the backend's LinkedIngredientResponse (app/schemas/supplement.py).
+ * `amount`/`unit`/`daily_value_percentage` come from the
+ * ProductIngredientLink junction row; `recommended_daily_dosage`/
+ * `scientific_data` come from the canonical Ingredient row.
+ */
+export interface LinkedIngredient {
+  id: number;
+  name: string;
+  amount?: string | null;
+  unit?: string | null;
+  daily_value_percentage?: string | null;
+  recommended_daily_dosage?: string | null;
+  scientific_data?: string | null;
+}
+
+/**
+ * A single search/browse result, matching the backend's SearchResultItem.
+ * `type` determines which of the optional fields are populated: `brand`
+ * and `ingredients` for products; `recommended_daily_dosage`/
+ * `scientific_data`/`product_count` for ingredients.
+ *
+ * As of the backend's Many-to-Many schema refactor (Product <->
+ * Ingredient via a ProductIngredientLink junction table), an ingredient
+ * result no longer carries a product-specific dosage (amount/unit/
+ * daily_value) or a single parent product name — Ingredient is now
+ * canonical/shared data that can belong to zero, one, or many products.
+ * Ingredient results instead surface that canonical metadata.
+ *
+ * `ingredients` is populated for product results via an explicit
+ * server-side join (see app/services/search.py::get_linked_ingredients) —
+ * always `[]` for ingredient-type results.
+ */
+export interface SearchResultItem {
+  id: number;
+  type: ResultType;
+  name: string;
+  brand?: string | null;
+  ingredients?: LinkedIngredient[];
+  recommended_daily_dosage?: string | null;
+  scientific_data?: string | null;
+  product_count?: number | null;
+}
+
+/** Shape of the JSON body returned by GET /api/v1/products/{id}. */
+export interface ProductDetailResponse {
+  id: number;
+  name: string;
+  brand?: string | null;
+  serving_size?: string | null;
+  created_at?: string | null;
+  ingredients: LinkedIngredient[];
+}
+
+/** Shape of the JSON body returned by GET /api/v1/supplements/search. */
+export interface SearchResponse {
+  query?: string | null;
+  filter_type: FilterType;
+  count: number;
+  results: SearchResultItem[];
+}
+
+/**
+ * GETs `url` and parses the JSON body as `T`, with the same network-error
+ * and non-2xx handling as uploadSupplementImage above (including FastAPI's
+ * validation-error shape, where `detail` is an array of objects rather
+ * than a plain string).
+ */
+async function getJson<T>(url: string): Promise<T> {
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      method: 'GET',
+      headers: { Accept: 'application/json' },
+    });
+  } catch (networkError) {
+    const reason =
+      networkError instanceof Error
+        ? networkError.message
+        : String(networkError);
+    throw new Error(
+      `Could not reach the server at ${API_BASE_URL}. Check API_BASE_URL in ` +
+        `src/services/api.ts and confirm the backend is running. (${reason})`
+    );
+  }
+
+  if (!response.ok) {
+    let detail = `Request failed with status ${response.status}`;
+    try {
+      const errorBody = (await response.json()) as { detail?: unknown };
+      if (typeof errorBody.detail === 'string') {
+        detail = errorBody.detail;
+      } else if (errorBody.detail) {
+        // FastAPI's 422 validation errors return `detail` as an array of
+        // { loc, msg, type } objects rather than a string.
+        detail = JSON.stringify(errorBody.detail);
+      }
+    } catch {
+      // Response body wasn't JSON; fall back to the generic message above.
+    }
+    throw new Error(detail);
+  }
+
+  return (await response.json()) as T;
+}
+
+/**
+ * Fetches up to `limit` live autocomplete suggestions for `query` from
+ * GET /api/v1/supplements/suggest. The backend itself no-ops (returns an
+ * empty list) for queries shorter than 3 characters, so callers don't
+ * strictly need to guard that — but the Library screen still debounces
+ * and gates on length client-side to avoid firing a request per keystroke.
+ */
+export async function fetchSuggestions(
+  query: string,
+  limit = 5
+): Promise<SuggestResponse> {
+  const params = new URLSearchParams({ query, limit: String(limit) });
+  return getJson<SuggestResponse>(
+    `${API_BASE_URL}/api/v1/supplements/suggest?${params.toString()}`
+  );
+}
+
+/**
+ * Searches or browses products/ingredients via
+ * GET /api/v1/supplements/search. Omitting `query` browses all rows of
+ * `filterType` instead of filtering by name (used by the Library screen's
+ * "Products" / "Ingredients" explore cards).
+ */
+export async function searchSupplements(params: {
+  query?: string;
+  filterType?: FilterType;
+  limit?: number;
+}): Promise<SearchResponse> {
+  const searchParams = new URLSearchParams();
+  if (params.query) {
+    searchParams.set('query', params.query);
+  }
+  if (params.filterType) {
+    searchParams.set('filter_type', params.filterType);
+  }
+  searchParams.set('limit', String(params.limit ?? 20));
+
+  return getJson<SearchResponse>(
+    `${API_BASE_URL}/api/v1/supplements/search?${searchParams.toString()}`
+  );
+}
+
+/**
+ * Fetches a single product with its full linked-ingredient list from
+ * GET /api/v1/products/{id}. Not currently called anywhere in the app —
+ * ResultsScreen/ProductCard get their ingredient data straight from
+ * GET /api/v1/supplements/search's nested `ingredients` field (see
+ * SearchResultItem above) — but this is available for a future
+ * dedicated product-detail screen without another backend round trip.
+ */
+export async function fetchProductDetail(
+  productId: number
+): Promise<ProductDetailResponse> {
+  return getJson<ProductDetailResponse>(
+    `${API_BASE_URL}/api/v1/products/${productId}`
+  );
+}
+
+// ---------------------------------------------------------------------
+// Dev-only debug tools (GET /api/v1/dev/*)
+// ---------------------------------------------------------------------
+
+/** Shape of the JSON body returned by DELETE /api/v1/dev/mock-data. */
+export interface MockDataResetResponse {
+  status: string;
+  message: string;
+}
+
+/**
+ * Dev/debug only: completely wipes every Product/Ingredient/link row on
+ * the backend (not just is_mock=True ones). See NavBar's "Reset DB"
+ * button. Not authenticated — this hits an unauthenticated backend
+ * endpoint intended for local development only (see
+ * backend/app/api/routes.py::delete_mock_data, which now calls
+ * storage.delete_all_data under the hood).
+ */
+export async function resetDatabase(): Promise<MockDataResetResponse> {
+  let response: Response;
+  try {
+    response = await fetch(`${API_BASE_URL}/api/v1/dev/mock-data`, {
+      method: 'DELETE',
+      headers: { Accept: 'application/json' },
+    });
+  } catch (networkError) {
+    const reason =
+      networkError instanceof Error
+        ? networkError.message
+        : String(networkError);
+    throw new Error(
+      `Could not reach the server at ${API_BASE_URL}. Check API_BASE_URL in ` +
+        `src/services/api.ts and confirm the backend is running. (${reason})`
+    );
+  }
+
+  if (!response.ok) {
+    let detail = `Request failed with status ${response.status}`;
+    try {
+      const errorBody = (await response.json()) as { detail?: unknown };
+      if (typeof errorBody.detail === 'string') {
+        detail = errorBody.detail;
+      } else if (errorBody.detail) {
+        detail = JSON.stringify(errorBody.detail);
+      }
+    } catch {
+      // Response body wasn't JSON; fall back to the generic message above.
+    }
+    throw new Error(detail);
+  }
+
+  return (await response.json()) as MockDataResetResponse;
+}

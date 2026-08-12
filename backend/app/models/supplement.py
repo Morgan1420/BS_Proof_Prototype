@@ -1,0 +1,133 @@
+"""SQLModel ORM tables for scanned products and their canonical
+ingredients, related through a Many-to-Many junction table.
+
+Schema (as of the M2M refactor):
+  - Product: one row per scanned product (name, brand, is_mock, created_at).
+  - Ingredient: one row PER CANONICAL COMPOUND, deduplicated by name (e.g.
+    "Creatine Monohydrate" appears once here even if it shows up in five
+    different scanned products). Holds only general/canonical metadata
+    (recommended_daily_dosage, scientific_data placeholders) — see the
+    strict rule below.
+  - ProductIngredientLink: the junction table. Holds the PRODUCT-SPECIFIC
+    dosage (amount, unit, daily_value_percentage) for one
+    product/ingredient pairing.
+
+STRICT RULE: do not add product-specific dosage/percentage/serving-size
+columns to Ingredient. That data belongs on ProductIngredientLink only —
+Ingredient must stay canonical/shared data.
+
+Distinct from the Pydantic I/O models in app/schemas/supplement.py, which
+shape Gemini's structured output and also happen to define an
+`Ingredient` class (for the per-scan shape Gemini returns — not this
+canonical DB row). Import with an alias where both are in scope (see
+app/services/storage.py) to keep them straight.
+"""
+
+
+# Deliberately NOT using `from __future__ import annotations` here: it
+# turns every annotation (including the Relationship() ones below) into a
+# plain string, which trips a strict check in newer SQLAlchemy versions —
+# "expression ... seems to be using a generic class as the argument to
+# relationship()" — since it can no longer distinguish a real `List[...]`
+# generic from an unparsed string. Forward references stay as quoted
+# strings ("Ingredient") instead, which SQLAlchemy resolves normally.
+
+from datetime import datetime, timezone
+from typing import List, Optional
+
+from sqlmodel import Field, Relationship, SQLModel
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+class Product(SQLModel, table=True):
+    """A single scanned supplement product."""
+
+    __tablename__ = "products"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    name: str
+    brand: str
+    is_mock: bool = Field(
+        default=True,
+        description=(
+            "Flags test/scanned data so it can be bulk-deleted via "
+            "DELETE /api/v1/dev/mock-data."
+        ),
+    )
+    created_at: datetime = Field(default_factory=_utcnow, nullable=False)
+
+    # NOTE: despite the field name, this returns ProductIngredientLink
+    # rows (each carrying THIS product's specific amount/unit/%DV for one
+    # ingredient) — not bare Ingredient rows. Use `link.ingredient` to
+    # reach the canonical Ingredient from each item. Named `ingredients`
+    # to match the task's field-naming spec for this model.
+    ingredients: List["ProductIngredientLink"] = Relationship(
+        back_populates="product",
+        # A product's dosage links only make sense attached to that
+        # product: deleting a Product should delete its link rows too.
+        # The linked *Ingredient* rows are NOT cascade-deleted here —
+        # they're canonical/shared and may still be referenced by other
+        # products (see app/services/storage.py::delete_mock_data for how
+        # mock ingredients are cleaned up without orphaning real ones).
+        sa_relationship_kwargs={"cascade": "all, delete-orphan"},
+    )
+
+
+class Ingredient(SQLModel, table=True):
+    """A single canonical ingredient/compound, deduplicated by name and
+    shared across every Product that contains it. Product-specific
+    dosage lives on ProductIngredientLink, NOT here — see the module
+    docstring's strict rule.
+    """
+
+    __tablename__ = "ingredients"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    name: str = Field(unique=True, index=True)
+
+    # General metadata placeholders — not derived from any scan; intended
+    # to be populated separately later (e.g. from a reference database).
+    # Deliberately NOT auto-maintained by storage.py right now (see
+    # docs/Architecture.md for the reasoning).
+    recommended_daily_dosage: str = Field(default="x")
+    product_count: int = Field(default=0)
+    scientific_data: str = Field(default="n/a")
+
+    is_mock: bool = Field(
+        default=True,
+        description=(
+            "Flags test/scanned data so it can be bulk-deleted via "
+            "DELETE /api/v1/dev/mock-data."
+        ),
+    )
+
+    product_links: List["ProductIngredientLink"] = Relationship(
+        back_populates="ingredient",
+    )
+
+
+class ProductIngredientLink(SQLModel, table=True):
+    """Junction table: one row per (product, ingredient) pairing, holding
+    that pairing's product-specific dosage.
+    """
+
+    __tablename__ = "product_ingredient_links"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    product_id: int = Field(foreign_key="products.id")
+    ingredient_id: int = Field(foreign_key="ingredients.id")
+
+    # Kept as `str` rather than `float`: label amounts from Gemini
+    # extraction are already strings, to accommodate ranges/decimals as
+    # printed on the label (e.g. "250-300", "1.5") — see
+    # app/schemas/supplement.py::Ingredient.amount. Coercing to float
+    # here would fail on those non-numeric-but-valid label values.
+    amount: str
+    unit: str
+    daily_value_percentage: Optional[str] = Field(default=None)
+
+    product: Optional[Product] = Relationship(back_populates="ingredients")
+    ingredient: Optional[Ingredient] = Relationship(back_populates="product_links")

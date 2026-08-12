@@ -16,6 +16,11 @@ const Footer: React.FC = () => {
 
 const styles = StyleSheet.create({
   container: {
+    // Explicitly stretch to fill the parent's width regardless of the
+    // parent's own alignItems setting (e.g. a screen that centers its
+    // main content shouldn't shrink-wrap the footer along with it).
+    alignSelf: 'stretch',
+    width: '100%',
     backgroundColor: colors.darkGreen,
     paddingVertical: spacing.lg,
     paddingHorizontal: spacing.md,
