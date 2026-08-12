@@ -1,23 +1,22 @@
 {
   "expo": {
     "name": "BS Proof",
-    "slug": "bs-proof-frontend",
+    "slug": "bs-proof-prototype",
     "version": "1.0.0",
     "orientation": "portrait",
     "userInterfaceStyle": "light",
-    "platforms": ["ios", "android", "web"],
-    "web": {
-      "bundler": "metro"
-    },
     "ios": {
       "supportsTablet": true,
       "infoPlist": {
-        "NSCameraUsageDescription": "Used to take a photo of a supplement label to scan.",
-        "NSPhotoLibraryUsageDescription": "Used to select a photo of a supplement label to scan."
+        "NSPhotoLibraryUsageDescription": "Used to select supplement label photos for scanning."
       }
     },
     "android": {
-      "permissions": ["CAMERA", "READ_EXTERNAL_STORAGE"]
-    }
+      "adaptiveIcon": {
+        "backgroundColor": "#E6F4FE"
+      },
+      "predictiveBackGestureEnabled": false
+    },
+    "web": {}
   }
 }

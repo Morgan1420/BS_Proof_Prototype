@@ -1,27 +1,25 @@
 {
-  "name": "bs-proof-frontend",
+  "name": "frontend_tmp",
   "version": "1.0.0",
-  "private": true,
-  "main": "node_modules/expo/AppEntry.js",
+  "main": "index.ts",
+  "dependencies": {
+    "expo": "~57.0.12",
+    "expo-image-picker": "~57.0.9",
+    "expo-status-bar": "~57.0.1",
+    "react": "19.2.3",
+    "react-dom": "19.2.3",
+    "react-native": "0.86.2",
+    "react-native-web": "^0.21.2"
+  },
+  "devDependencies": {
+    "@types/react": "~19.2.2",
+    "typescript": "~6.0.3"
+  },
   "scripts": {
     "start": "expo start",
     "android": "expo start --android",
     "ios": "expo start --ios",
     "web": "expo start --web"
   },
-  "dependencies": {
-    "@expo/metro-runtime": "~3.2.3",
-    "axios": "^1.7.2",
-    "expo": "~51.0.28",
-    "expo-image-picker": "~15.1.0",
-    "expo-status-bar": "~1.12.1",
-    "react": "18.2.0",
-    "react-dom": "18.2.0",
-    "react-native": "0.74.5",
-    "react-native-web": "~0.19.10"
-  },
-  "devDependencies": {
-    "@babel/core": "^7.24.0",
-    "babel-preset-expo": "~11.0.0"
-  }
+  "private": true
 }
