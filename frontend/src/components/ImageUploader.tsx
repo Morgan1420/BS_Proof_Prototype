@@ -9,6 +9,8 @@ import {
 } from 'react-native';
 import * as ImagePicker from 'expo-image-picker';
 
+import { colors, spacing, typography } from '../theme';
+
 /**
  * Props for the ImageUploader component.
  */
@@ -42,7 +44,7 @@ const ImageUploader: React.FC<ImageUploaderProps> = ({
 
     const result: ImagePicker.ImagePickerResult =
       await ImagePicker.launchImageLibraryAsync({
-        mediaTypes: ImagePicker.MediaTypeOptions.Images,
+        mediaTypes: ['images'],
         allowsEditing: true,
         quality: 1,
       });
@@ -88,28 +90,28 @@ const styles = StyleSheet.create({
   },
   uploadCard: {
     width: 260,
-    paddingVertical: 20,
-    paddingHorizontal: 16,
+    paddingVertical: spacing.lg,
+    paddingHorizontal: spacing.md,
     borderRadius: 12,
     borderWidth: 2,
-    borderColor: '#4A90E2',
+    borderColor: colors.orange,
     borderStyle: 'dashed',
-    backgroundColor: '#F5F9FF',
+    backgroundColor: colors.offWhite,
     alignItems: 'center',
     justifyContent: 'center',
   },
   uploadCardText: {
-    fontSize: 16,
+    fontSize: typography.buttonLabel,
     fontWeight: '600',
-    color: '#4A90E2',
+    color: colors.orange,
     textAlign: 'center',
   },
   previewImage: {
     width: 260,
     height: 260,
-    marginTop: 20,
+    marginTop: spacing.lg,
     borderRadius: 12,
-    backgroundColor: '#EEE',
+    backgroundColor: colors.lightYellow,
   },
 });
 

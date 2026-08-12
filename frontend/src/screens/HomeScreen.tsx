@@ -1,112 +1,154 @@
-import React, { useState, useCallback } from 'react';
-import { View, Text, Pressable, StyleSheet, SafeAreaView } from 'react-native';
-import ImageUploader from '../components/ImageUploader';
+import React from 'react';
+import { View, Text, Pressable, StyleSheet, ScrollView } from 'react-native';
+import { useNavigation } from '@react-navigation/native';
+import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
+
+import Footer from '../components/Footer';
+import { colors, spacing, typography } from '../theme';
+import type { RootStackParamList } from '../navigation/types';
+
+type HomeScreenNavigationProp = NativeStackNavigationProp<
+  RootStackParamList,
+  'HomeScreen'
+>;
+
+/** Repeated placeholder copy for the info section's left column. */
+const PLACEHOLDER_PARAGRAPH = 'BSProof '.repeat(24).trim();
 
 /**
- * Local screen state for the home / upload screen.
- */
-interface HomeScreenState {
-  imageUri: string | null;
-}
-
-/**
- * Landing screen: lets the user pick a supplement label photo, preview it,
- * and kick off analysis. Analysis itself is stubbed out for now — it just
- * logs the picked image URI — pending backend integration
- * (POST /api/v1/scan, see backend/app/services/vision.py).
+ * Marketing home page: Hero with primary/secondary CTAs, an info section
+ * explaining the product, and the shared Footer.
  */
 const HomeScreen: React.FC = () => {
-  const [imageUri, setImageUri] = useState<HomeScreenState['imageUri']>(null);
-
-  const handleImageSelected = useCallback((uri: string | null): void => {
-    setImageUri(uri);
-  }, []);
-
-  /**
-   * Placeholder for the future backend call. Currently just logs the
-   * local image URI to the console.
-   */
-  const handleAnalyze = useCallback((): void => {
-    if (!imageUri) {
-      return;
-    }
-    console.log('Analyze requested for image URI:', imageUri);
-  }, [imageUri]);
-
-  const isAnalyzeDisabled: boolean = imageUri === null;
+  const navigation = useNavigation<HomeScreenNavigationProp>();
 
   return (
-    <SafeAreaView style={styles.safeArea}>
-      <View style={styles.container}>
-        <Text style={styles.title}>Supplement Label Scanner</Text>
-
-        <ImageUploader
-          imageUri={imageUri}
-          onImageSelected={handleImageSelected}
-        />
-
-        <Pressable
-          style={[
-            styles.analyzeButton,
-            isAnalyzeDisabled && styles.analyzeButtonDisabled,
-          ]}
-          onPress={handleAnalyze}
-          disabled={isAnalyzeDisabled}
-          accessibilityRole="button"
-          accessibilityLabel="Analyze Label"
-          accessibilityState={{ disabled: isAnalyzeDisabled }}
-        >
-          <Text
-            style={[
-              styles.analyzeButtonText,
-              isAnalyzeDisabled && styles.analyzeButtonTextDisabled,
-            ]}
+    <ScrollView style={styles.screen} contentContainerStyle={styles.content}>
+      {/* HERO */}
+      <View style={styles.hero}>
+        <Text style={styles.heroTitle}>BS Proof</Text>
+        <View style={styles.heroButtons}>
+          <Pressable
+            style={[styles.heroButton, styles.scanButton]}
+            onPress={() => navigation.navigate('ScanScreen')}
+            accessibilityRole="button"
+            accessibilityLabel="Scan Supplement"
           >
-            Analyze Label
-          </Text>
-        </Pressable>
+            <Text style={styles.scanButtonText}>Scan Supplement</Text>
+          </Pressable>
+          <Pressable
+            style={[styles.heroButton, styles.libraryButton]}
+            onPress={() => navigation.navigate('LibraryScreen')}
+            accessibilityRole="button"
+            accessibilityLabel="Supplement Library"
+          >
+            <Text style={styles.libraryButtonText}>Supplement Library</Text>
+          </Pressable>
+        </View>
       </View>
-    </SafeAreaView>
+
+      {/* INFO */}
+      <View style={styles.infoSection}>
+        <Text style={styles.infoTitle}>Why BSProof?</Text>
+        <View style={styles.infoColumns}>
+          <View style={styles.infoTextColumn}>
+            <Text style={styles.infoParagraph}>{PLACEHOLDER_PARAGRAPH}</Text>
+            <Text style={styles.infoParagraph}>{PLACEHOLDER_PARAGRAPH}</Text>
+            <Text style={styles.infoParagraph}>{PLACEHOLDER_PARAGRAPH}</Text>
+          </View>
+          <View
+            style={styles.infoImagePlaceholder}
+            accessibilityLabel="Image placeholder"
+          />
+        </View>
+      </View>
+
+      <Footer />
+    </ScrollView>
   );
 };
 
 const styles = StyleSheet.create({
-  safeArea: {
+  screen: {
     flex: 1,
-    backgroundColor: '#FFFFFF',
+    backgroundColor: colors.offWhite,
   },
-  container: {
-    flex: 1,
+  content: {
+    flexGrow: 1,
+  },
+  hero: {
+    backgroundColor: colors.lightYellow,
+    paddingVertical: spacing.xl * 1.5,
+    paddingHorizontal: spacing.lg,
     alignItems: 'center',
-    justifyContent: 'center',
-    paddingHorizontal: 24,
-    gap: 24,
   },
-  title: {
-    fontSize: 22,
-    fontWeight: '700',
-    color: '#1A1A1A',
-    marginBottom: 8,
+  heroTitle: {
+    color: colors.brown,
+    fontSize: typography.heroTitle,
+    fontWeight: '800',
     textAlign: 'center',
+    marginBottom: spacing.lg,
   },
-  analyzeButton: {
-    width: 260,
-    paddingVertical: 16,
-    borderRadius: 12,
-    backgroundColor: '#4A90E2',
-    alignItems: 'center',
+  heroButtons: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
     justifyContent: 'center',
+    gap: spacing.md,
   },
-  analyzeButtonDisabled: {
-    backgroundColor: '#CCCCCC',
+  heroButton: {
+    paddingVertical: spacing.md,
+    paddingHorizontal: spacing.lg,
+    borderRadius: 10,
+    minWidth: 180,
+    alignItems: 'center',
   },
-  analyzeButtonText: {
-    fontSize: 16,
-    fontWeight: '600',
-    color: '#FFFFFF',
+  scanButton: {
+    backgroundColor: colors.orange,
   },
-  analyzeButtonTextDisabled: {
-    color: '#888888',
+  scanButtonText: {
+    color: colors.offWhite,
+    fontSize: typography.buttonLabel,
+    fontWeight: '700',
+  },
+  libraryButton: {
+    backgroundColor: colors.yellow,
+  },
+  libraryButtonText: {
+    color: colors.brown,
+    fontSize: typography.buttonLabel,
+    fontWeight: '700',
+  },
+  infoSection: {
+    padding: spacing.lg,
+  },
+  infoTitle: {
+    fontSize: typography.sectionTitle,
+    fontWeight: '700',
+    color: colors.brown,
+    marginBottom: spacing.md,
+    textAlign: 'left',
+  },
+  infoColumns: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: spacing.lg,
+  },
+  infoTextColumn: {
+    flex: 1,
+    minWidth: 200,
+    gap: spacing.sm,
+  },
+  infoParagraph: {
+    fontSize: typography.body,
+    color: colors.brown,
+    lineHeight: 22,
+  },
+  infoImagePlaceholder: {
+    flex: 1,
+    minWidth: 200,
+    minHeight: 220,
+    backgroundColor: colors.olive,
+    borderRadius: 12,
   },
 });
 
