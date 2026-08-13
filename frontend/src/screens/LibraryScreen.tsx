@@ -210,12 +210,12 @@ const styles = StyleSheet.create({
     flexGrow: 1,
   },
   body: {
-    paddingVertical: spacing.lg,
+    paddingVertical: spacing.xl,
     paddingHorizontal: layout.screenHorizontalPadding,
-    gap: spacing.xl,
+    gap: spacing.xl * 1.25,
   },
   section: {
-    gap: spacing.sm,
+    gap: spacing.md,
   },
   sectionTitle: {
     fontSize: typography.sectionTitle,

@@ -1,6 +1,9 @@
 # BS_Proof_Prototype
 A prototype for the BS Proff app
 
+## Activate Frontend
+npx expo start -c
+
 ## Activate Backend
 source venv/bin/activate
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8000

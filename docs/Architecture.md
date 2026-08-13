@@ -343,6 +343,9 @@ frontend/
 └── src/
     ├── App.tsx                 # Root: SafeAreaProvider + NavigationContainer + persistent NavBar + Stack.Navigator
     ├── theme.ts                 # Strict color palette, typography, spacing, layout (20% screen inset) tokens
+    ├── assets/
+    │   ├── 7685212-hd_1920_1080_24fps.mp4    # Hero background video (HD, used by default)
+    │   └── 7710495-uhd_4096_2160_25fps.mp4   # Hero background video (UHD alt — larger file, not used by default)
     ├── navigation/
     │   ├── types.ts             # RootStackParamList (Home/Scan/Library/ResultsScreen), FilterType
     │   └── navigationRef.ts     # Imperative nav ref, used by NavBar (which renders outside the Stack tree)
@@ -353,7 +356,7 @@ frontend/
     │   ├── ProductCard.tsx       # Expandable product card (metadata + nested Ingredient accordion)
     │   └── IngredientCard.tsx    # Accordion card: dosage/%DV or canonical RDA/research + placeholder
     ├── screens/
-    │   ├── HomeScreen.tsx        # Marketing hero (full-width) + "Why BSProof?" info section (20% inset) + Footer
+    │   ├── HomeScreen.tsx        # Marketing hero (full-width, looping video background via expo-video) + "Why BSProof?" info section (20% inset) + Footer
     │   ├── ScanScreen.tsx        # ImageUploader + Analyze button + raw-JSON Results section + Footer
     │   ├── LibraryScreen.tsx     # Search (live suggestions) + Explore (Products/Ingredients cards) + Footer
     │   └── ResultsScreen.tsx     # Back button + title/filter row, ProductCard/IngredientCard list, + Footer
@@ -394,6 +397,52 @@ separate from this global inset and unaffected by it. Because 20% is
 taken off *each* side, note this significantly narrows content on phone-
 width screens (roughly 60% of screen width remains) — worth revisiting if
 it reads as too cramped on real devices.
+
+Vertical rhythm was tightened up in a later pass: `HomeScreen`'s info
+section, `ScanScreen`'s body, `LibraryScreen`'s body, and `ResultsScreen`'s
+header/`FlatList` content all use `paddingVertical: spacing.xl` (32) on
+their main container, with inter-section/inter-card gaps bumped to
+`spacing.md`/`spacing.xl` depending on context — up from the original
+`spacing.lg`/`spacing.sm` values. `NavBar` and `Footer` are explicitly
+excluded, same as the horizontal rule above.
+
+### Hero video background (`HomeScreen.tsx`)
+
+The Hero section's background is a looping, muted local video instead of
+a flat color, via **`expo-video`** — not `expo-av`: `expo-av`'s Video/Audio
+APIs are deprecated (no further patches, removed entirely in SDK 55) and
+this project is on SDK 57, so `expo-video` is the only supported option.
+Install it manually:
+
+```bash
+cd frontend
+npx expo install expo-video
+```
+
+Implementation:
+- `useVideoPlayer(HERO_VIDEO, setup)` creates the player; the setup
+  callback sets `loop = true`, `muted = true`, and calls `play()` — the
+  `expo-video` equivalents of `expo-av`'s `isLooping`/`isMuted`/
+  `shouldPlay` props.
+- `<VideoView player={player} contentFit="cover" nativeControls={false} />`
+  is absolutely positioned (`top/left/right/bottom: 0`) to fill the Hero
+  container, which is given `position: 'relative'` + `overflow: 'hidden'`
+  so the video is clipped to it rather than the whole screen.
+- A `rgba(0, 0, 0, 0.35)` overlay `View` sits above the video (both
+  `pointerEvents="none"` so taps pass through to the buttons), for
+  contrast.
+- The title/buttons render as later JSX siblings (so they stack on top by
+  default) plus explicit `zIndex: 2` as a safeguard. `heroTitle`'s color
+  changed from `brown` to `offWhite` (still an existing palette color —
+  just the higher-contrast one against a video + dark overlay instead of
+  the old flat `lightYellow` background) with a small text shadow for
+  extra legibility against busy video frames.
+- Two source clips live in `src/assets/`: an HD 1920x1080 file (used by
+  default — smaller, no visible quality loss as a background loop) and a
+  UHD 4096x2160 alternative (~2.5x the size). Swap the `HERO_VIDEO`
+  `require()` in `HomeScreen.tsx` to switch.
+- The Hero container's `lightYellow` `backgroundColor` is kept as a
+  fallback, visible behind/around the video while it's loading.
 
 ### Expandable cards (`ProductCard`, `IngredientCard`)
 

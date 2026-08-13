@@ -122,9 +122,9 @@ const styles = StyleSheet.create({
   },
   body: {
     alignItems: 'center',
-    paddingTop: spacing.lg,
+    paddingVertical: spacing.xl,
     paddingHorizontal: layout.screenHorizontalPadding,
-    gap: spacing.lg,
+    gap: spacing.xl,
   },
   title: {
     fontSize: typography.sectionTitle,

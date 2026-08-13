@@ -241,9 +241,9 @@ const styles = StyleSheet.create({
     backgroundColor: colors.offWhite,
   },
   body: {
-    paddingTop: spacing.md,
+    paddingVertical: spacing.xl,
     paddingHorizontal: layout.screenHorizontalPadding,
-    gap: spacing.sm,
+    gap: spacing.md,
   },
   backButton: {
     alignSelf: 'flex-start',
@@ -280,8 +280,8 @@ const styles = StyleSheet.create({
   listContent: {
     flexGrow: 1,
     paddingHorizontal: layout.screenHorizontalPadding,
-    paddingBottom: spacing.lg,
-    gap: spacing.sm,
+    paddingBottom: spacing.xl,
+    gap: spacing.md,
   },
 });
 

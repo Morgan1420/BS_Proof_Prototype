@@ -17,6 +17,9 @@
       },
       "predictiveBackGestureEnabled": false
     },
-    "web": {}
+    "web": {},
+    "plugins": [
+      "expo-video"
+    ]
   }
 }
