@@ -1,8 +1,9 @@
-"""Pydantic response models for the Phase 2/3 research/grading endpoints."""
+"""Pydantic response models for the Phase 2/3/5 research/grading
+endpoints."""
 
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
@@ -65,6 +66,36 @@ class ResearchPaperResponse(BaseModel):
     rubric_evaluation: Optional[RubricEvaluationResponse] = None
 
 
+class PaperConclusionResponse(BaseModel):
+    """A single synthesized cross-paper conclusion/claim for an
+    ingredient (Phase 5) — mirrors PaperConclusion
+    (app/models/research.py) field-for-field. See
+    app/services/conclusion_grader.py for how these are built and kept
+    up to date as more graded papers come in.
+
+    `rubric_evaluation` is a loose `Dict[str, Any]` rather than a strict
+    submodel (unlike ResearchPaperResponse.rubric_evaluation, which uses
+    RubricEvaluationResponse) — a merged conclusion's stored evaluation
+    is built by spreading a previous dict and overwriting a few keys
+    (see conclusion_grader.py::process_paper_conclusions), so its exact
+    key set is less rigidly fixed than a freshly-graded paper's; a loose
+    dict tolerates that without risking a validation error on an
+    otherwise-fine row.
+    """
+
+    id: int
+    ingredient_id: int
+    claim_summary: str
+    detailed_conclusion: Optional[str] = None
+    dosage_mentioned: Optional[str] = None
+    rubric_evaluation: Optional[Dict[str, Any]] = None
+    confidence_score: int
+    confidence_grade: str
+    cross_paper_consensus: int
+    supporting_paper_ids: List[int] = Field(default_factory=list)
+    contradicting_paper_ids: List[int] = Field(default_factory=list)
+
+
 class IngredientDetailResponse(BaseModel):
     """Response body for GET /api/v1/ingredients/{id}.
 
@@ -75,6 +106,14 @@ class IngredientDetailResponse(BaseModel):
     below) still returns the same `papers` shape so the panel can update
     immediately after a fresh grade request too, without a second round
     trip.
+
+    `conclusions` (Phase 5) is every *active* synthesized
+    PaperConclusion for this ingredient, highest-confidence first — see
+    app/services/search.py::get_ingredient_conclusions. Not yet returned
+    by GradeIngredientResponse/GradePaperResponse below (those still only
+    refresh `papers`) — the frontend re-fetches ingredient detail to see
+    updated conclusions after a grade request, same as it does today for
+    any state this endpoint alone exposes.
     """
 
     id: int
@@ -85,6 +124,7 @@ class IngredientDetailResponse(BaseModel):
     is_graded: bool = False
     grade_badge_text: Optional[str] = None
     papers: List[ResearchPaperResponse] = Field(default_factory=list)
+    conclusions: List[PaperConclusionResponse] = Field(default_factory=list)
 
 
 class GradeIngredientResponse(BaseModel):

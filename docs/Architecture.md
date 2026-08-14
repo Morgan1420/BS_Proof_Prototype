@@ -25,20 +25,22 @@ backend/
     │   ├── supplement.py   # Ingredient, SupplementAnalysis — Pydantic I/O models (Gemini + API response)
     │   ├── search.py       # FilterType, ResultType, SearchResultItem (now with nested ingredients), SearchResponse, SuggestResponse
     │   ├── dev.py           # MockDataResetResponse
-    │   ├── research.py      # RubricEvaluationResponse (Phase 3), ResearchPaperResponse, IngredientDetailResponse, GradeIngredientResponse (Phase 2), GradePaperResponse (Phase 4)
+    │   ├── research.py      # RubricEvaluationResponse (Phase 3), ResearchPaperResponse, PaperConclusionResponse (Phase 5), IngredientDetailResponse (now with conclusions), GradeIngredientResponse (Phase 2), GradePaperResponse (Phase 4)
     │   └── (supplement.py adds LinkedIngredientResponse, ProductDetailResponse)
     ├── models/
     │   ├── schemas.py      # ScanResponse (superseded by schemas/supplement.py; unused)
     │   ├── supplement.py   # Product, Ingredient (now with is_graded/grade_badge_text/papers), ProductIngredientLink — SQLModel ORM tables (M2M)
-    │   └── research.py     # ResearchPaper — SQLModel ORM table (Phase 2; now with keywords + grade/grade_score/rubric_evaluation from Phase 3), FK'd to Ingredient. Also: serialize_keywords()/parse_keywords()
+    │   └── research.py     # ResearchPaper — SQLModel ORM table (Phase 2; now with keywords + grade/grade_score/rubric_evaluation from Phase 3), FK'd to Ingredient. Also: serialize_keywords()/parse_keywords(). PaperConclusion (Phase 5) — one row per synthesized cross-paper claim, FK'd to Ingredient (no ORM relationship — queried directly, see search.py)
     └── services/
         ├── vision.py       # Gemini API calls for label parsing
         ├── storage.py      # save_scan() (M2M find-or-create), delete_all_data(), delete_mock_data() (legacy, unused by the route)
-        ├── search.py       # suggest() / search() queries, get_linked_ingredients()/get_product_detail() (explicit joins), get_ingredient_papers()/get_ingredient_detail()/to_research_paper_response() (shared ORM->response mapper)
+        ├── search.py       # suggest() / search() queries, get_linked_ingredients()/get_product_detail() (explicit joins), get_ingredient_papers()/get_ingredient_detail()/to_research_paper_response() (shared ORM->response mapper), get_ingredient_conclusions() (Phase 5)
         ├── research_keywords.py  # Gemini: generate_ingredient_keywords() (Phase 2)
-        ├── paper_search.py       # Europe PMC/PubMed/Semantic Scholar/OpenAlex (async, concurrent): search_papers_for_ingredient() (Phase 2; now also grades each new paper — Phase 3)
-        ├── paper_grader.py       # Gemini: grade_paper() — evaluates one paper against docs/paper_grading_rubric.json (Phase 3); grade_single_paper() — on-demand DB-aware wrapper for one already-stored paper (Phase 4)
-        └── grading.py             # Orchestrates keyword-gen + paper-search (which itself now grades) + debug grade assignment: grade_ingredient() (Phase 2)
+        ├── paper_search.py       # Europe PMC/PubMed/Semantic Scholar/OpenAlex (async, concurrent): search_papers_for_ingredient() (Phase 2; search-only as of Phase 5 — grading moved to paper_analysis_pipeline.py)
+        ├── paper_grader.py       # Gemini: grade_paper() — evaluates one paper against docs/paper_grading_rubric.json (Phase 3); grade_single_paper() — on-demand/idempotent DB-aware wrapper for one already-stored paper (Phase 4; also the per-paper grading step of the Phase 5 pipeline)
+        ├── conclusion_grader.py  # Gemini: process_paper_conclusions() — extracts one graded paper's findings and merges/creates PaperConclusion rows against docs/conclusion_grading_rubric.json (Phase 5)
+        ├── paper_analysis_pipeline.py  # analyze_ingredient_papers() — sequential per-paper grade + conclusion-synthesis loop with per-paper error isolation (Phase 5)
+        └── grading.py             # Orchestrates keyword-gen + paper-search + the Phase 5 grade/conclusion-synthesis pipeline + debug grade assignment: grade_ingredient() (Phase 2, updated Phase 5)
 ```
 
 Note: `app/schemas/supplement.py` and `app/models/supplement.py` both define an
@@ -329,32 +331,41 @@ same explicit-join approach as `/supplements/search` above
 
 ### `GET /api/v1/ingredients/{id}`
 Returns a single canonical `Ingredient` plus every `ResearchPaper` stored
-for it (`app/services/search.py::get_ingredient_detail`). Added to back
+for it, and (Phase 5) every synthesized `PaperConclusion`
+(`app/services/search.py::get_ingredient_detail`). Added to back
 standalone `IngredientCard`'s "List of Studies" panel
 (`src/components/StudiesList.tsx`) — this is a pure read, it never
-triggers a new paper search itself; `papers` is just whatever's already
-been persisted by a prior `POST .../grade` call (`[]` if the ingredient
-hasn't been graded yet).
+triggers a new paper search itself; `papers`/`conclusions` are just
+whatever's already been persisted by a prior `POST .../grade` call (`[]`
+for both if the ingredient hasn't been graded yet).
 
 - **Params:** `id` (path, int).
 - **Response (200):** `IngredientDetailResponse` — `{ id, name,
   recommended_daily_dosage, scientific_data, product_count, is_graded,
-  grade_badge_text, papers: ResearchPaperResponse[] }`. Each
-  `ResearchPaperResponse` is `{ id, title, abstract, authors,
-  publication_date, source_url, source_domain, ingredient_id, keywords:
-  string[], grade, grade_score, rubric_evaluation }` — a direct mirror of
-  the `ResearchPaper` table columns, except `keywords` (parsed from the
-  stored comma-separated string via `parse_keywords()`) and
-  `rubric_evaluation` (the stored JSON dict, validated straight into
-  `RubricEvaluationResponse`). `grade`/`grade_score`/`rubric_evaluation`
-  are `null` for a paper that hasn't been graded yet (Phase 3 — see
-  "Automated paper grading" below).
+  grade_badge_text, papers: ResearchPaperResponse[], conclusions:
+  PaperConclusionResponse[] }`. Each `ResearchPaperResponse` is `{ id,
+  title, abstract, authors, publication_date, source_url, source_domain,
+  ingredient_id, keywords: string[], grade, grade_score,
+  rubric_evaluation }` — a direct mirror of the `ResearchPaper` table
+  columns, except `keywords` (parsed from the stored comma-separated
+  string via `parse_keywords()`) and `rubric_evaluation` (the stored
+  JSON dict, validated straight into `RubricEvaluationResponse`).
+  `grade`/`grade_score`/`rubric_evaluation` are `null` for a paper that
+  hasn't been graded yet (Phase 3 — see "Automated paper grading"
+  below). Each `PaperConclusionResponse` (Phase 5 — see "Cross-Paper
+  Conclusion Synthesis" below) is `{ id, ingredient_id, claim_summary,
+  detailed_conclusion, dosage_mentioned, rubric_evaluation,
+  confidence_score, confidence_grade, cross_paper_consensus,
+  supporting_paper_ids: number[], contradicting_paper_ids: number[] }`,
+  ordered highest-`confidence_score`-first.
 - **Errors:** `404` if no `Ingredient` with that id exists.
 
 ### `POST /api/v1/ingredients/{id}/grade`
 **[Phase 2, debug]** Runs the research-paper search pipeline for a single
-canonical `Ingredient` and assigns a debug grade — see "Research Paper
-Search & Ingredient Grading (Phase 2)" below for the full pipeline.
+canonical `Ingredient`, grades every stored paper and synthesizes/merges
+cross-paper conclusions (Phase 5), and assigns a debug grade — see
+"Research Paper Search & Ingredient Grading (Phase 2)" and "Cross-Paper
+Conclusion Synthesis (Phase 5)" below for the full pipeline.
 
 - **Params:** `ingredient_id` (path, int).
 - **Response (200):** `GradeIngredientResponse` — `{ status,
@@ -580,16 +591,21 @@ eventual commit, no separate `session.add()` needed. Rendered as
 `StudiesList.tsx` below).
 
 **Automated paper grading (Phase 3) — `app/services/paper_grader.py`.**
-Every newly-persisted `ResearchPaper` row is graded automatically, right
-when it's created — `search_papers_for_ingredient`'s new-paper loop
-calls a private `_apply_grade(paper, record)` helper immediately after
-building each `ResearchPaper` (before it's flushed), which calls
-`paper_grader.grade_paper({title, abstract, authors, journal,
-publication_date})` and sets `paper.grade`/`paper.grade_score`/
-`paper.rubric_evaluation` from the result. Papers matched to an
-*already-stored* paper (the `_merge_keyword_onto` path above) are never
-re-graded — a paper's evaluation doesn't change once assigned, only its
-`keywords` list grows.
+**As of Phase 5, grading no longer happens inline during paper search** —
+`search_papers_for_ingredient` used to call a private `_apply_grade`
+helper on each newly-built `ResearchPaper` before flushing it; that
+helper was removed and its responsibility folded into
+`app/services/paper_analysis_pipeline.py::analyze_ingredient_papers`
+(see "Cross-Paper Conclusion Synthesis (Phase 5)" below), which now
+grades every *stored* paper for an ingredient (new ones this run, plus
+any left ungraded by an earlier partial run) via
+`paper_grader.grade_single_paper` — the same idempotent, DB-aware
+function Phase 4's on-demand single-paper endpoint already used. A
+paper's evaluation still never changes once assigned, only its
+`keywords` list grows on a re-match (`_merge_keyword_onto`, still in
+`paper_search.py`). The rubric/prompting/scoring mechanics described
+below (rubric file, category clamping, server-side grade derivation) are
+unchanged — only *when* and *from where* grading is triggered moved.
 
 - **Rubric — `docs/paper_grading_rubric.json`** (repo root, same
   absolute-path resolution as `paperApis.json`; currently `version:
@@ -647,30 +663,35 @@ re-graded — a paper's evaluation doesn't change once assigned, only its
   breakdown — a real risk if Gemini were asked to independently pick
   both a score and a letter — and that a heavily-penalized paper's total
   never surfaces as a negative or out-of-range `grade_score`.
-- **Per-paper resilience.** `_apply_grade` catches `PaperGradingError`
-  (raised for a failed Gemini call, an empty/unparseable response, or a
-  missing/malformed rubric file) and logs a warning rather than
+- **Per-paper resilience.** `app/services/paper_analysis_pipeline.py::analyze_ingredient_papers`
+  (Phase 5) catches `PaperGradingError` (raised for a failed Gemini call,
+  an empty/unparseable response, or a missing/malformed rubric file)
+  around each paper's grading step and logs a warning rather than
   propagating — a single paper's grading failure leaves that one row
   ungraded (`grade`/`grade_score`/`rubric_evaluation` stay `None`)
-  without failing the rest of the ingestion batch, same philosophy as
-  `_safe_query_async`'s per-source handling.
-- **Journal name capture.** `PaperRecord` gained a `journal: Optional[str]`
-  field (not persisted as its own `ResearchPaper` column — only used
-  transiently to build the grading prompt) so "Journal / Publisher
-  Rigor" grading has something better than the *platform* domain
-  (`source_domain`, e.g. `"pubmed.ncbi.nlm.nih.gov"`) to go on: Europe
+  without stopping the loop or rolling back progress already committed
+  for earlier papers, same philosophy as `_safe_query_async`'s
+  per-source handling.
+- **Journal name capture (now unused downstream).** `PaperRecord` still
+  captures a `journal: Optional[str]` field per search result (Europe
   PMC's `journalInfo.journal.title`, PubMed's `Journal/Title` XML
-  element, Semantic Scholar's `venue` field, and OpenAlex's
-  `primary_location.source.display_name` (falling back to the older
-  `host_venue.display_name` shape). `None` if the source doesn't expose
-  one for that result.
-- **Cost/latency tradeoff.** One additional blocking Gemini call per
-  *newly-found* paper, on top of the keyword-generation call and the
-  paper-search HTTP fan-out — for a grade request that turns up many new
-  papers, this adds meaningfully to total request time (sequential, not
-  concurrent, in this pass). Acceptable for this debug-stage feature's
-  volume; a candidate for a future concurrent/batched grading pass if
-  paper counts grow.
+  element, Semantic Scholar's `venue` field, OpenAlex's
+  `primary_location.source.display_name`/`host_venue.display_name`) —
+  but as of Phase 5, nothing reads it: grading happens later, via
+  `grade_single_paper`, which has no `journal` parameter (see that
+  function's "Known limitation" docstring, same gap Phase 4's on-demand
+  endpoint already had). Kept captured per source anyway since it's
+  effectively free to extract, in case a future pass wires it back into
+  grading.
+- **Cost/latency tradeoff.** One blocking Gemini call per paper graded,
+  now made from `analyze_ingredient_papers` (Phase 5) after paper search
+  completes and its results are committed, rather than inline during the
+  search loop — for a grade request that turns up many new papers (or
+  re-processes previously ungraded ones), this still adds meaningfully
+  to total request time (sequential, not concurrent, deliberately — see
+  "Cross-Paper Conclusion Synthesis (Phase 5)" below for why). Acceptable
+  for this debug-stage feature's volume; a candidate for a future
+  concurrent/batched pass if paper counts grow.
 - **API exposure.** `ResearchPaperResponse` (`app/schemas/research.py`)
   gained `grade: Optional[str]`, `grade_score: Optional[int]`,
   `rubric_evaluation: Optional[RubricEvaluationResponse]`, built by the
@@ -700,15 +721,19 @@ re-graded — a paper's evaluation doesn't change once assigned, only its
 
 **4. Orchestration — `app/services/grading.py`.**
 `grade_ingredient(session, ingredient)` runs the full pipeline: generate
-keywords -> search + persist papers -> count total stored papers for
-that ingredient -> **debug grade assignment**: `ingredient.is_graded =
-True` and `ingredient.grade_badge_text = f"{paper_count} / {paper_count}
-/ {paper_count}"` — there's no real grading algorithm yet, this is
-purely so the badge shows something derived from real (paper-count) data
-rather than a static placeholder. Commits everything as one transaction;
-rolls back and raises `GradingError` on failure. Raises `GradingError`
-(not paper-search's own exceptions) for keyword-generation failures too,
-so the route only needs to catch one exception type.
+keywords -> search + persist papers -> **commit** (durable checkpoint,
+see "Cross-Paper Conclusion Synthesis (Phase 5)" below for why this
+changed from one single end-to-end transaction) -> run the Phase 5
+grade + conclusion-synthesis pipeline over every stored paper for the
+ingredient -> count total stored papers -> **debug grade assignment**:
+`ingredient.is_graded = True` and `ingredient.grade_badge_text =
+f"{paper_count} / {paper_count} / {paper_count}"` — there's no real
+grading algorithm yet, this is purely so the badge shows something
+derived from real (paper-count) data rather than a static placeholder ->
+final commit. Raises `GradingError` (not paper-search's own exceptions,
+and not the Phase 5 pipeline's per-paper exceptions, which it never lets
+escape — see below) for keyword-generation failures or either commit
+failing, so the route only needs to catch one exception type.
 
 **5. Route — `POST /api/v1/ingredients/{id}/grade`** (see API Routes
 above) — thin: looks up the `Ingredient` (404 if missing), runs
@@ -753,6 +778,183 @@ pip install -r requirements.txt
   `User-Agent` identifying the caller for better throughput/support —
   not set here.
 - This endpoint is unauthenticated, same caveat as `/dev/mock-data`.
+
+## Cross-Paper Conclusion Synthesis (Phase 5)
+
+Where Phase 3/4 grade individual papers in isolation, Phase 5 synthesizes
+*claims* — e.g. "Improves deep sleep duration" — across every graded
+paper an ingredient has, tracking which papers support vs. contradict
+each claim and how confident the evidence makes it. Three new pieces,
+plus changes to `paper_search.py`/`grading.py` to wire them in.
+
+**1. Data model — `PaperConclusion` (`app/models/research.py`).** A new
+table (`paper_conclusions`), one row per synthesized claim (not per
+paper): `id`, `ingredient_id` (FK -> `ingredients.id`, indexed, **no**
+`Relationship()` back to `Ingredient` — every consumer queries this
+table directly by `ingredient_id`, same "avoid lazy-loaded relationships
+in API responses" reasoning as `get_linked_ingredients`), `claim_summary`,
+`detailed_conclusion`, `dosage_mentioned` (the specific dosage *this
+claim* pertains to — distinct from `Ingredient.recommended_daily_dosage`),
+`rubric_evaluation` (JSON — same column pattern as
+`ResearchPaper.rubric_evaluation`), `confidence_score` (0-100),
+`confidence_grade` (A-E, server-derived, never trusted from Gemini —
+same philosophy as Phase 3's `grade`), `cross_paper_consensus` (int,
+duplicated out of `rubric_evaluation` as its own column since it's the
+one category re-evaluated on every merge), `supporting_paper_ids`/
+`contradicting_paper_ids` (JSON arrays of `ResearchPaper.id` — a
+lightweight tag, not a join table, since nothing needs more than the
+ids/counts), `is_active` (bool, default `True` — reserved for a future
+"merge duplicate conclusions" cleanup pass; nothing deactivates a row
+today, but every read already filters on it), `created_at`/`updated_at`
+(the latter bumped manually on every merge, not an ORM `onupdate` hook).
+Being a **brand-new table** (not new columns on an existing one), it
+needs no hand-rolled `_migrate_*` function like the additive-column
+cases elsewhere in this doc — `SQLModel.metadata.create_all()` (already
+called by `init_db()` on every startup) creates any table missing *by
+name*, which covers this case directly, as long as `app.models.research`
+is imported before `create_all()` runs (it already is).
+
+**2. Rubric — `docs/conclusion_grading_rubric.json`.** Same shape as
+`paper_grading_rubric.json` (`grade_bands` A-E over 0-100,
+`categories` with `id`/`label`/`max_score`/`description`/`score_tiers`),
+but scores a *claim's aggregate evidence*, not one paper: `evidence_strength`
+(40 — how strong the paper(s) backing this claim are, by their own
+Phase 3 `grade_score`), `cross_paper_consensus` (40 — how many papers
+support vs. contradict it, and how consistent the finding is; the *one*
+category re-evaluated every time a new paper is merged into an existing
+claim), `claim_specificity` (20 — how precisely dosage/population/outcome
+are specified, i.e. how clinically actionable the claim is). Maximums
+sum to exactly 100.
+
+**3. Synthesis service — `app/services/conclusion_grader.py`.**
+`process_paper_conclusions(session, ingredient_id, paper)` is gatekept by
+`MIN_GRADE_SCORE_FOR_CONCLUSIONS = 50`: returns `False` immediately (no
+Gemini call) if `paper.grade_score` is `None` or `<= 50` — an ungraded or
+low-quality paper never gets to influence an ingredient's synthesized
+conclusions. Otherwise it:
+- Fetches every *active* `PaperConclusion` already stored for the
+  ingredient.
+- Makes **one** Gemini call (structured `response_schema`, same
+  `.parsed`-with-raw-text-fallback pattern as every other Gemini service
+  in this app) that does extraction + merging + grading together —
+  deliberately not three separate calls, to keep the per-paper request
+  count (and therefore free-tier rate-limit exposure) as low as possible.
+  The prompt includes the paper's title/abstract/grade plus a compact
+  summary of every existing conclusion (`id`, `claim_summary`,
+  `confidence_score`, supporting/contradicting counts), and asks Gemini
+  to return two lists:
+  - `merged_conclusions`: findings that match an existing claim —
+    `existing_conclusion_id`, `relationship` (`SUPPORTS`/`CONTRADICTS`),
+    reasoning, and a **re-evaluated `cross_paper_consensus` score**.
+  - `new_conclusions`: findings that don't match anything existing —
+    fully graded against the rubric (all three category scores + tier
+    labels + notes).
+- For each merge: appends `paper.id` to that conclusion's
+  `supporting_paper_ids` or `contradicting_paper_ids` (deduplicated — a
+  paper already recorded on a conclusion is never appended twice, which
+  is what makes re-running this function on the same paper safe), clamps
+  the new `cross_paper_consensus` score to the rubric's bounds, and
+  **recomputes total confidence** as `evidence_strength_score` (unchanged
+  from when the claim was first created — a later paper's own quality
+  doesn't retroactively change it) + the new `cross_paper_consensus` +
+  `claim_specificity_score` (also unchanged), clamped to 0-100, with
+  `confidence_grade` re-derived from that total via `grade_bands` — never
+  trusted from Gemini directly, same "derive the letter server-side"
+  philosophy as `paper_grader.py`. Every field is **reassigned to a new
+  value** (`conclusion.supporting_paper_ids = [*old, paper.id]`, not
+  `.append()`), not mutated in place — required for SQLAlchemy's
+  dirty-tracking to notice the change on a JSON column.
+- For each new finding: creates a `PaperConclusion` row, category scores
+  clamped to the rubric's bounds, `confidence_score` computed as their
+  sum (not trusted from Gemini), `confidence_grade` derived the same way,
+  `supporting_paper_ids=[paper.id]`.
+- Commits its own work (`process_paper_conclusions` is the transaction
+  boundary, not its caller) and raises `ConclusionGradingError` — with a
+  rollback first — on any failure (Gemini request, response parsing, or
+  the commit itself).
+
+**4. Pipeline — `app/services/paper_analysis_pipeline.py`.**
+`analyze_ingredient_papers(session, ingredient_id)` is the sequential,
+per-paper loop the task's "replace bulk/batch evaluation with a
+sequential pipeline" requirement asks for: it fetches **every**
+`ResearchPaper` currently stored for the ingredient (not just ones from
+the current request — this also catches papers left ungraded/
+unsynthesized by an earlier, partially-failed run) and, for each one in
+turn:
+1. Calls `paper_grader.grade_single_paper` (Phase 4's idempotent,
+   DB-aware grader — a no-op, no Gemini call, if already graded).
+2. If that succeeds, calls `conclusion_grader.process_paper_conclusions`
+   for the now-graded paper.
+
+Both steps are wrapped in their own `try/except`, and a failure in
+either (rate limiting, a transient network error, a malformed Gemini
+response) is logged and the loop **moves on to the next paper** rather
+than aborting — the whole point being that `grade_single_paper` and
+`process_paper_conclusions` each commit their own work independently, so
+whatever succeeded before a mid-loop failure is already durably saved,
+never rolled back by a later paper's problem. `analyze_ingredient_papers`
+itself never raises for a single paper's failure; it only would if the
+initial paper-lookup query itself broke (a sign of a dead DB connection,
+not a transient API issue). Returns a `PipelineResult` (papers
+considered/graded/failed, conclusions attempted/failed) — informational
+only, nothing branches on it today beyond logging.
+
+Deliberately **per-paper and sequential, never bulk/batched into fewer,
+larger Gemini calls** — both to stay within free-tier rate limits (many
+small calls beat one huge one) and because a single call trying to
+grade+synthesize an entire ingredient's paper set at once would also
+risk exceeding practical context/output-length limits well before it hit
+a rate limit.
+
+**5. Wiring — `paper_search.py` / `grading.py`.** `search_papers_for_ingredient`
+(Phase 2) is now **search-only** again — the `_apply_grade` call it used
+to make per new paper (Phase 3) was removed; grading is consolidated
+into the pipeline above so it happens in exactly one place. To make sure
+newly-found papers survive even if the pipeline fails outright,
+`grade_ingredient` (`app/services/grading.py`) now **commits twice**
+before its own final commit: once right after `search_papers_for_ingredient`
+returns (durably persisting new papers before grading starts at all),
+and then implicitly again on every paper `analyze_ingredient_papers`
+successfully processes (since `grade_single_paper`/
+`process_paper_conclusions` each call `session.commit()` on the same
+shared session — each of those commits also flushes through any other
+pending session state, including the newly-found papers if the very
+first commit somehow hadn't happened yet). This is the mechanism behind
+the "if rate limiting occurs mid-loop, previously completed paper grades
+and conclusion updates remain saved without rolling back whole batches"
+requirement — nothing in this pipeline defers its persistence to one
+big transaction at the end the way the pre-Phase-5 `grade_ingredient`
+did.
+
+**API exposure.** `IngredientDetailResponse` (`app/schemas/research.py`)
+gained `conclusions: List[PaperConclusionResponse]`, populated by
+`app/services/search.py::get_ingredient_conclusions` (every *active*
+`PaperConclusion` for the ingredient, highest-`confidence_score`-first)
+and returned from `GET /api/v1/ingredients/{id}` (see API Routes above).
+Not yet added to `GradeIngredientResponse`/`GradePaperResponse` — those
+still only refresh `papers`; the frontend would need a follow-up
+`GET .../ingredients/{id}` call to see freshly-synthesized conclusions
+after a grade request. **Not yet rendered anywhere in the frontend** —
+`StudiesList.tsx` still only shows per-paper data; a "Conclusions" panel
+consuming this new field is unbuilt.
+
+**Known gaps:**
+- No frontend UI consumes `conclusions` yet — this pass is backend-only,
+  scoped to the pipeline/model/API per the task.
+- `evidence_strength`/`claim_specificity` are only ever scored once, when
+  a claim is first created — if the *original* supporting paper(s)'
+  grades were somehow wrong, or a much stronger paper later supports the
+  same claim without prompting a full re-score of those two categories,
+  `confidence_score` won't reflect that; only `cross_paper_consensus` is
+  re-evaluated on every merge, per the task's explicit scope.
+- No "supersede/deactivate a stale conclusion" pass exists yet —
+  `is_active` is defined and every read filters on it, but nothing ever
+  sets it `False`. Two near-duplicate claims from slightly different
+  Gemini phrasing could end up as two separate `PaperConclusion` rows
+  rather than merging, since matching relies entirely on Gemini
+  recognizing the paraphrase against the existing-conclusions list in
+  the prompt, not on any server-side similarity check.
+- Same unauthenticated-endpoint caveat as the rest of this API surface.
 
 ## Frontend Structure
 

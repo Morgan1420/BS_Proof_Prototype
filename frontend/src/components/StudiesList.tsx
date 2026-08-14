@@ -15,6 +15,8 @@ import { Ionicons } from '@expo/vector-icons';
 import { colors, spacing, typography } from '../theme';
 import { gradePaper } from '../services/api';
 import type { PaperGrade, ResearchPaper } from '../services/api';
+import { GRADE_COLORS, getGradeRank, isPaperGrade } from '../utils/grades';
+import Pagination from './Pagination';
 
 /** Fill color for the "(-)" ungraded badge — per spec, a neutral gray
  * distinct from both the palette (no gray in theme.ts) and every
@@ -24,38 +26,6 @@ const UNGRADED_BADGE_COLOR = '#6C757D';
 
 /** Max rows shown per page — per spec. */
 const PAGE_SIZE = 5;
-
-/** Fixed grade->color mapping, per spec — deliberately NOT sourced from
- * theme.ts's palette: these are semantic quality-signal colors (traffic-
- * light-style green-to-red), not part of the app's brand palette, so
- * they're kept local to this component rather than polluting the shared
- * theme with colors nothing else uses. */
-const GRADE_COLORS: Record<PaperGrade, string> = {
-  A: '#1E7E34',
-  B: '#28A745',
-  C: '#D39E00',
-  D: '#FD7E14',
-  E: '#DC3545',
-};
-
-/** Narrows the backend's loosely-typed `grade?: string | null` down to a
- * known PaperGrade — a paper with no grade yet (or, defensively, some
- * unrecognized value) simply renders no badge rather than crashing on an
- * unmapped GRADE_COLORS lookup. */
-function isPaperGrade(value: string | null | undefined): value is PaperGrade {
-  return value === 'A' || value === 'B' || value === 'C' || value === 'D' || value === 'E';
-}
-
-/** Grade -> sort rank, lowest number sorts first. Ungraded papers get
- * UNGRADED_RANK (below every real letter grade, per spec), so they
- * always sink to the end of the list regardless of any future grade
- * added to GRADE_COLORS. */
-const GRADE_RANK: Record<PaperGrade, number> = { A: 1, B: 2, C: 3, D: 4, E: 5 };
-const UNGRADED_RANK = 6;
-
-function getGradeRank(grade: string | null | undefined): number {
-  return isPaperGrade(grade) ? GRADE_RANK[grade] : UNGRADED_RANK;
-}
 
 /**
  * Sorts papers by grade rank (A -> E, ungraded last). Papers sharing the
@@ -362,73 +332,7 @@ const StudiesList: React.FC<StudiesListProps> = ({
             ))}
           </View>
 
-          {totalPages > 1 && (
-            <View style={styles.paginationRow}>
-              <Pressable
-                style={[styles.navButton, page === 0 && styles.navButtonDisabled]}
-                onPress={() => setPage((current) => Math.max(0, current - 1))}
-                disabled={page === 0}
-                accessibilityRole="button"
-                accessibilityLabel="Previous page"
-              >
-                <Text
-                  style={[
-                    styles.navButtonText,
-                    page === 0 && styles.navButtonTextDisabled,
-                  ]}
-                >
-                  ← Previous
-                </Text>
-              </Pressable>
-
-              <View style={styles.pageNumberRow}>
-                {Array.from({ length: totalPages }, (_, pageIndex) => (
-                  <Pressable
-                    key={pageIndex}
-                    style={[
-                      styles.pageBadge,
-                      pageIndex === page && styles.pageBadgeActive,
-                    ]}
-                    onPress={() => setPage(pageIndex)}
-                    accessibilityRole="button"
-                    accessibilityLabel={`Go to page ${pageIndex + 1}`}
-                    accessibilityState={{ selected: pageIndex === page }}
-                  >
-                    <Text
-                      style={[
-                        styles.pageBadgeText,
-                        pageIndex === page && styles.pageBadgeTextActive,
-                      ]}
-                    >
-                      {pageIndex + 1}
-                    </Text>
-                  </Pressable>
-                ))}
-              </View>
-
-              <Pressable
-                style={[
-                  styles.navButton,
-                  page === totalPages - 1 && styles.navButtonDisabled,
-                ]}
-                onPress={() =>
-                  setPage((current) => Math.min(totalPages - 1, current + 1))
-                }
-                disabled={page === totalPages - 1}
-                accessibilityRole="button"
-                accessibilityLabel="Next page"
-              >
-                <Text
-                  style={[
-                    styles.navButtonText,
-                    page === totalPages - 1 && styles.navButtonTextDisabled,
-                  ]}
-                >
-                  Next →
-                </Text>
-              </Pressable>
-            </View>
-          )}
+          <Pagination page={page} totalPages={totalPages} onPageChange={setPage} />
         </>
       )}
 
@@ -685,57 +589,6 @@ const styles = StyleSheet.create({
   // transparent background and a spinner.
   gradeBadgeLoading: {
     backgroundColor: 'transparent',
-  },
-  paginationRow: {
-    flexDirection: 'row',
-    justifyContent: 'center',
-    alignItems: 'center',
-    flexWrap: 'wrap',
-    gap: spacing.sm,
-    paddingTop: spacing.xs,
-  },
-  navButton: {
-    paddingHorizontal: spacing.sm,
-    paddingVertical: spacing.xs,
-  },
-  navButtonDisabled: {
-    opacity: 0.4,
-  },
-  navButtonText: {
-    fontSize: typography.resultCardLabel,
-    fontWeight: '700',
-    color: colors.orange,
-  },
-  navButtonTextDisabled: {
-    color: `${colors.orange}88`,
-  },
-  pageNumberRow: {
-    flexDirection: 'row',
-    gap: spacing.xs,
-  },
-  pageBadge: {
-    borderWidth: 1,
-    borderColor: colors.orange,
-    borderRadius: 4,
-    paddingHorizontal: 8,
-    paddingVertical: 2,
-    minWidth: 26,
-    alignItems: 'center',
-  },
-  // Active page is filled solid orange (vs. the outline-only style
-  // above) — that fill/outline contrast is what distinguishes the
-  // active page now that both states live in the same orange family.
-  pageBadgeActive: {
-    backgroundColor: colors.orange,
-    borderColor: colors.orange,
-  },
-  pageBadgeText: {
-    fontSize: typography.resultCardLabel,
-    fontWeight: '700',
-    color: colors.orange,
-  },
-  pageBadgeTextActive: {
-    color: colors.offWhite,
   },
   // --- Info modal ---
   modalBackdrop: {

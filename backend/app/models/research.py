@@ -1,15 +1,20 @@
-"""SQLModel ORM table for scientific research papers, one row per paper
-linked to a canonical Ingredient (Phase 2 — automated paper scraping /
-ingredient grading).
+"""SQLModel ORM tables for scientific research: ResearchPaper (one row
+per paper linked to a canonical Ingredient — Phase 2, automated paper
+scraping/grading) and PaperConclusion (one row per synthesized claim
+built up across those papers — Phase 5, see
+app/services/conclusion_grader.py).
 
-Populated by app/services/paper_search.py, which queries PubMed, Europe
-PMC, and Semantic Scholar per Gemini-generated keyword (see
-app/services/research_keywords.py) and persists deduplicated results
-here. See app/services/grading.py for the full pipeline this feeds into.
+ResearchPaper rows are populated by app/services/paper_search.py, which
+queries PubMed, Europe PMC, Semantic Scholar, and OpenAlex per
+Gemini-generated keyword (see app/services/research_keywords.py) and
+persists deduplicated results here. PaperConclusion rows are populated
+by app/services/conclusion_grader.py, driven by
+app/services/paper_analysis_pipeline.py. See app/services/grading.py for
+the full pipeline both feed into.
 
 Deliberately its own module (not folded into app/models/supplement.py):
-this is a distinct, independently-growing table with no direct
-dependency on Product/ProductIngredientLink, and keeping it separate
+these are distinct, independently-growing tables with no direct
+dependency on Product/ProductIngredientLink, and keeping them separate
 avoids bloating the M2M schema module with an unrelated concern.
 """
 
@@ -136,3 +141,80 @@ class ResearchPaper(SQLModel, table=True):
     created_at: datetime = Field(default_factory=_utcnow, nullable=False)
 
     ingredient: Optional[Ingredient] = Relationship(back_populates="papers")
+
+
+class PaperConclusion(SQLModel, table=True):
+    """A single synthesized scientific conclusion/claim for one canonical
+    Ingredient, built up incrementally across every graded ResearchPaper
+    (grade_score > 50) whose findings support or contradict it — Phase 5,
+    see app/services/conclusion_grader.py::process_paper_conclusions.
+
+    Unlike ResearchPaper (one row per paper found), this is one row per
+    *distinct claim* — e.g. "Improves deep sleep duration" — regardless
+    of how many papers discuss it; `supporting_paper_ids`/
+    `contradicting_paper_ids` track which ResearchPaper rows (by id)
+    agree or disagree, and `confidence_score`/`confidence_grade` reflect
+    the aggregate evidence across all of them, re-evaluated every time a
+    new qualifying paper is merged into it.
+
+    Deliberately no `Relationship()` back to Ingredient (unlike
+    ResearchPaper.ingredient above): every consumer of this table
+    (conclusion_grader.py, app/services/search.py's API response) always
+    queries it directly by `ingredient_id` — see
+    app/services/search.py::get_linked_ingredients' docstring for why
+    this codebase generally prefers explicit queries over lazy-loaded
+    relationships when building API responses.
+    """
+
+    __tablename__ = "paper_conclusions"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    ingredient_id: int = Field(foreign_key="ingredients.id", index=True)
+
+    claim_summary: str
+    detailed_conclusion: Optional[str] = Field(default=None)
+    # The specific dosage this claim pertains to, if the source paper(s)
+    # specify one (e.g. "300mg") — distinct from
+    # Ingredient.recommended_daily_dosage, which is general/canonical,
+    # not tied to any one finding.
+    dosage_mentioned: Optional[str] = Field(default=None)
+
+    # Structured breakdown backing confidence_score/confidence_grade —
+    # see app/services/conclusion_grader.py's rubric-category shape
+    # (evidence_strength[_score], cross_paper_consensus[_score],
+    # claim_specificity[_score], total_score, summary_notes). Same JSON
+    # column pattern as ResearchPaper.rubric_evaluation above.
+    rubric_evaluation: Optional[dict] = Field(default=None, sa_column=Column(JSON))
+    confidence_score: int = Field(default=0)
+    confidence_grade: str
+
+    # Duplicated out of rubric_evaluation as its own column (rather than
+    # only living inside the JSON blob) specifically because it's the
+    # one rubric category re-evaluated on every merge — see
+    # conclusion_grader.py::process_paper_conclusions — so having it
+    # directly queryable/sortable without unpacking JSON is worth the
+    # small duplication, same reasoning as ResearchPaper keeping
+    # `grade`/`grade_score` alongside its own `rubric_evaluation` JSON.
+    cross_paper_consensus: int = Field(default=0)
+
+    # ResearchPaper.id values, not a relationship/join table —
+    # deliberately: a "supports/contradicts" edge here is a lightweight
+    # tag, not a first-class row needing its own table, and every
+    # consumer only ever needs the ids/counts, never a full join back to
+    # ResearchPaper. Always reassigned to a new list (never mutated
+    # in-place with .append()) wherever updated, so SQLAlchemy's change
+    # tracking picks up the new value — see conclusion_grader.py.
+    supporting_paper_ids: List[int] = Field(default_factory=list, sa_column=Column(JSON))
+    contradicting_paper_ids: List[int] = Field(default_factory=list, sa_column=Column(JSON))
+
+    # Reserved for a future "supersede/merge duplicate conclusions"
+    # cleanup pass — every conclusion created today is active by default
+    # and nothing currently deactivates one, but queries already filter
+    # on it (see app/services/search.py::get_ingredient_conclusions) so
+    # that pass can land later without an API/query-shape change.
+    is_active: bool = Field(default=True)
+
+    created_at: datetime = Field(default_factory=_utcnow, nullable=False)
+    # Bumped manually wherever a merge updates this row (not an ORM
+    # `onupdate` hook) — see conclusion_grader.py.
+    updated_at: datetime = Field(default_factory=_utcnow, nullable=False)

@@ -44,7 +44,6 @@ import httpx
 from sqlmodel import Session, select
 
 from app.models.research import ResearchPaper, parse_keywords, serialize_keywords
-from app.services.paper_grader import PaperGradingError, grade_paper
 
 logger = logging.getLogger(__name__)
 
@@ -99,12 +98,14 @@ class PaperRecord:
     # Scholar's `venue`, OpenAlex's primary_location source) — distinct
     # from `source_domain` above, which is the *platform* that surfaced
     # the paper (e.g. "pubmed.ncbi.nlm.nih.gov"), not the journal that
-    # actually published it. Fed into app/services/paper_grader.py's
-    # "Journal / Publisher Rigor" evaluation; not persisted as its own
-    # ResearchPaper column — the grader's `journal_reputation` text
-    # captures the assessment, so storing the raw name separately isn't
-    # needed for anything the app does today. None if the source doesn't
-    # expose one.
+    # actually published it. Not persisted as its own ResearchPaper
+    # column, and — since grading now happens later, via
+    # app/services/paper_analysis_pipeline.py calling
+    # paper_grader.py::grade_single_paper (see that function's "Known
+    # limitation" docstring) rather than inline here at ingestion time —
+    # presently unread by anything downstream too. Kept captured per
+    # source anyway (it's effectively free) in case a future pass wires
+    # it back into grading. None if the source doesn't expose one.
     journal: Optional[str] = None
 
 
@@ -518,6 +519,16 @@ def search_papers_for_ingredient(
     already stored for `ingredient_id`, and persists new ResearchPaper
     rows.
 
+    Search-only — does NOT grade the papers it finds. Grading (and
+    conclusion synthesis) happens afterward, over every stored paper for
+    the ingredient (not just the ones newly added here), via
+    app/services/paper_analysis_pipeline.py::analyze_ingredient_papers —
+    see app/services/grading.py::grade_ingredient for how the two are
+    sequenced. This used to grade each new paper inline
+    (`_apply_grade`); that was consolidated into the pipeline so grading
+    + conclusion synthesis live in exactly one place, run sequentially
+    per paper (never bulk/batched) with per-paper commit/error handling.
+
     Stays a synchronous function — internally it runs the actual network
     fan-out via `asyncio.run(_search_all_records_async(...))` over
     `httpx.AsyncClient`, so its call sites
@@ -529,10 +540,10 @@ def search_papers_for_ingredient(
     "asyncio.run() cannot be called from a running event loop" conflict.
 
     Deliberately `session.flush()`s rather than `session.commit()`s — the
-    caller (app/services/grading.py) commits once, together with the
-    ingredient's `is_graded`/`grade_badge_text` update, so a grade
-    request either fully succeeds or fully rolls back rather than leaving
-    papers persisted with the ingredient still marked ungraded.
+    caller (app/services/grading.py) commits right after this call
+    returns, before grading starts, so the newly found papers are
+    durably persisted even if grading/conclusion synthesis later fails
+    partway through — see grade_ingredient's docstring.
 
     Args:
         session: An open SQLModel session.
@@ -603,7 +614,6 @@ def search_papers_for_ingredient(
             source_domain=record.source_domain,
             keywords=serialize_keywords(batch_keywords[key]),
         )
-        _apply_grade(paper, record)
         session.add(paper)
         new_papers.append(paper)
 
@@ -611,44 +621,6 @@ def search_papers_for_ingredient(
         session.flush()  # assigns ids without committing — see docstring
 
     return new_papers
-
-
-def _apply_grade(paper: ResearchPaper, record: PaperRecord) -> None:
-    """Grades `paper` via app/services/paper_grader.py (Phase 3) and sets
-    its `grade`/`grade_score`/`rubric_evaluation` fields — called exactly
-    once, right when a paper is first persisted, never on subsequent
-    re-grade runs (an already-graded paper's evaluation doesn't change).
-
-    Makes one blocking Gemini call per new paper, so grading a batch with
-    many newly-found papers adds proportionally to this request's total
-    latency (on top of the paper-search calls already made) — acceptable
-    for this debug-stage feature's request volume, but a candidate for a
-    future concurrent/batched pass if paper counts grow.
-
-    Resilient by design: a single paper's grading failure (Gemini error,
-    malformed response, missing/unreadable rubric file) is logged and
-    left as an ungraded row (`grade`/`grade_score`/`rubric_evaluation`
-    all stay `None`) rather than failing the whole ingestion batch — same
-    "one flaky piece shouldn't sink the request" philosophy as
-    _safe_query_async's per-source handling above.
-    """
-    try:
-        result = grade_paper(
-            {
-                "title": record.title,
-                "abstract": record.abstract,
-                "authors": record.authors,
-                "journal": record.journal,
-                "publication_date": record.publication_date,
-            }
-        )
-    except PaperGradingError as exc:
-        logger.warning("Could not grade paper %r: %s", record.title, exc)
-        return
-
-    paper.grade = result["grade"]
-    paper.grade_score = result["grade_score"]
-    paper.rubric_evaluation = dict(result["rubric_evaluation"])
 
 
 def _merge_keyword_onto(paper: ResearchPaper, keyword: Optional[str]) -> None:

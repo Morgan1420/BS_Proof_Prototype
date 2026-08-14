@@ -408,6 +408,51 @@ export interface ResearchPaper {
   rubric_evaluation?: RubricEvaluation | null;
 }
 
+/**
+ * Structured per-category rubric breakdown backing a conclusion's
+ * `confidence_score`/`confidence_grade` — mirrors the backend's
+ * PaperConclusionResponse.rubric_evaluation (app/schemas/research.py),
+ * which is itself a loose `Dict[str, Any]` server-side (not a strict
+ * schema, unlike RubricEvaluation above) — see that field's docstring
+ * for why: a merged conclusion's stored evaluation is built by spreading
+ * a previous dict and overwriting a few keys
+ * (conclusion_grader.py::process_paper_conclusions), so its exact key
+ * set is less rigidly fixed than a freshly-graded paper's. Every field
+ * here is optional for the same reason.
+ */
+export interface ConclusionRubricEvaluation {
+  evidence_strength?: string;
+  evidence_strength_score?: number;
+  cross_paper_consensus?: string;
+  cross_paper_consensus_score?: number;
+  claim_specificity?: string;
+  claim_specificity_score?: number;
+  total_score?: number;
+  summary_notes?: string;
+}
+
+/**
+ * A single synthesized cross-paper conclusion/claim for an ingredient
+ * (Phase 5) — mirrors the backend's PaperConclusionResponse
+ * (app/schemas/research.py), which itself mirrors the PaperConclusion
+ * table (app/models/research.py). Rendered by RecommendedUsesList.tsx.
+ */
+export interface PaperConclusion {
+  id: number;
+  ingredient_id: number;
+  claim_summary: string;
+  detailed_conclusion?: string | null;
+  dosage_mentioned?: string | null;
+  rubric_evaluation?: ConclusionRubricEvaluation | null;
+  confidence_score: number;
+  /** Loosely typed as `string` rather than `PaperGrade` at this API
+   * boundary, same reasoning as ResearchPaper.grade above. */
+  confidence_grade: string;
+  cross_paper_consensus: number;
+  supporting_paper_ids: number[];
+  contradicting_paper_ids: number[];
+}
+
 /** Shape of the JSON body returned by GET /api/v1/ingredients/{id}. */
 export interface IngredientDetailResponse {
   id: number;
@@ -418,10 +463,19 @@ export interface IngredientDetailResponse {
   is_graded: boolean;
   grade_badge_text?: string | null;
   papers: ResearchPaper[];
+  /** Every *active* synthesized PaperConclusion for this ingredient,
+   * highest-confidence first (see app/services/search.py::
+   * get_ingredient_conclusions on the backend). Not yet included in
+   * GradeIngredientResponse below — see that interface's docstring. */
+  conclusions: PaperConclusion[];
 }
 
 /** Shape of the JSON body returned by
- * POST /api/v1/ingredients/{id}/grade. */
+ * POST /api/v1/ingredients/{id}/grade. Deliberately has no `conclusions`
+ * field — the backend's GradeIngredientResponse only refreshes `papers`
+ * (see app/schemas/research.py's docstring) — so IngredientCard follows
+ * up this call with a plain fetchIngredientDetail() to pick up anything
+ * the Phase 5 pipeline just synthesized. */
 export interface GradeIngredientResponse {
   status: string;
   ingredient_id: number;

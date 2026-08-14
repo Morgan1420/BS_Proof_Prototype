@@ -6,8 +6,10 @@ import { colors, spacing, typography } from '../theme';
 import { animateCardToggle } from '../utils/animations';
 import GradeBadge, { PLACEHOLDER_GRADE_VALUE } from './GradeBadge';
 import StudiesList from './StudiesList';
+import RecommendedUsesList from './RecommendedUsesList';
+import StudiesAnalysisBar from './StudiesAnalysisBar';
 import { fetchIngredientDetail, gradeIngredient } from '../services/api';
-import type { ResearchPaper } from '../services/api';
+import type { PaperConclusion, ResearchPaper } from '../services/api';
 
 /**
  * A single ingredient/nutrient row. This card is used in two different
@@ -56,14 +58,36 @@ export interface Ingredient {
    * made, so it's effectively always `undefined` on initial load today. */
   grade_badge_text?: string;
   /** Every stored ResearchPaper for this ingredient (see
-   * backend/app/models/research.py), rendered by StudiesList in the
-   * standalone variant's "Science Info" block. `undefined` means "not
-   * loaded yet" — IngredientCard fetches it lazily on first expand (via
-   * GET /api/v1/ingredients/{id}) rather than requiring every caller to
-   * populate it upfront, since most ingredient lists (search results,
-   * product-nested rows) don't need it until a card is actually opened.
-   * Only meaningful for the `'standalone'` variant. */
+   * backend/app/models/research.py), rendered by StudiesList inside the
+   * standalone variant's "Scientific information" section. `undefined`
+   * means "not loaded yet" — IngredientCard fetches it lazily on first
+   * expand (via GET /api/v1/ingredients/{id}) rather than requiring
+   * every caller to populate it upfront, since most ingredient lists
+   * (search results, product-nested rows) don't need it until a card is
+   * actually opened. Only meaningful for the `'standalone'` variant. */
   papers?: ResearchPaper[];
+  /** Every synthesized PaperConclusion for this ingredient (Phase 5 —
+   * see backend/app/models/research.py), rendered by RecommendedUsesList
+   * in the standalone variant's "Scientific information" block. Same
+   * "undefined = not loaded yet, lazily fetched on first expand"
+   * convention as `papers` above. */
+  conclusions?: PaperConclusion[];
+}
+
+/** Renders one generic placeholder info block (label + italic placeholder
+ * body) — shared by the "before" and "after" halves of
+ * STANDALONE_INFO_BLOCKS_BEFORE_SCIENCE/_AFTER_SCIENCE above, since the
+ * "Scientific information" section between them is no longer part of
+ * that same simple array/map. */
+function renderPlaceholderBlock(block: { label: string; placeholder: string }): React.ReactElement {
+  return (
+    <View key={block.label} style={styles.standaloneInfoBlock}>
+      <Text style={[styles.standaloneInfoLabel, styles.expandedTextColor]}>{block.label}</Text>
+      <Text style={[styles.standaloneInfoText, styles.expandedTextColor]}>
+        {block.placeholder}
+      </Text>
+    </View>
+  );
 }
 
 export type IngredientCardVariant = 'nested' | 'standalone';
@@ -80,23 +104,31 @@ export interface IngredientCardProps {
   /** Which internal layout to render. `'nested'` (the default) is the
    * original compact dosage/product-relation card used inside
    * ProductCard's own ingredient accordion — unchanged. `'standalone'` is
-   * the wireframe-driven layout (name + grade badge header, four stacked
-   * placeholder info blocks) used for top-level ingredient results on
-   * ResultsScreen, where an ingredient isn't tied to one particular
-   * product's dosage. Defaulting to `'nested'` means ProductCard's
-   * existing usage doesn't need to change at all. */
+   * the wireframe-driven layout (name + grade badge header, three stacked
+   * placeholder info blocks plus the "Scientific information" composite
+   * section) used for top-level ingredient results on ResultsScreen,
+   * where an ingredient isn't tied to one particular product's dosage.
+   * Defaulting to `'nested'` means ProductCard's existing usage doesn't
+   * need to change at all. */
   variant?: IngredientCardVariant;
 }
 
 /**
- * The stacked info blocks shown in the standalone layout's expanded
- * body. Content is still placeholder text per this pass's wireframe for
- * every block except `'Science Info'`, which now renders the real,
- * database-backed StudiesList component instead (see the render logic
- * below) — the rest are tracked in docs/Architecture.md's "Expandable
+ * The stacked placeholder info blocks shown in the standalone layout's
+ * expanded body. Content is still placeholder text per this pass's
+ * wireframe. `'Science Info'` used to be one of these (swapped for
+ * StudiesList) but is now its own fully custom "Scientific information"
+ * composite section (header + overview text + RecommendedUsesList +
+ * StudiesAnalysisBar + StudiesList — see the render logic below),
+ * rendered explicitly between `'Grade Info'` and `'Related Products'`
+ * rather than folded into this generic placeholder-block array. The
+ * remaining three are tracked in docs/Architecture.md's "Expandable
  * cards" follow-up.
  */
-const STANDALONE_INFO_BLOCKS: ReadonlyArray<{ label: string; placeholder: string }> = [
+const STANDALONE_INFO_BLOCKS_BEFORE_SCIENCE: ReadonlyArray<{
+  label: string;
+  placeholder: string;
+}> = [
   {
     label: 'General Information',
     placeholder: 'General ingredient summary and usage information placeholder...',
@@ -106,11 +138,12 @@ const STANDALONE_INFO_BLOCKS: ReadonlyArray<{ label: string; placeholder: string
     placeholder:
       'Detailed breakdown of safety, efficacy, and purity grade criteria placeholder...',
   },
-  {
-    label: 'Science Info',
-    placeholder:
-      'Scientific studies, clinical trials, and bioavailability research placeholder...',
-  },
+];
+
+const STANDALONE_INFO_BLOCKS_AFTER_SCIENCE: ReadonlyArray<{
+  label: string;
+  placeholder: string;
+}> = [
   {
     label: 'Related Products',
     placeholder: 'List of products containing this standalone ingredient placeholder...',
@@ -154,7 +187,7 @@ const IngredientCard = React.forwardRef<View, IngredientCardProps>(
     // take a few seconds, not feel instant like ProductCard's local flip.
     const [isRequestingGrade, setIsRequestingGrade] = useState(false);
 
-    // --- StudiesList data (standalone variant's "Science Info" block) ---
+    // --- StudiesList data (standalone variant's "Scientific information" section) ---
     // `undefined` = not fetched yet, `[]` = fetched and genuinely empty.
     // Seeded from `ingredient.papers` when the caller already has it (e.g.
     // a parent that just re-rendered this card with fresh data), so we
@@ -172,6 +205,17 @@ const IngredientCard = React.forwardRef<View, IngredientCardProps>(
     // instead of going through this fetch path at all.
     const papersFetchAttemptedRef = useRef(ingredient.papers !== undefined);
 
+    // --- RecommendedUsesList data (standalone variant's "Scientific
+    // information" block, Phase 5) — same undefined/loading/error/fetch-
+    // once-per-mount conventions as `papers` above. Populated by the same
+    // GET /api/v1/ingredients/{id} call as `papers` (one fetch, both
+    // fields on the response) — see the shared effect below.
+    const [conclusions, setConclusions] = useState<PaperConclusion[] | undefined>(
+      ingredient.conclusions
+    );
+    const [conclusionsLoading, setConclusionsLoading] = useState(false);
+    const [conclusionsError, setConclusionsError] = useState<string | null>(null);
+
     useEffect(() => {
       if (variant !== 'standalone' || !isExpanded || papersFetchAttemptedRef.current) {
         return;
@@ -179,12 +223,15 @@ const IngredientCard = React.forwardRef<View, IngredientCardProps>(
       papersFetchAttemptedRef.current = true;
       setPapersLoading(true);
       setPapersError(null);
+      setConclusionsLoading(true);
+      setConclusionsError(null);
 
       let cancelled = false;
       fetchIngredientDetail(ingredient.id)
         .then((detail) => {
           if (!cancelled) {
             setPapers(detail.papers);
+            setConclusions(detail.conclusions);
           }
         })
         .catch((error) => {
@@ -192,11 +239,13 @@ const IngredientCard = React.forwardRef<View, IngredientCardProps>(
             const message =
               error instanceof Error ? error.message : 'Failed to load studies.';
             setPapersError(message);
+            setConclusionsError(message);
           }
         })
         .finally(() => {
           if (!cancelled) {
             setPapersLoading(false);
+            setConclusionsLoading(false);
           }
         });
 
@@ -221,6 +270,24 @@ const IngredientCard = React.forwardRef<View, IngredientCardProps>(
           setPapers(response.papers);
           setPapersError(null);
           papersFetchAttemptedRef.current = true;
+
+          // Unlike `papers`, GradeIngredientResponse deliberately doesn't
+          // include `conclusions` (see backend/app/schemas/research.py) —
+          // the Phase 5 pipeline may have just synthesized new/updated
+          // ones as part of this grade request, so re-fetch ingredient
+          // detail once more to pick them up rather than leaving
+          // RecommendedUsesList showing stale (or empty) data.
+          setConclusionsLoading(true);
+          setConclusionsError(null);
+          fetchIngredientDetail(ingredient.id)
+            .then((detail) => setConclusions(detail.conclusions))
+            .catch(() => {
+              // Best-effort supplementary fetch — the grade request itself
+              // already succeeded (papers/grade above are current), so a
+              // failure here just means conclusions stay whatever they
+              // were before rather than surfacing a second error alert.
+            })
+            .finally(() => setConclusionsLoading(false));
         })
         .catch((error) => {
           const message =
@@ -294,30 +361,41 @@ const IngredientCard = React.forwardRef<View, IngredientCardProps>(
 
         {isExpanded && variant === 'standalone' && (
           <View style={styles.expandedSection}>
-            {STANDALONE_INFO_BLOCKS.map((block) =>
-              block.label === 'Science Info' ? (
-                // StudiesList renders its own "LIST OF STUDIES" header and
-                // background/padding container, so it replaces the whole
-                // block (including the generic label) rather than nesting
-                // inside the standard placeholder wrapper below.
-                <StudiesList
-                  key={block.label}
-                  papers={papers}
-                  isLoading={papersLoading}
-                  errorMessage={papersError}
-                  onPaperGraded={handlePaperGraded}
-                />
-              ) : (
-                <View key={block.label} style={styles.standaloneInfoBlock}>
-                  <Text style={[styles.standaloneInfoLabel, styles.expandedTextColor]}>
-                    {block.label}
-                  </Text>
-                  <Text style={[styles.standaloneInfoText, styles.expandedTextColor]}>
-                    {block.placeholder}
-                  </Text>
-                </View>
-              )
-            )}
+            {STANDALONE_INFO_BLOCKS_BEFORE_SCIENCE.map(renderPlaceholderBlock)}
+
+            {/* "Scientific information" — redesigned Phase 5 section:
+                header + overview placeholder, RecommendedUsesList
+                (conclusions graded C+), StudiesAnalysisBar, then the
+                existing StudiesList retained unchanged at the bottom. */}
+            <View style={styles.scienceSection}>
+              <Text style={[styles.standaloneInfoLabel, styles.expandedTextColor]}>
+                Scientific information
+              </Text>
+              <Text style={[styles.standaloneInfoText, styles.expandedTextColor]}>
+                this is a placeholder text
+              </Text>
+
+              <RecommendedUsesList
+                conclusions={conclusions}
+                isLoading={conclusionsLoading}
+                errorMessage={conclusionsError}
+              />
+
+              <StudiesAnalysisBar papers={papers} />
+
+              {/* StudiesList renders its own "LIST OF STUDIES" header and
+                  background/padding container, retained here exactly as
+                  before — only its position within the wider Scientific
+                  information section changed. */}
+              <StudiesList
+                papers={papers}
+                isLoading={papersLoading}
+                errorMessage={papersError}
+                onPaperGraded={handlePaperGraded}
+              />
+            </View>
+
+            {STANDALONE_INFO_BLOCKS_AFTER_SCIENCE.map(renderPlaceholderBlock)}
           </View>
         )}
 
@@ -448,7 +526,16 @@ const styles = StyleSheet.create({
     paddingBottom: spacing.lg,
     gap: spacing.md,
   },
-  // --- Standalone-variant expanded body (four stacked info blocks) ---
+  // --- Standalone-variant expanded body (stacked info blocks +
+  // "Scientific information" composite section) ---
+  // Wraps the whole "Scientific information" section (header + overview
+  // text + RecommendedUsesList + StudiesAnalysisBar + StudiesList) — no
+  // background/border of its own (unlike standaloneInfoBlock below),
+  // since its three sub-widgets already carry their own container
+  // styling; this just spaces them out consistently.
+  scienceSection: {
+    gap: spacing.sm,
+  },
   standaloneInfoBlock: {
     backgroundColor: `${colors.olive}18`,
     borderRadius: 8,

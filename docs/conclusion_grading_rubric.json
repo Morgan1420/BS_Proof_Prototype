@@ -1,118 +1,53 @@
 {
-  "rubric_name": "Ingredient Claim & Conclusion Evaluation Rubric",
   "version": "1.0",
-  "description": "Evaluates extracted scientific conclusions for papers scoring > 50 points. Assesses cross-paper consensus, underlying paper quality, clinical relevance, dosage feasibility, and safety.",
-  "confidence_bands": [
-    {
-      "confidence": "HIGHLY_SUBSTANTIATED",
-      "grade_letter": "A",
-      "min_score": 80,
-      "max_score": 100,
-      "label": "Gold Standard Claim — High Confidence",
-      "color": "#1E7E34",
-      "description": "Strongly supported by multiple high-grade papers with high consensus, clinically meaningful human effect sizes, and realistic oral dosage."
-    },
-    {
-      "confidence": "MODERATELY_SUBSTANTIATED",
-      "grade_letter": "B",
-      "min_score": 60,
-      "max_score": 79,
-      "label": "Promising Evidence — Moderate Confidence",
-      "color": "#28A745",
-      "description": "Supported by good quality research with majority agreement, though minor contradictory evidence or smaller sample sizes exist."
-    },
-    {
-      "confidence": "PRELIMINARY_LIMITED",
-      "grade_letter": "C",
-      "min_score": 40,
-      "max_score": 59,
-      "label": "Preliminary / Conditional Claim",
-      "color": "#D39E00",
-      "description": "Based on moderate paper scores or proxy markers, or inconsistent results across different human trials."
-    },
-    {
-      "confidence": "UNSUBSTANTIATED_CONTRADICTED",
-      "grade_letter": "D",
-      "min_score": 20,
-      "max_score": 39,
-      "label": "Weak or Contradicted Claim",
-      "color": "#FD7E14",
-      "description": "Heavily disputed by higher-grade studies, based on unrealistic dosing, or lacking direct human outcome data."
-    },
-    {
-      "confidence": "REFUTED_UNSAFE",
-      "grade_letter": "E",
-      "min_score": 0,
-      "max_score": 19,
-      "label": "Refuted or Unsafe Claim",
-      "color": "#DC3545",
-      "description": "Directly debunked by high-quality meta-analyses or carries unacceptable toxicity/safety risks."
-    }
+  "description": "Cross-paper conclusion confidence rubric for the Phase 5 conclusion-synthesis pipeline (app/services/conclusion_grader.py). Unlike paper_grading_rubric.json (which scores one paper in isolation), this rubric scores one synthesized *claim* — e.g. 'Improves deep sleep duration' — built up across every graded paper (grade_score > 50) that discusses it. Three categories summing to a maximum of 100 points, mapped to letter grades A-E.",
+
+  "grade_bands": [
+    { "grade": "A", "min_score": 85, "max_score": 100, "label": "Very high confidence — strong, consistent, well-specified evidence" },
+    { "grade": "B", "min_score": 70, "max_score": 84, "label": "High confidence — good evidence with minor gaps" },
+    { "grade": "C", "min_score": 50, "max_score": 69, "label": "Moderate confidence — plausible but limited or mixed evidence" },
+    { "grade": "D", "min_score": 30, "max_score": 49, "label": "Low confidence — weak, thin, or inconsistent evidence" },
+    { "grade": "E", "min_score": 0, "max_score": 29, "label": "Very low confidence — minimal, contradicted, or vague evidence" }
   ],
+
   "categories": [
     {
-      "id": "source_paper_weight",
-      "label": "Source Paper Quality Base",
-      "max_score": 25,
-      "min_score": 0,
-      "description": "Base score proportional to the parent paper's grade score (e.g. paper score of 80/100 contributes 20 points). Papers with grade score <= 50 are excluded entirely.",
+      "id": "evidence_strength",
+      "label": "Source Evidence Strength",
+      "max_score": 40,
+      "description": "How strong the underlying paper(s) supporting this claim are, based on their own paper_grading_rubric.json grade_score (study design, journal rigor, sample methodology, funding bias). For a brand-new claim this reflects the single paper introducing it; for a merged claim it isn't re-scored on every merge (see conclusion_grader.py) — only cross_paper_consensus is re-evaluated as more papers come in.",
       "score_tiers": [
-        { "range": "21-25", "example": "Extracted from an 'A' grade paper (score 85-100)" },
-        { "range": "15-20", "example": "Extracted from a 'B' grade paper (score 70-84)" },
-        { "range": "10-14", "example": "Extracted from a 'C' grade paper (score 51-69)" }
+        { "range": "34-40", "example": "Primarily backed by paper(s) graded 'A' (85-100) — systematic reviews or well-controlled human RCTs" },
+        { "range": "24-33", "example": "Primarily backed by paper(s) graded 'B' (70-84) — solid methodology, minor limitations" },
+        { "range": "14-23", "example": "Primarily backed by paper(s) graded 'C' (50-69) — fair quality or notable limitations" },
+        { "range": "5-13", "example": "Backed by a single borderline paper just above the grading threshold" },
+        { "range": "0-4", "example": "Evidence quality unclear or minimally documented" }
       ]
     },
     {
       "id": "cross_paper_consensus",
-      "label": "Cross-Paper Consensus & Contradiction",
-      "max_score": 35,
-      "min_score": -15,
-      "description": "Evaluates agreement vs. dissent across all other retrieved papers for the ingredient, weighted by those papers' respective grades.",
+      "label": "Cross-Paper Consensus",
+      "max_score": 40,
+      "description": "How many independent papers support vs. contradict this claim, and how consistent the finding is across them. Re-evaluated by Gemini every time a new qualifying paper is merged into an existing claim (see conclusion_grader.py::process_paper_conclusions) — this is the one category score that changes after a claim is first created.",
       "score_tiers": [
-        { "range": "28 to 35", "example": "Strong consensus — multiple other Grade A/B papers corroborate this conclusion with zero major contradictions." },
-        { "range": "15 to 27", "example": "Moderate agreement — other papers support the claim, but sample sizes or populations differ slightly." },
-        { "range": "0 to 14", "example": "Isolated claim — no other papers confirm or contradict it yet." },
-        { "range": "-1 to -8", "example": "Minor contradiction — lower-grade or equivalent papers find conflicting results." },
-        { "range": "-9 to -15", "example": "Direct refutation — higher-grade meta-analyses or RCTs explicitly contradict this conclusion." }
+        { "range": "34-40", "example": "Supported by 4+ independent papers with no contradicting evidence" },
+        { "range": "24-33", "example": "Supported by 2-3 independent papers, no contradicting evidence" },
+        { "range": "14-23", "example": "Supported by a single paper so far, or supported by multiple with one contradicting outlier" },
+        { "range": "5-13", "example": "Mixed evidence — roughly as many contradicting papers as supporting ones" },
+        { "range": "0-4", "example": "Contradicted by more papers than currently support it" }
       ]
     },
     {
-      "id": "clinical_relevance",
-      "label": "Clinical Relevance & Direct Outcome",
+      "id": "claim_specificity",
+      "label": "Claim Specificity & Clinical Relevance",
       "max_score": 20,
-      "min_score": 0,
-      "description": "Measures whether the conclusion proves a direct human health outcome or merely an indirect biological biomarker.",
+      "description": "How precisely the claim specifies dosage, population, and outcome measure, and how clinically actionable it is for someone deciding whether to take this ingredient.",
       "score_tiers": [
-        { "range": "16-20", "example": "Direct, measurable human efficacy (e.g. reduced pain, improved sleep efficiency)" },
-        { "range": "10-15", "example": "Surrogate clinical endpoint in humans (e.g. lowered blood pressure, improved lipid profile)" },
-        { "range": "4-9", "example": "Indirect biomarker or mechanism in healthy human volunteers" },
-        { "range": "0-3", "example": "In vitro mechanism, cell culture, or animal tissue response" }
-      ]
-    },
-    {
-      "id": "dosage_practicality",
-      "label": "Dosage & Bioavailability Realism",
-      "max_score": 10,
-      "min_score": -5,
-      "description": "Assesses if the effective concentration mentioned in the conclusion translates to a realistic, oral daily supplement dosage.",
-      "score_tiers": [
-        { "range": "8 to 10", "example": "Standard oral supplementation dose (e.g. 100mg - 500mg daily) with proven oral bioavailability" },
-        { "range": "4 to 7", "example": "High but achievable oral dose (e.g. 1g - 3g daily) or requires specialized delivery (liposomal)" },
-        { "range": "0 to 3", "example": "Unclear dosing mentioned in conclusion" },
-        { "range": "-1 to -5", "example": "Unrealistic or unsafe dose (e.g. 50g/day needed orally) or IV-only administration" }
-      ]
-    },
-    {
-      "id": "safety_risk_balance",
-      "label": "Safety & Side Effect Profile",
-      "max_score": 10,
-      "min_score": -10,
-      "description": "Rewards claims that confirm strong safety thresholds and penalizes conclusions associated with severe side effects.",
-      "score_tiers": [
-        { "range": "8 to 10", "example": "Conclusion explicitly documents well-tolerated safety profile and zero adverse events" },
-        { "range": "3 to 7", "example": "Mild, reversible side effects reported (e.g. slight stomach upset)" },
-        { "range": "0 to 2", "example": "Safety outcomes not measured or reported in conclusion" },
-        { "range": "-1 to -10", "example": "Reported organ toxicity, severe contraindications, or drug-interaction hazards" }
+        { "range": "17-20", "example": "Specific dosage, population, and outcome measure all clearly stated" },
+        { "range": "11-16", "example": "Dosage and outcome stated, population described only generally" },
+        { "range": "5-10", "example": "Partial specificity — dosage OR outcome stated, but not both" },
+        { "range": "1-4", "example": "Vague claim with minimal specific detail" },
+        { "range": "0-0", "example": "No specific dosage, population, or outcome detail provided" }
       ]
     }
   ]

@@ -6,10 +6,14 @@ from typing import List, Optional
 
 from sqlmodel import Session, select
 
-from app.models.research import ResearchPaper, parse_keywords
+from app.models.research import PaperConclusion, ResearchPaper, parse_keywords
 from app.models.supplement import Ingredient as IngredientRow
 from app.models.supplement import Product, ProductIngredientLink
-from app.schemas.research import IngredientDetailResponse, ResearchPaperResponse
+from app.schemas.research import (
+    IngredientDetailResponse,
+    PaperConclusionResponse,
+    ResearchPaperResponse,
+)
 from app.schemas.search import FilterType, ResultType, SearchResultItem
 from app.schemas.supplement import LinkedIngredientResponse, ProductDetailResponse
 
@@ -116,12 +120,44 @@ def get_ingredient_papers(
     return [to_research_paper_response(paper) for paper in session.exec(stmt).all()]
 
 
+def get_ingredient_conclusions(
+    session: Session, ingredient_id: int
+) -> List[PaperConclusionResponse]:
+    """Returns every *active* synthesized PaperConclusion for
+    `ingredient_id`, highest-confidence first — backs the `conclusions`
+    field on GET /api/v1/ingredients/{id} (see
+    app/services/conclusion_grader.py for how these are built/updated).
+    """
+    stmt = (
+        select(PaperConclusion)
+        .where(PaperConclusion.ingredient_id == ingredient_id)
+        .where(PaperConclusion.is_active.is_(True))
+        .order_by(PaperConclusion.confidence_score.desc())
+    )
+    return [
+        PaperConclusionResponse(
+            id=conclusion.id,
+            ingredient_id=conclusion.ingredient_id,
+            claim_summary=conclusion.claim_summary,
+            detailed_conclusion=conclusion.detailed_conclusion,
+            dosage_mentioned=conclusion.dosage_mentioned,
+            rubric_evaluation=conclusion.rubric_evaluation,
+            confidence_score=conclusion.confidence_score,
+            confidence_grade=conclusion.confidence_grade,
+            cross_paper_consensus=conclusion.cross_paper_consensus,
+            supporting_paper_ids=conclusion.supporting_paper_ids,
+            contradicting_paper_ids=conclusion.contradicting_paper_ids,
+        )
+        for conclusion in session.exec(stmt).all()
+    ]
+
+
 def get_ingredient_detail(
     session: Session, ingredient_id: int
 ) -> Optional[IngredientDetailResponse]:
     """Returns a single canonical Ingredient plus its full stored paper
-    list, or None if no Ingredient with that id exists. Backs
-    GET /api/v1/ingredients/{id}.
+    list and synthesized conclusion list, or None if no Ingredient with
+    that id exists. Backs GET /api/v1/ingredients/{id}.
     """
     ingredient = session.get(IngredientRow, ingredient_id)
     if ingredient is None:
@@ -136,6 +172,7 @@ def get_ingredient_detail(
         is_graded=ingredient.is_graded,
         grade_badge_text=ingredient.grade_badge_text,
         papers=get_ingredient_papers(session, ingredient.id),
+        conclusions=get_ingredient_conclusions(session, ingredient.id),
     )
 
 
