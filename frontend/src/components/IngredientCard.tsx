@@ -1,8 +1,13 @@
-import React from 'react';
-import { View, Text, Pressable, StyleSheet } from 'react-native';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import { View, Text, Pressable, StyleSheet, Alert } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 
 import { colors, spacing, typography } from '../theme';
+import { animateCardToggle } from '../utils/animations';
+import GradeBadge, { PLACEHOLDER_GRADE_VALUE } from './GradeBadge';
+import StudiesList from './StudiesList';
+import { fetchIngredientDetail, gradeIngredient } from '../services/api';
+import type { ResearchPaper } from '../services/api';
 
 /**
  * A single ingredient/nutrient row. This card is used in two different
@@ -33,7 +38,35 @@ export interface Ingredient {
   recommendedDailyDosage?: string;
   scientificData?: string;
   productCount?: number;
+  /** Whether this ingredient already has a grade. Every mapping function
+   * that builds an `Ingredient` currently initializes this to `false` —
+   * search results don't yet come back with real grading data (see
+   * docs/Architecture.md's "Known gaps") — so in practice this only ever
+   * becomes `true` locally, after a successful
+   * POST /api/v1/ingredients/{id}/grade call (see this component's
+   * `handleGradeRequest` below). Only meaningful for the `'standalone'`
+   * variant (see `variant` below) — nested ingredient rows don't render
+   * a grade badge at all. */
+  is_graded?: boolean;
+  /** Debug grade text from the grading API (e.g. "14 / 14 / 14",
+   * formatted server-side as the ingredient's stored paper count
+   * repeated three times — see backend/app/services/grading.py). Only
+   * meaningful once `is_graded` is true; like `is_graded`, nothing
+   * populates this with a real value before a grade request has been
+   * made, so it's effectively always `undefined` on initial load today. */
+  grade_badge_text?: string;
+  /** Every stored ResearchPaper for this ingredient (see
+   * backend/app/models/research.py), rendered by StudiesList in the
+   * standalone variant's "Science Info" block. `undefined` means "not
+   * loaded yet" — IngredientCard fetches it lazily on first expand (via
+   * GET /api/v1/ingredients/{id}) rather than requiring every caller to
+   * populate it upfront, since most ingredient lists (search results,
+   * product-nested rows) don't need it until a card is actually opened.
+   * Only meaningful for the `'standalone'` variant. */
+  papers?: ResearchPaper[];
 }
+
+export type IngredientCardVariant = 'nested' | 'standalone';
 
 export interface IngredientCardProps {
   ingredient: Ingredient;
@@ -44,134 +77,400 @@ export interface IngredientCardProps {
   /** Called when the header is tapped; the parent decides what "open"
    * means (usually: toggle this id, closing any other open sibling). */
   onToggle: () => void;
+  /** Which internal layout to render. `'nested'` (the default) is the
+   * original compact dosage/product-relation card used inside
+   * ProductCard's own ingredient accordion — unchanged. `'standalone'` is
+   * the wireframe-driven layout (name + grade badge header, four stacked
+   * placeholder info blocks) used for top-level ingredient results on
+   * ResultsScreen, where an ingredient isn't tied to one particular
+   * product's dosage. Defaulting to `'nested'` means ProductCard's
+   * existing usage doesn't need to change at all. */
+  variant?: IngredientCardVariant;
 }
+
+/**
+ * The stacked info blocks shown in the standalone layout's expanded
+ * body. Content is still placeholder text per this pass's wireframe for
+ * every block except `'Science Info'`, which now renders the real,
+ * database-backed StudiesList component instead (see the render logic
+ * below) — the rest are tracked in docs/Architecture.md's "Expandable
+ * cards" follow-up.
+ */
+const STANDALONE_INFO_BLOCKS: ReadonlyArray<{ label: string; placeholder: string }> = [
+  {
+    label: 'General Information',
+    placeholder: 'General ingredient summary and usage information placeholder...',
+  },
+  {
+    label: 'Grade Info',
+    placeholder:
+      'Detailed breakdown of safety, efficacy, and purity grade criteria placeholder...',
+  },
+  {
+    label: 'Science Info',
+    placeholder:
+      'Scientific studies, clinical trials, and bioavailability research placeholder...',
+  },
+  {
+    label: 'Related Products',
+    placeholder: 'List of products containing this standalone ingredient placeholder...',
+  },
+];
 
 /** Accordion card for a single ingredient. Expansion state is entirely
  * controlled by the parent — see IngredientCardProps.isExpanded/onToggle
  * — so a group of these can implement single-expansion (only one open at
  * a time) by sharing one `expandedId` state value.
+ *
+ * Forwards `ref` to its outer `View` so ProductCard can attach a ref
+ * directly to a nested ingredient row (no extra wrapping View needed) —
+ * used to auto-scroll a just-expanded ingredient into view on web via
+ * `ref.current.scrollIntoView(...)` (React Native Web forwards `View`
+ * refs to the underlying DOM node, which supports it natively).
  */
-const IngredientCard: React.FC<IngredientCardProps> = ({
-  ingredient,
-  isExpanded,
-  onToggle,
-}) => {
-  const doseSummary =
-    ingredient.amount && ingredient.unit
-      ? `${ingredient.amount}${ingredient.unit}`
-      : ingredient.recommendedDailyDosage
-      ? `RDA: ${ingredient.recommendedDailyDosage}`
-      : 'dosage unavailable';
+const IngredientCard = React.forwardRef<View, IngredientCardProps>(
+  function IngredientCard({ ingredient, isExpanded, onToggle, variant = 'nested' }, ref) {
+    const doseSummary =
+      ingredient.amount && ingredient.unit
+        ? `${ingredient.amount}${ingredient.unit}`
+        : ingredient.recommendedDailyDosage
+        ? `RDA: ${ingredient.recommendedDailyDosage}`
+        : 'dosage unavailable';
 
-  return (
-    <View style={styles.card}>
-      <Pressable
-        style={styles.headerRow}
-        onPress={onToggle}
-        accessibilityRole="button"
-        accessibilityLabel={`${isExpanded ? 'Collapse' : 'Expand'} ${ingredient.name}`}
-        accessibilityState={{ expanded: isExpanded }}
-      >
-        <Text style={styles.headerText} numberOfLines={2}>
-          {ingredient.name} — {doseSummary}
-        </Text>
-        <Ionicons
-          name={isExpanded ? 'chevron-up' : 'chevron-down'}
-          size={18}
-          color={colors.brown}
-        />
-      </Pressable>
+    // "Graded" state — only meaningful (and only rendered) for the
+    // standalone variant; harmless to keep these hooks unconditional for
+    // the nested variant too (Rules of Hooks), they're simply unused
+    // there. Unlike ProductCard's still-local-only placeholder grading,
+    // this is backed by a real POST /api/v1/ingredients/{id}/grade call
+    // (see handleGradeRequest below) — isGraded/gradeBadgeText reflect
+    // whatever that call actually returned, not an instant local flip.
+    const [isGraded, setIsGraded] = useState(ingredient.is_graded ?? false);
+    const [gradeBadgeText, setGradeBadgeText] = useState(
+      ingredient.grade_badge_text ?? PLACEHOLDER_GRADE_VALUE
+    );
+    // Drives GradeBadge's loading spinner while the request is in
+    // flight — the backend call chains Gemini keyword generation plus
+    // several sequential external paper-search API calls, so this can
+    // take a few seconds, not feel instant like ProductCard's local flip.
+    const [isRequestingGrade, setIsRequestingGrade] = useState(false);
 
-      {isExpanded && (
-        <View style={styles.expandedSection}>
-          <View style={styles.doseBlock}>
-            {ingredient.amount && ingredient.unit ? (
-              // Product-specific dosage — this card represents a
-              // particular product's link to this ingredient.
-              <View style={styles.doseRow}>
-                <Text style={styles.doseLabel}>Dosage</Text>
-                <Text style={styles.doseValue}>
-                  {`${ingredient.amount} ${ingredient.unit}`}
-                </Text>
+    // --- StudiesList data (standalone variant's "Science Info" block) ---
+    // `undefined` = not fetched yet, `[]` = fetched and genuinely empty.
+    // Seeded from `ingredient.papers` when the caller already has it (e.g.
+    // a parent that just re-rendered this card with fresh data), so we
+    // don't refetch something we were already handed.
+    const [papers, setPapers] = useState<ResearchPaper[] | undefined>(
+      ingredient.papers
+    );
+    const [papersLoading, setPapersLoading] = useState(false);
+    const [papersError, setPapersError] = useState<string | null>(null);
+    // Guards the lazy fetch below to "at most once per mount" rather than
+    // retrying on every render while `papers` stays undefined (e.g. after
+    // a fetch error) — a manual re-expand (collapse/expand again) doesn't
+    // remount this component, so this ref persists across that; a fresh
+    // grade request (handleGradeRequest below) updates `papers` directly
+    // instead of going through this fetch path at all.
+    const papersFetchAttemptedRef = useRef(ingredient.papers !== undefined);
+
+    useEffect(() => {
+      if (variant !== 'standalone' || !isExpanded || papersFetchAttemptedRef.current) {
+        return;
+      }
+      papersFetchAttemptedRef.current = true;
+      setPapersLoading(true);
+      setPapersError(null);
+
+      let cancelled = false;
+      fetchIngredientDetail(ingredient.id)
+        .then((detail) => {
+          if (!cancelled) {
+            setPapers(detail.papers);
+          }
+        })
+        .catch((error) => {
+          if (!cancelled) {
+            const message =
+              error instanceof Error ? error.message : 'Failed to load studies.';
+            setPapersError(message);
+          }
+        })
+        .finally(() => {
+          if (!cancelled) {
+            setPapersLoading(false);
+          }
+        });
+
+      return () => {
+        cancelled = true;
+      };
+    }, [variant, isExpanded, ingredient.id]);
+
+    const handleGradeRequest = useCallback(() => {
+      if (isRequestingGrade) {
+        return;
+      }
+      setIsRequestingGrade(true);
+      gradeIngredient(ingredient.id)
+        .then((response) => {
+          animateCardToggle();
+          setIsGraded(response.is_graded);
+          setGradeBadgeText(response.grade_badge_text ?? PLACEHOLDER_GRADE_VALUE);
+          // The grade endpoint returns the full, freshly-updated paper
+          // list — use it directly instead of triggering a second GET
+          // /api/v1/ingredients/{id} round trip.
+          setPapers(response.papers);
+          setPapersError(null);
+          papersFetchAttemptedRef.current = true;
+        })
+        .catch((error) => {
+          const message =
+            error instanceof Error ? error.message : 'Unknown error occurred.';
+          Alert.alert('Grading failed', message);
+        })
+        .finally(() => {
+          setIsRequestingGrade(false);
+        });
+    }, [ingredient.id, isRequestingGrade]);
+
+    /** Splices one freshly-graded paper back into local `papers` state
+     * by id — passed to StudiesList as `onPaperGraded`, called after a
+     * successful on-demand single-paper grade (tapping a gray "(-)"
+     * badge). `papers` is owned here, not in StudiesList (see that
+     * component's `onPaperGraded` prop doc), so this is the one place
+     * that actually needs to update — StudiesList re-derives its sorted/
+     * paginated view from this prop automatically once it changes.
+     */
+    const handlePaperGraded = useCallback((updatedPaper: ResearchPaper) => {
+      setPapers((current) =>
+        current?.map((paper) => (paper.id === updatedPaper.id ? updatedPaper : paper))
+      );
+    }, []);
+
+    return (
+      <View ref={ref} style={[styles.card, isExpanded && styles.cardExpanded]}>
+        <Pressable
+          style={styles.headerRow}
+          onPress={onToggle}
+          accessibilityRole="button"
+          accessibilityLabel={`${isExpanded ? 'Collapse' : 'Expand'} ${ingredient.name}`}
+          accessibilityState={{ expanded: isExpanded }}
+        >
+          {variant === 'standalone' ? (
+            <>
+              <Text
+                style={[styles.standaloneName, isExpanded && styles.expandedTextColor]}
+                numberOfLines={2}
+              >
+                {ingredient.name}
+              </Text>
+              <View style={styles.standaloneHeaderRight}>
+                <GradeBadge
+                  isGraded={isGraded}
+                  onRequestGrade={handleGradeRequest}
+                  isExpanded={isExpanded}
+                  gradeValue={gradeBadgeText}
+                  isLoading={isRequestingGrade}
+                />
+                <Ionicons
+                  name={isExpanded ? 'chevron-up' : 'chevron-down'}
+                  size={18}
+                  color={colors.brown}
+                />
               </View>
-            ) : (
-              // No product-specific dosage available (standalone
-              // ingredient result) — fall back to the canonical
-              // ingredient's general dosage guidance placeholder.
-              <View style={styles.doseRow}>
-                <Text style={styles.doseLabel}>Recommended Daily Dosage</Text>
-                <Text style={styles.doseValue}>
-                  {ingredient.recommendedDailyDosage ?? 'Not available'}
-                </Text>
-              </View>
-            )}
-            {ingredient.dailyValue && (
-              <View style={styles.doseRow}>
-                <Text style={styles.doseLabel}>% Daily Value</Text>
-                <Text style={styles.doseValue}>{ingredient.dailyValue}</Text>
-              </View>
-            )}
-            {ingredient.productName && (
-              <View style={styles.doseRow}>
-                <Text style={styles.doseLabel}>Product</Text>
-                <Text style={styles.doseValue}>{ingredient.productName}</Text>
-              </View>
-            )}
-            {typeof ingredient.productCount === 'number' && (
-              <View style={styles.doseRow}>
-                <Text style={styles.doseLabel}>Found In</Text>
-                <Text style={styles.doseValue}>
-                  {ingredient.productCount}{' '}
-                  {ingredient.productCount === 1 ? 'product' : 'products'}
-                </Text>
-              </View>
+            </>
+          ) : (
+            <>
+              <Text style={styles.headerText} numberOfLines={2}>
+                {ingredient.name} — {doseSummary}
+              </Text>
+              <Ionicons
+                name={isExpanded ? 'chevron-up' : 'chevron-down'}
+                size={18}
+                color={colors.brown}
+              />
+            </>
+          )}
+        </Pressable>
+
+        {isExpanded && variant === 'standalone' && (
+          <View style={styles.expandedSection}>
+            {STANDALONE_INFO_BLOCKS.map((block) =>
+              block.label === 'Science Info' ? (
+                // StudiesList renders its own "LIST OF STUDIES" header and
+                // background/padding container, so it replaces the whole
+                // block (including the generic label) rather than nesting
+                // inside the standard placeholder wrapper below.
+                <StudiesList
+                  key={block.label}
+                  papers={papers}
+                  isLoading={papersLoading}
+                  errorMessage={papersError}
+                  onPaperGraded={handlePaperGraded}
+                />
+              ) : (
+                <View key={block.label} style={styles.standaloneInfoBlock}>
+                  <Text style={[styles.standaloneInfoLabel, styles.expandedTextColor]}>
+                    {block.label}
+                  </Text>
+                  <Text style={[styles.standaloneInfoText, styles.expandedTextColor]}>
+                    {block.placeholder}
+                  </Text>
+                </View>
+              )
             )}
           </View>
+        )}
 
-          <View style={styles.researchPlaceholder}>
-            <Text style={styles.researchPlaceholderText}>
-              {ingredient.scientificData ??
-                'General compound research & metadata coming soon...'}
-            </Text>
+        {isExpanded && variant === 'nested' && (
+          <View style={styles.expandedSection}>
+            <View style={styles.doseBlock}>
+              {ingredient.amount && ingredient.unit ? (
+                // Product-specific dosage — this card represents a
+                // particular product's link to this ingredient.
+                <View style={styles.doseRow}>
+                  <Text style={styles.doseLabel}>Dosage</Text>
+                  <Text style={styles.doseValue}>
+                    {`${ingredient.amount} ${ingredient.unit}`}
+                  </Text>
+                </View>
+              ) : (
+                // No product-specific dosage available (standalone
+                // ingredient result) — fall back to the canonical
+                // ingredient's general dosage guidance placeholder.
+                <View style={styles.doseRow}>
+                  <Text style={styles.doseLabel}>Recommended Daily Dosage</Text>
+                  <Text style={styles.doseValue}>
+                    {ingredient.recommendedDailyDosage ?? 'Not available'}
+                  </Text>
+                </View>
+              )}
+              {ingredient.dailyValue && (
+                <View style={styles.doseRow}>
+                  <Text style={styles.doseLabel}>% Daily Value</Text>
+                  <Text style={styles.doseValue}>{ingredient.dailyValue}</Text>
+                </View>
+              )}
+              {ingredient.productName && (
+                <View style={styles.doseRow}>
+                  <Text style={styles.doseLabel}>Product</Text>
+                  <Text style={styles.doseValue}>{ingredient.productName}</Text>
+                </View>
+              )}
+              {typeof ingredient.productCount === 'number' && (
+                <View style={styles.doseRow}>
+                  <Text style={styles.doseLabel}>Found In</Text>
+                  <Text style={styles.doseValue}>
+                    {ingredient.productCount}{' '}
+                    {ingredient.productCount === 1 ? 'product' : 'products'}
+                  </Text>
+                </View>
+              )}
+            </View>
+
+            <View style={styles.researchPlaceholder}>
+              <Text style={styles.researchPlaceholderText}>
+                {ingredient.scientificData ??
+                  'General compound research & metadata coming soon...'}
+              </Text>
+            </View>
           </View>
-        </View>
-      )}
-    </View>
-  );
-};
+        )}
+      </View>
+    );
+  }
+);
+
+IngredientCard.displayName = 'IngredientCard';
 
 const styles = StyleSheet.create({
   card: {
     backgroundColor: colors.offWhite,
-    borderWidth: 1,
-    borderColor: `${colors.olive}55`,
-    borderRadius: 10,
+    // Thicker, dark-green-by-default border (was a thin, translucent
+    // olive one) — overridden by cardExpanded (below) while open.
+    borderWidth: 3,
+    borderColor: colors.darkGreen,
+    // Rounder, more modern feel — up from 10. Slightly smaller than
+    // ProductCard's 20 (a common nested/hierarchy convention: outer
+    // container rounder than what's nested inside it).
+    borderRadius: 16,
     overflow: 'hidden',
+  },
+  // Applied on top of `card` (via a conditional array style) while the
+  // ingredient is expanded — orange accent border, per spec.
+  cardExpanded: {
+    borderColor: colors.orange,
   },
   headerRow: {
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
     gap: spacing.sm,
-    paddingVertical: spacing.sm,
-    paddingHorizontal: spacing.md,
+    // Bumped from paddingVertical: sm/paddingHorizontal: md (8/16) for a
+    // roomier, more generous card.
+    padding: spacing.lg,
   },
   headerText: {
     flex: 1,
-    fontSize: typography.body,
-    fontWeight: '600',
+    fontSize: typography.resultCardTitle,
+    fontWeight: '700',
     color: colors.brown,
   },
-  expandedSection: {
-    paddingHorizontal: spacing.md,
-    paddingBottom: spacing.md,
+  // --- Standalone-variant header (name + grade badge) ---
+  standaloneName: {
+    flex: 1,
+    fontSize: typography.resultCardTitle,
+    fontWeight: '700',
+    color: colors.brown,
+  },
+  // Groups the grade badge + chevron together on the header row's right
+  // side — the wireframe only calls out "name left / badge right", but
+  // the chevron (existing expand/collapse affordance) still needs a
+  // home; pairing it with the badge keeps the row's two-item
+  // space-between layout intact rather than adding a third column.
+  standaloneHeaderRight: {
+    flexDirection: 'row',
+    alignItems: 'center',
     gap: spacing.sm,
+  },
+  // Applied on top of every other standalone-variant text style (via a
+  // conditional array style, e.g. `[styles.standaloneName, isExpanded &&
+  // styles.expandedTextColor]`) while this card is expanded — forces
+  // every text element inside it (name, the four info block labels/
+  // placeholder bodies; GradeBadge handles its own text via the
+  // `isExpanded` prop passed to it) to the palette orange, per spec. Only
+  // applied to the `'standalone'` variant — nested cards are untouched.
+  // The card's own background/border colors are unaffected — only text.
+  expandedTextColor: {
+    color: colors.orange,
+  },
+  expandedSection: {
+    paddingHorizontal: spacing.lg,
+    paddingBottom: spacing.lg,
+    gap: spacing.md,
+  },
+  // --- Standalone-variant expanded body (four stacked info blocks) ---
+  standaloneInfoBlock: {
+    backgroundColor: `${colors.olive}18`,
+    borderRadius: 8,
+    padding: spacing.md,
+    gap: spacing.xs,
+  },
+  standaloneInfoLabel: {
+    fontSize: typography.resultCardLabel,
+    fontWeight: '700',
+    color: colors.darkGreen,
+  },
+  standaloneInfoText: {
+    fontSize: typography.resultCardLabel,
+    color: `${colors.brown}AA`,
+    fontStyle: 'italic',
+    lineHeight: 18,
   },
   doseBlock: {
     backgroundColor: `${colors.olive}18`,
     borderRadius: 8,
-    padding: spacing.sm,
-    gap: 4,
+    padding: spacing.md,
+    gap: spacing.xs,
   },
   doseRow: {
     flexDirection: 'row',
@@ -179,12 +478,12 @@ const styles = StyleSheet.create({
     gap: spacing.sm,
   },
   doseLabel: {
-    fontSize: 12,
+    fontSize: typography.resultCardLabel,
     fontWeight: '700',
     color: colors.brown,
   },
   doseValue: {
-    fontSize: 12,
+    fontSize: typography.resultCardLabel,
     color: colors.brown,
     flexShrink: 1,
     textAlign: 'right',
@@ -194,10 +493,10 @@ const styles = StyleSheet.create({
     borderStyle: 'dashed',
     borderColor: `${colors.brown}55`,
     borderRadius: 8,
-    padding: spacing.sm,
+    padding: spacing.md,
   },
   researchPlaceholderText: {
-    fontSize: 12,
+    fontSize: typography.resultCardLabel,
     fontStyle: 'italic',
     color: `${colors.brown}AA`,
     textAlign: 'center',

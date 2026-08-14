@@ -1,5 +1,12 @@
-import React, { useEffect, useState } from 'react';
-import { View, Text, FlatList, ActivityIndicator, Pressable, StyleSheet } from 'react-native';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import {
+  View,
+  Text,
+  FlatList,
+  ActivityIndicator,
+  Pressable,
+  StyleSheet,
+} from 'react-native';
 import { useNavigation, useRoute } from '@react-navigation/native';
 import type { RouteProp } from '@react-navigation/native';
 import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
@@ -14,6 +21,7 @@ import { colors, layout, spacing, typography } from '../theme';
 import type { RootStackParamList } from '../navigation/types';
 import { searchSupplements } from '../services/api';
 import type { LinkedIngredient, SearchResultItem } from '../services/api';
+import { animateCardToggle } from '../utils/animations';
 
 type ResultsScreenRouteProp = RouteProp<RootStackParamList, 'ResultsScreen'>;
 type ResultsScreenNavigationProp = NativeStackNavigationProp<
@@ -82,6 +90,10 @@ function toProduct(item: SearchResultItem): Product {
     servingSize: undefined,
     createdAt: undefined,
     ingredients: (item.ingredients ?? []).map(toLinkedIngredient),
+    // No real grading system on the backend yet — every product starts
+    // ungraded; see ProductCard.tsx's `handleGradeRequest` for the
+    // placeholder-only "assign a grade" interaction.
+    is_graded: false,
   };
 }
 
@@ -101,6 +113,11 @@ function toIngredient(item: SearchResultItem): Ingredient {
     recommendedDailyDosage: item.recommended_daily_dosage ?? undefined,
     scientificData: item.scientific_data ?? undefined,
     productCount: item.product_count ?? undefined,
+    // No real grading system on the backend yet — every standalone
+    // ingredient result starts ungraded; see IngredientCard.tsx's
+    // `handleGradeRequest` for the placeholder-only "assign a grade"
+    // interaction (standalone variant only).
+    is_graded: false,
   };
 }
 
@@ -128,6 +145,35 @@ const ResultsScreen: React.FC = () => {
   const [expandedIngredientId, setExpandedIngredientId] = useState<
     number | null
   >(null);
+
+  // Single-expansion accordion for top-level ProductCard rows — tracked
+  // here (rather than inside ProductCard) so expanding one product
+  // always collapses any other that was already open.
+  const [expandedProductId, setExpandedProductId] = useState<number | null>(
+    null
+  );
+
+  const flatListRef = useRef<FlatList<SearchResultItem>>(null);
+
+  /**
+   * Scrolls the list so row `index` (a top-level ProductCard or
+   * IngredientCard that was just expanded) is aligned to the top of the
+   * visible area. Deferred one frame via requestAnimationFrame so it
+   * doesn't fight the in-flight LayoutAnimation the card's own expand
+   * triggered (see src/utils/animations.ts) — scrollToIndex only needs
+   * the item's current (pre-expand) offset, which is already known, but
+   * nudging it a frame later keeps the two animations from stepping on
+   * each other.
+   */
+  const scrollToItemIndex = useCallback((index: number): void => {
+    requestAnimationFrame(() => {
+      flatListRef.current?.scrollToIndex({
+        index,
+        animated: true,
+        viewPosition: 0,
+      });
+    });
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -204,24 +250,57 @@ const ResultsScreen: React.FC = () => {
         </View>
       ) : (
         <FlatList
+          ref={flatListRef}
           data={results}
           keyExtractor={(item) => `${item.type}-${item.id}`}
           contentContainerStyle={styles.listContent}
-          renderItem={({ item }) =>
+          renderItem={({ item, index }) =>
             item.type === 'product' ? (
-              <ProductCard product={toProduct(item)} />
+              <ProductCard
+                product={toProduct(item)}
+                isExpanded={expandedProductId === item.id}
+                onToggle={() => {
+                  animateCardToggle();
+                  setExpandedProductId((current) => {
+                    const next = current === item.id ? null : item.id;
+                    if (next !== null) {
+                      scrollToItemIndex(index);
+                    }
+                    return next;
+                  });
+                }}
+                onNestedIngredientExpand={() => scrollToItemIndex(index)}
+              />
             ) : (
               <IngredientCard
                 ingredient={toIngredient(item)}
+                variant="standalone"
                 isExpanded={expandedIngredientId === item.id}
-                onToggle={() =>
-                  setExpandedIngredientId((current) =>
-                    current === item.id ? null : item.id
-                  )
-                }
+                onToggle={() => {
+                  animateCardToggle();
+                  setExpandedIngredientId((current) => {
+                    const next = current === item.id ? null : item.id;
+                    if (next !== null) {
+                      scrollToItemIndex(index);
+                    }
+                    return next;
+                  });
+                }}
               />
             )
           }
+          // scrollToIndex needs the target row already measured; this is
+          // a defensive fallback (item not yet laid out) rather than the
+          // expected path — the tapped card is always already on screen.
+          onScrollToIndexFailed={(info) => {
+            setTimeout(() => {
+              flatListRef.current?.scrollToIndex({
+                index: info.index,
+                animated: true,
+                viewPosition: 0,
+              });
+            }, 100);
+          }}
           ListEmptyComponent={
             <View style={styles.centered}>
               <Text style={styles.emptyText}>No results found.</Text>

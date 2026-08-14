@@ -31,8 +31,24 @@ export const typography = {
   navBarLink: 15,
   heroTitle: 40,
   sectionTitle: 22,
+  /** Extra-prominent variant of sectionTitle — currently just
+   * LibraryScreen's "Search"/"Explore" headers. Kept separate from
+   * `sectionTitle` (used on Home/Results) rather than bumping that
+   * shared token, so this doesn't cascade to screens that didn't ask
+   * for bigger titles. */
+  sectionTitleLarge: 28,
   body: 16,
   buttonLabel: 16,
+  /** Result item cards (ProductCard/IngredientCard on ResultsScreen) —
+   * boosted from the shared `body`/12px tokens they used to use, so
+   * titles/tags/labels read as significantly more prominent inside the
+   * thicker-bordered, more padded card redesign. */
+  resultCardTitle: 20,
+  resultCardTag: 15,
+  /** Secondary/body details (dosage values, metadata labels) — dialed
+   * back down slightly from an earlier pass (14) to keep cards compact,
+   * while still reading larger than the original 12px. */
+  resultCardLabel: 13,
 } as const;
 
 /** Shared spacing scale so padding/margins stay consistent across screens. */

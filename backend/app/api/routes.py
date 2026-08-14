@@ -10,11 +10,20 @@ from sqlmodel import Session
 from starlette.concurrency import run_in_threadpool
 
 from app.db import get_session
+from app.models.research import ResearchPaper
+from app.models.supplement import Ingredient as IngredientRow
 from app.schemas.dev import MockDataResetResponse
+from app.schemas.research import (
+    GradeIngredientResponse,
+    GradePaperResponse,
+    IngredientDetailResponse,
+)
 from app.schemas.search import FilterType, SearchResponse, SuggestResponse
 from app.schemas.supplement import ProductDetailResponse, SupplementAnalysis
+from app.services import grading as grading_service
 from app.services import search as search_service
 from app.services import storage
+from app.services.paper_grader import PaperGradingError, grade_single_paper
 from app.services.vision import VisionServiceError, analyze_supplement_label
 
 logger = logging.getLogger(__name__)
@@ -22,6 +31,8 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=["scan"])
 search_router = APIRouter(prefix="/supplements", tags=["supplements"])
 products_router = APIRouter(prefix="/products", tags=["products"])
+ingredients_router = APIRouter(prefix="/ingredients", tags=["ingredients"])
+papers_router = APIRouter(prefix="/papers", tags=["papers"])
 dev_router = APIRouter(prefix="/dev", tags=["dev"])
 
 # MIME types accepted for a supplement label photo upload.
@@ -171,6 +182,139 @@ async def get_product(
             detail=f"No product with id {product_id}.",
         )
     return detail
+
+
+@ingredients_router.get(
+    "/{ingredient_id}",
+    response_model=IngredientDetailResponse,
+    summary="Get a single canonical ingredient with its full stored research-paper list",
+)
+async def get_ingredient(
+    ingredient_id: int,
+    session: Session = Depends(get_session),
+) -> IngredientDetailResponse:
+    """Returns one canonical Ingredient plus every ResearchPaper stored
+    for it (see app/models/research.py), for the standalone
+    IngredientCard's "List of Studies" panel
+    (src/components/StudiesList.tsx). Papers are whatever's already been
+    persisted by a prior POST .../grade call — this endpoint itself never
+    triggers new paper searches, it just reads what's there (an empty
+    `papers` list if the ingredient hasn't been graded yet).
+    """
+    detail = await run_in_threadpool(
+        search_service.get_ingredient_detail, session, ingredient_id
+    )
+    if detail is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No ingredient with id {ingredient_id}.",
+        )
+    return detail
+
+
+@ingredients_router.post(
+    "/{ingredient_id}/grade",
+    response_model=GradeIngredientResponse,
+    summary="[Phase 2, debug] Generate search keywords, fetch research papers, and assign a debug grade",
+)
+async def grade_ingredient(
+    ingredient_id: int,
+    session: Session = Depends(get_session),
+) -> GradeIngredientResponse:
+    """Runs the Phase 2 grading pipeline for a single ingredient:
+
+    1. Looks up the Ingredient by id (404 if it doesn't exist).
+    2. Asks Gemini for 3-5 targeted search keywords
+       (app/services/research_keywords.py).
+    3. Queries PubMed / Europe PMC / Semantic Scholar for each keyword and
+       persists new, deduplicated ResearchPaper rows
+       (app/services/paper_search.py).
+    4. Sets `is_graded=True` and `grade_badge_text` to the total stored
+       paper count formatted as "N / N / N" — a debug placeholder, not a
+       real grading algorithm yet (see app/services/grading.py).
+
+    This can take several seconds (it makes multiple external network
+    calls server-side, sequentially) — the frontend shows a loading
+    spinner on the grade button for the duration.
+    """
+    ingredient = session.get(IngredientRow, ingredient_id)
+    if ingredient is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No ingredient with id {ingredient_id}.",
+        )
+
+    try:
+        # The Gemini call and every paper-search HTTP call are blocking;
+        # run the whole pipeline off the event loop, same reasoning as
+        # /scan's analyze_supplement_label call above.
+        paper_count = await run_in_threadpool(
+            grading_service.grade_ingredient, session, ingredient
+        )
+    except grading_service.GradingError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Grading failed: {exc}",
+        ) from exc
+
+    # Full paper list (not just the count) so the frontend can refresh its
+    # StudiesList panel immediately off this response, without a
+    # follow-up GET /api/v1/ingredients/{id} call.
+    papers = await run_in_threadpool(
+        search_service.get_ingredient_papers, session, ingredient.id
+    )
+
+    return GradeIngredientResponse(
+        status="success",
+        ingredient_id=ingredient.id,
+        is_graded=ingredient.is_graded,
+        grade_badge_text=ingredient.grade_badge_text,
+        papers_found=paper_count,
+        papers=papers,
+    )
+
+
+@papers_router.post(
+    "/{paper_id}/grade",
+    response_model=GradePaperResponse,
+    summary="[Phase 4, on-demand] Grade a single already-stored research paper",
+)
+async def grade_paper_route(
+    paper_id: int,
+    session: Session = Depends(get_session),
+) -> GradePaperResponse:
+    """Grades exactly one already-stored `ResearchPaper` row on demand —
+    backs the frontend's gray "(-)" ungraded badge in StudiesList
+    (tapping it calls this instead of waiting for the next full
+    ingredient re-grade).
+
+    1. Looks up the ResearchPaper by id (404 if it doesn't exist).
+    2. If it's already graded, returns it unchanged (no Gemini call) —
+       see app/services/paper_grader.py::grade_single_paper's docstring
+       for why this is a safe, idempotent no-op rather than an error.
+    3. Otherwise runs it through the same rubric-based Gemini evaluation
+       as ingestion-time grading (app/services/paper_grader.py::grade_paper)
+       and persists the result.
+    """
+    paper = session.get(ResearchPaper, paper_id)
+    if paper is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No research paper with id {paper_id}.",
+        )
+
+    try:
+        graded_paper = await run_in_threadpool(grade_single_paper, session, paper)
+    except PaperGradingError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Grading failed: {exc}",
+        ) from exc
+
+    return GradePaperResponse(
+        status="success",
+        paper=search_service.to_research_paper_response(graded_paper),
+    )
 
 
 @dev_router.delete(

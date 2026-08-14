@@ -30,9 +30,27 @@ export const API_BASE_URL = 'http://192.168.31.229:8000'; // TODO: set for your 
 
 const SCAN_ENDPOINT = `${API_BASE_URL}/api/v1/scan`;
 
-/** Shape of the JSON body returned by POST /api/v1/scan on success. */
-export interface ScanResponse {
-  message: string;
+/** A single ingredient row from POST /api/v1/scan's response — mirrors
+ * the backend's app/schemas/supplement.py::Ingredient (the per-scan
+ * parsed shape Gemini returns, not the canonical DB Ingredient row —
+ * see that file's module docstring for the distinction). */
+export interface ScannedIngredient {
+  name: string;
+  amount: string;
+  unit: string;
+  daily_value?: string | null;
+}
+
+/** Shape of the JSON body returned by POST /api/v1/scan on success —
+ * mirrors the backend's SupplementAnalysis (app/schemas/supplement.py).
+ * Replaces the old `{ message: string }` stub, which never actually
+ * matched what the backend returns (a long-flagged "Known gap" in
+ * docs/Architecture.md — ScanScreen previously worked around it by
+ * treating the response as `unknown`). */
+export interface SupplementAnalysis {
+  product_name?: string | null;
+  serving_size?: string | null;
+  ingredients: ScannedIngredient[];
 }
 
 /** Shape of a FastAPI error body, e.g. { "detail": "..." }. */
@@ -77,7 +95,7 @@ function inferImagePayload(uri: string): UploadableImage {
  */
 export async function uploadSupplementImage(
   uri: string
-): Promise<ScanResponse> {
+): Promise<SupplementAnalysis> {
   const image = inferImagePayload(uri);
 
   const formData = new FormData();
@@ -141,7 +159,7 @@ export async function uploadSupplementImage(
     throw new Error(detail);
   }
 
-  return (await response.json()) as ScanResponse;
+  return (await response.json()) as SupplementAnalysis;
 }
 
 // ---------------------------------------------------------------------
@@ -323,6 +341,218 @@ export async function fetchProductDetail(
   return getJson<ProductDetailResponse>(
     `${API_BASE_URL}/api/v1/products/${productId}`
   );
+}
+
+// ---------------------------------------------------------------------
+// Ingredient detail + grading (GET/POST /api/v1/ingredients/{id}...) — Phase 2
+// ---------------------------------------------------------------------
+
+/** Recognized paper letter grades (Phase 3 automated grading) — mirrors
+ * docs/paper_grading_rubric.json's `grade_bands`. */
+export type PaperGrade = 'A' | 'B' | 'C' | 'D' | 'E';
+
+/**
+ * Structured per-category rubric breakdown for a graded paper — mirrors
+ * the backend's RubricEvaluationResponse (app/schemas/research.py),
+ * which itself mirrors app/services/paper_grader.py's RubricEvaluation
+ * shape and, in turn, ResearchPaper.rubric_evaluation's stored JSON.
+ * Rendered by StudiesList's Rubric Breakdown modal.
+ */
+export interface RubricEvaluation {
+  study_type: string;
+  study_type_score: number;
+  journal_reputation: string;
+  journal_score: number;
+  sample_info: string;
+  sample_score: number;
+  funding_status: string;
+  funding_score: number;
+  total_score: number;
+  summary_notes: string;
+}
+
+/**
+ * A single stored research paper — mirrors the backend's
+ * ResearchPaperResponse (app/schemas/research.py), which itself mirrors
+ * the ResearchPaper table (app/models/research.py). Rendered by
+ * StudiesList.tsx.
+ */
+export interface ResearchPaper {
+  id: number;
+  title: string;
+  abstract?: string | null;
+  authors?: string | null;
+  publication_date?: string | null;
+  source_url: string;
+  source_domain: string;
+  ingredient_id: number;
+  /** Every Gemini-generated search keyword that surfaced this paper
+   * (backend: ResearchPaper.keywords, comma-separated string parsed into
+   * this array server-side). Rendered as "Matched Keywords" pill tags in
+   * StudiesList's paper info modal. Always present as an array (possibly
+   * empty), never undefined. */
+  keywords: string[];
+  /** Letter grade from the Phase 3 automated paper-grading pipeline
+   * (app/services/paper_grader.py) — null until that pipeline has
+   * successfully graded this paper (grading is best-effort at ingestion
+   * time; a Gemini/parsing failure leaves a paper permanently
+   * ungraded). Typed loosely as `string` rather than `PaperGrade` at
+   * this API boundary since the backend's `Optional[str]` column isn't
+   * enforced beyond "A"-"E" by a DB constraint — StudiesList validates
+   * against PaperGrade before rendering a badge. */
+  grade?: string | null;
+  /** Total rubric score, 0-100. Null iff `grade` is null. */
+  grade_score?: number | null;
+  /** Full per-category breakdown backing `grade`/`grade_score`. Null iff
+   * `grade` is null. */
+  rubric_evaluation?: RubricEvaluation | null;
+}
+
+/** Shape of the JSON body returned by GET /api/v1/ingredients/{id}. */
+export interface IngredientDetailResponse {
+  id: number;
+  name: string;
+  recommended_daily_dosage?: string | null;
+  scientific_data?: string | null;
+  product_count: number;
+  is_graded: boolean;
+  grade_badge_text?: string | null;
+  papers: ResearchPaper[];
+}
+
+/** Shape of the JSON body returned by
+ * POST /api/v1/ingredients/{id}/grade. */
+export interface GradeIngredientResponse {
+  status: string;
+  ingredient_id: number;
+  is_graded: boolean;
+  grade_badge_text?: string | null;
+  papers_found: number;
+  papers: ResearchPaper[];
+}
+
+/**
+ * Fetches a single canonical ingredient plus its full stored research-
+ * paper list from GET /api/v1/ingredients/{id}. Used by standalone
+ * IngredientCard to populate its "List of Studies" panel (papers already
+ * persisted by a prior grade request — this never triggers a new paper
+ * search itself).
+ */
+export async function fetchIngredientDetail(
+  ingredientId: number
+): Promise<IngredientDetailResponse> {
+  return getJson<IngredientDetailResponse>(
+    `${API_BASE_URL}/api/v1/ingredients/${ingredientId}`
+  );
+}
+
+/**
+ * Runs the backend's Phase 2 debug grading pipeline for a single
+ * canonical ingredient (see backend/app/services/grading.py): Gemini
+ * generates search keywords, the backend queries PubMed/Europe PMC/
+ * Semantic Scholar for each one, persists paper metadata, and assigns a
+ * debug grade (the stored paper count formatted as "N / N / N"). Can
+ * take several seconds — it's several sequential external network calls
+ * server-side — which is why standalone IngredientCard shows a loading
+ * spinner on the grade button while this is in flight.
+ */
+export async function gradeIngredient(
+  ingredientId: number
+): Promise<GradeIngredientResponse> {
+  let response: Response;
+  try {
+    response = await fetch(
+      `${API_BASE_URL}/api/v1/ingredients/${ingredientId}/grade`,
+      {
+        method: 'POST',
+        headers: { Accept: 'application/json' },
+      }
+    );
+  } catch (networkError) {
+    const reason =
+      networkError instanceof Error
+        ? networkError.message
+        : String(networkError);
+    throw new Error(
+      `Could not reach the server at ${API_BASE_URL}. Check API_BASE_URL in ` +
+        `src/services/api.ts and confirm the backend is running. (${reason})`
+    );
+  }
+
+  if (!response.ok) {
+    let detail = `Request failed with status ${response.status}`;
+    try {
+      const errorBody = (await response.json()) as { detail?: unknown };
+      if (typeof errorBody.detail === 'string') {
+        detail = errorBody.detail;
+      } else if (errorBody.detail) {
+        detail = JSON.stringify(errorBody.detail);
+      }
+    } catch {
+      // Response body wasn't JSON; fall back to the generic message above.
+    }
+    throw new Error(detail);
+  }
+
+  return (await response.json()) as GradeIngredientResponse;
+}
+
+// ---------------------------------------------------------------------
+// Single-paper grading (POST /api/v1/papers/{id}/grade) — on-demand
+// ---------------------------------------------------------------------
+
+/** Shape of the JSON body returned by
+ * POST /api/v1/papers/{paper_id}/grade. */
+export interface GradePaperResponse {
+  status: string;
+  paper: ResearchPaper;
+}
+
+/**
+ * Grades exactly one already-stored research paper on demand (see
+ * backend/app/services/paper_grader.py::grade_single_paper) — triggered
+ * by tapping a paper's gray "(-)" ungraded badge in StudiesList, rather
+ * than waiting for the next full ingredient re-grade
+ * (POST /api/v1/ingredients/{id}/grade above, which grades every
+ * newly-found paper automatically but doesn't retroactively grade
+ * papers that failed grading on an earlier run). Idempotent server-side:
+ * calling this on an already-graded paper just returns it unchanged, no
+ * extra Gemini call.
+ */
+export async function gradePaper(paperId: number): Promise<GradePaperResponse> {
+  let response: Response;
+  try {
+    response = await fetch(`${API_BASE_URL}/api/v1/papers/${paperId}/grade`, {
+      method: 'POST',
+      headers: { Accept: 'application/json' },
+    });
+  } catch (networkError) {
+    const reason =
+      networkError instanceof Error
+        ? networkError.message
+        : String(networkError);
+    throw new Error(
+      `Could not reach the server at ${API_BASE_URL}. Check API_BASE_URL in ` +
+        `src/services/api.ts and confirm the backend is running. (${reason})`
+    );
+  }
+
+  if (!response.ok) {
+    let detail = `Request failed with status ${response.status}`;
+    try {
+      const errorBody = (await response.json()) as { detail?: unknown };
+      if (typeof errorBody.detail === 'string') {
+        detail = errorBody.detail;
+      } else if (errorBody.detail) {
+        detail = JSON.stringify(errorBody.detail);
+      }
+    } catch {
+      // Response body wasn't JSON; fall back to the generic message above.
+    }
+    throw new Error(detail);
+  }
+
+  return (await response.json()) as GradePaperResponse;
 }
 
 // ---------------------------------------------------------------------

@@ -6,8 +6,10 @@ from typing import List, Optional
 
 from sqlmodel import Session, select
 
+from app.models.research import ResearchPaper, parse_keywords
 from app.models.supplement import Ingredient as IngredientRow
 from app.models.supplement import Product, ProductIngredientLink
+from app.schemas.research import IngredientDetailResponse, ResearchPaperResponse
 from app.schemas.search import FilterType, ResultType, SearchResultItem
 from app.schemas.supplement import LinkedIngredientResponse, ProductDetailResponse
 
@@ -69,6 +71,71 @@ def get_product_detail(
         serving_size=getattr(product, "serving_size", "Not available"),
         created_at=product.created_at.isoformat() if product.created_at else None,
         ingredients=get_linked_ingredients(session, product.id),
+    )
+
+
+def to_research_paper_response(paper: ResearchPaper) -> ResearchPaperResponse:
+    """Builds a ResearchPaperResponse from one ResearchPaper ORM row —
+    shared by get_ingredient_papers() below and
+    app/api/routes.py's single-paper grade endpoint, so both build this
+    shape identically rather than duplicating the field mapping.
+    """
+    return ResearchPaperResponse(
+        id=paper.id,
+        title=paper.title,
+        abstract=paper.abstract,
+        authors=paper.authors,
+        publication_date=paper.publication_date,
+        source_url=paper.source_url,
+        source_domain=paper.source_domain,
+        ingredient_id=paper.ingredient_id,
+        keywords=parse_keywords(paper.keywords),
+        grade=paper.grade,
+        grade_score=paper.grade_score,
+        # paper.rubric_evaluation is already a plain dict (SQLAlchemy's
+        # JSON column type deserializes it automatically) whose keys
+        # match RubricEvaluationResponse field-for-field — pydantic
+        # validates it straight through. None stays None.
+        rubric_evaluation=paper.rubric_evaluation,
+    )
+
+
+def get_ingredient_papers(
+    session: Session, ingredient_id: int
+) -> List[ResearchPaperResponse]:
+    """Returns every stored ResearchPaper row for `ingredient_id`, most
+    recently added first (see ResearchPaper.created_at) — backs the
+    `papers` field on both GET /api/v1/ingredients/{id} and
+    POST /api/v1/ingredients/{id}/grade's response.
+    """
+    stmt = (
+        select(ResearchPaper)
+        .where(ResearchPaper.ingredient_id == ingredient_id)
+        .order_by(ResearchPaper.created_at.desc())
+    )
+    return [to_research_paper_response(paper) for paper in session.exec(stmt).all()]
+
+
+def get_ingredient_detail(
+    session: Session, ingredient_id: int
+) -> Optional[IngredientDetailResponse]:
+    """Returns a single canonical Ingredient plus its full stored paper
+    list, or None if no Ingredient with that id exists. Backs
+    GET /api/v1/ingredients/{id}.
+    """
+    ingredient = session.get(IngredientRow, ingredient_id)
+    if ingredient is None:
+        return None
+
+    return IngredientDetailResponse(
+        id=ingredient.id,
+        name=ingredient.name,
+        recommended_daily_dosage=ingredient.recommended_daily_dosage,
+        scientific_data=ingredient.scientific_data,
+        product_count=ingredient.product_count,
+        is_graded=ingredient.is_graded,
+        grade_badge_text=ingredient.grade_badge_text,
+        papers=get_ingredient_papers(session, ingredient.id),
     )
 
 

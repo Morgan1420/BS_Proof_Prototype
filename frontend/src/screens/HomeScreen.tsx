@@ -69,7 +69,14 @@ const HomeScreen: React.FC = () => {
   }, [player]);
 
   return (
-    <ScrollView style={styles.screen} contentContainerStyle={styles.content}>
+    <ScrollView
+      style={styles.screen}
+      contentContainerStyle={styles.content}
+      // Kill the elastic overscroll/recoil at the top and bottom bounds —
+      // it read as "bouncy" against the full-bleed video Hero.
+      bounces={false}
+      overScrollMode="never"
+    >
       {/* HERO — spans the full viewport height (minHeight, so it never
           clips content on short screens / large text sizes). Stacking
           order (video -> overlay -> text/buttons) relies on render

@@ -1,0 +1,863 @@
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import {
+  View,
+  Text,
+  Pressable,
+  StyleSheet,
+  Linking,
+  Modal,
+  ScrollView,
+  Alert,
+  ActivityIndicator,
+} from 'react-native';
+import { Ionicons } from '@expo/vector-icons';
+
+import { colors, spacing, typography } from '../theme';
+import { gradePaper } from '../services/api';
+import type { PaperGrade, ResearchPaper } from '../services/api';
+
+/** Fill color for the "(-)" ungraded badge — per spec, a neutral gray
+ * distinct from both the palette (no gray in theme.ts) and every
+ * GRADE_COLORS entry, so an ungraded paper reads as "no signal yet"
+ * rather than implying any particular quality. */
+const UNGRADED_BADGE_COLOR = '#6C757D';
+
+/** Max rows shown per page — per spec. */
+const PAGE_SIZE = 5;
+
+/** Fixed grade->color mapping, per spec — deliberately NOT sourced from
+ * theme.ts's palette: these are semantic quality-signal colors (traffic-
+ * light-style green-to-red), not part of the app's brand palette, so
+ * they're kept local to this component rather than polluting the shared
+ * theme with colors nothing else uses. */
+const GRADE_COLORS: Record<PaperGrade, string> = {
+  A: '#1E7E34',
+  B: '#28A745',
+  C: '#D39E00',
+  D: '#FD7E14',
+  E: '#DC3545',
+};
+
+/** Narrows the backend's loosely-typed `grade?: string | null` down to a
+ * known PaperGrade — a paper with no grade yet (or, defensively, some
+ * unrecognized value) simply renders no badge rather than crashing on an
+ * unmapped GRADE_COLORS lookup. */
+function isPaperGrade(value: string | null | undefined): value is PaperGrade {
+  return value === 'A' || value === 'B' || value === 'C' || value === 'D' || value === 'E';
+}
+
+/** Grade -> sort rank, lowest number sorts first. Ungraded papers get
+ * UNGRADED_RANK (below every real letter grade, per spec), so they
+ * always sink to the end of the list regardless of any future grade
+ * added to GRADE_COLORS. */
+const GRADE_RANK: Record<PaperGrade, number> = { A: 1, B: 2, C: 3, D: 4, E: 5 };
+const UNGRADED_RANK = 6;
+
+function getGradeRank(grade: string | null | undefined): number {
+  return isPaperGrade(grade) ? GRADE_RANK[grade] : UNGRADED_RANK;
+}
+
+/**
+ * Sorts papers by grade rank (A -> E, ungraded last). Papers sharing the
+ * same letter grade are tie-broken by `grade_score` descending; ungraded
+ * papers (which share UNGRADED_RANK and have no score to break ties
+ * with) keep their original relative order instead.
+ *
+ * Pure and side-effect-free — returns a new array, never mutates
+ * `papers` — so it's safe to call from a `useMemo` on every render
+ * without needing to guard against re-sorting an already-sorted array
+ * differently. Explicitly threads each paper's original index through
+ * as the final tie-break (rather than relying on `Array.prototype.sort`
+ * being stable, which is guaranteed by the JS spec since ES2019 / on
+ * Hermes but easy to get wrong if this function is ever ported or the
+ * comparator refactored) so "preserve original retrieval order" for
+ * ungraded papers holds unambiguously.
+ */
+function sortPapersByGrade(papers: readonly ResearchPaper[]): ResearchPaper[] {
+  return papers
+    .map((paper, index) => ({ paper, index }))
+    .sort((a, b) => {
+      const rankDiff = getGradeRank(a.paper.grade) - getGradeRank(b.paper.grade);
+      if (rankDiff !== 0) {
+        return rankDiff;
+      }
+      if (isPaperGrade(a.paper.grade)) {
+        // Both share a real letter grade (same rank) — higher score first.
+        const scoreDiff = (b.paper.grade_score ?? 0) - (a.paper.grade_score ?? 0);
+        if (scoreDiff !== 0) {
+          return scoreDiff;
+        }
+      }
+      // Equal score, or both ungraded: preserve original order.
+      return a.index - b.index;
+    })
+    .map(({ paper }) => paper);
+}
+
+interface PaperGradeBadgeProps {
+  grade: PaperGrade;
+  /** Omit entirely to render a plain, non-pressable badge — used for the
+   * Rubric Breakdown modal's header, where the badge is already what got
+   * tapped to open that modal and re-wrapping it in another Pressable
+   * would just announce a button that does nothing to screen readers. */
+  onPress?: () => void;
+  /** Larger variant used in the Rubric Breakdown modal's header — the
+   * per-row badge stays small (26px) so it doesn't crowd the title. */
+  large?: boolean;
+}
+
+/** Round letter-grade badge — tapping it (per-row usage) opens the
+ * Rubric Breakdown modal for that paper. A plain Pressable + onPress (no
+ * findNodeHandle or other ref-based DOM API), same as every other tap
+ * target in this component, so it works identically on web and native. */
+const PaperGradeBadge: React.FC<PaperGradeBadgeProps> = ({ grade, onPress, large = false }) => {
+  const badgeStyle = [
+    styles.gradeBadge,
+    large ? styles.gradeBadgeLarge : null,
+    { backgroundColor: GRADE_COLORS[grade] },
+  ];
+  const textStyle = [styles.gradeBadgeText, large && styles.gradeBadgeTextLarge];
+
+  if (!onPress) {
+    return (
+      <View style={badgeStyle}>
+        <Text style={textStyle}>{grade}</Text>
+      </View>
+    );
+  }
+
+  return (
+    <Pressable
+      onPress={onPress}
+      accessibilityRole="button"
+      accessibilityLabel={`View rubric breakdown — grade ${grade}`}
+      hitSlop={6}
+      style={badgeStyle}
+    >
+      <Text style={textStyle}>{grade}</Text>
+    </Pressable>
+  );
+};
+
+export interface StudiesListProps {
+  /** Every stored ResearchPaper for this ingredient (unpaginated) — see
+   * app/schemas/research.py::ResearchPaperResponse on the backend. `undefined`
+   * means "not fetched yet" (renders the loading state); an empty array
+   * means "fetched, but the ingredient has no stored papers yet" (renders
+   * the empty state). */
+  papers: ResearchPaper[] | undefined;
+  /** True while the initial GET /api/v1/ingredients/{id} fetch is in
+   * flight. Only meaningful when `papers` is still undefined. */
+  isLoading?: boolean;
+  /** Set if the papers fetch failed — shown instead of the list/empty
+   * state when non-null. */
+  errorMessage?: string | null;
+  /** Called with the freshly-graded paper after a successful on-demand
+   * single-paper grade (tapping a gray "(-)" badge — see
+   * handleGradePaperPress below). The parent (IngredientCard) owns the
+   * `papers` array as state and is expected to splice this updated
+   * paper back in by id; StudiesList itself doesn't own `papers`, only
+   * derives a sorted/paginated view of it, so it has nothing to update
+   * on its own. Omitted (rather than required) so any future caller
+   * that doesn't need on-demand grading isn't forced to wire it up —
+   * without it, the "(-)" badge still triggers the grade request, it
+   * just has nowhere to deliver the result. */
+  onPaperGraded?: (paper: ResearchPaper) => void;
+}
+
+/** Formats the modal's authors/date/domain metadata line, skipping any
+ * pieces that are missing rather than showing "undefined" or empty
+ * segments. */
+function formatMetaLine(
+  authors: string | null | undefined,
+  publicationDate: string | null | undefined,
+  sourceDomain: string
+): string {
+  const parts = [authors, publicationDate, sourceDomain].filter(
+    (part): part is string => Boolean(part && part.trim())
+  );
+  return parts.join(' · ');
+}
+
+/**
+ * Paginated "List of Studies" panel — replaces the old placeholder text
+ * in standalone IngredientCard's "Science Info" block with real,
+ * database-backed ResearchPaper rows.
+ *
+ * Pagination is entirely local/client-side (all papers for the
+ * ingredient are fetched once by the parent and handed to this
+ * component) since a single ingredient's paper count is small (a
+ * handful to a few dozen from the Phase 2 paper-search pipeline) — no
+ * need for server-side paging.
+ *
+ * Palette note: this component only ever renders while its parent
+ * IngredientCard is expanded (see IngredientCard.tsx — it's nested
+ * inside `{isExpanded && variant === 'standalone' && (...)}`), so every
+ * text/icon/border color here is hardcoded to the palette orange
+ * (`colors.orange`) rather than conditioned on an `isExpanded` prop —
+ * there is no "collapsed" rendering of this component to also support.
+ * This matches the "expanded card = all-orange internals, no green"
+ * palette rule (see docs/Architecture.md).
+ */
+const StudiesList: React.FC<StudiesListProps> = ({
+  papers,
+  isLoading = false,
+  errorMessage = null,
+  onPaperGraded,
+}) => {
+  const [page, setPage] = useState(0);
+  const [activePaper, setActivePaper] = useState<ResearchPaper | null>(null);
+  // Separate from `activePaper` above (the (i) info modal) — the Rubric
+  // Breakdown modal is a distinct pop-up triggered by tapping the round
+  // grade badge, not the info icon.
+  const [activeRubricPaper, setActiveRubricPaper] = useState<ResearchPaper | null>(null);
+  // Id of the paper currently being graded on-demand (tapped "(-)"
+  // badge), or null if none is in flight. A single id rather than a Set
+  // is enough — the badge is disabled the moment it's tapped (see
+  // handleGradePaperPress), so there's at most one in-flight request per
+  // StudiesList at a time in practice; still keyed by id (not a bare
+  // boolean) so only *that* row's badge swaps to a spinner.
+  const [gradingPaperId, setGradingPaperId] = useState<number | null>(null);
+
+  // Sorted (grade rank, then score, then original order — see
+  // sortPapersByGrade) once per `papers` change, *before* pagination
+  // chunking below, per spec. Every downstream computation (page count,
+  // page slicing, empty-state check) reads from this, not the raw
+  // `papers` prop, so a re-sort (e.g. after grading one paper on demand)
+  // is immediately reflected in which page a given paper lands on.
+  const sortedPapers = useMemo<ResearchPaper[] | undefined>(() => {
+    return papers ? sortPapersByGrade(papers) : undefined;
+  }, [papers]);
+
+  const totalPages = sortedPapers
+    ? Math.max(1, Math.ceil(sortedPapers.length / PAGE_SIZE))
+    : 1;
+
+  // Clamp the current page if the paper list shrinks/changes out from
+  // under us (e.g. a fresh grade request replaces the list with a
+  // different count) so we never render an out-of-range page.
+  useEffect(() => {
+    setPage((current) => Math.min(current, totalPages - 1));
+  }, [totalPages]);
+
+  const pageItems = useMemo(() => {
+    if (!sortedPapers) {
+      return [];
+    }
+    const start = page * PAGE_SIZE;
+    return sortedPapers.slice(start, start + PAGE_SIZE);
+  }, [sortedPapers, page]);
+
+  const handleOpenSource = (paper: ResearchPaper): void => {
+    Linking.openURL(paper.source_url).catch(() => {
+      Alert.alert('Could not open link', paper.source_url);
+    });
+  };
+
+  /** Tapping a gray "(-)" ungraded badge: grades that one paper on
+   * demand (POST /api/v1/papers/{id}/grade) and hands the result up to
+   * the parent via `onPaperGraded`. The parent updating its `papers`
+   * state is what actually moves this row — `sortedPapers` (above) is
+   * derived from that prop via `useMemo`, so once the parent re-renders
+   * with the updated paper, this component re-sorts and re-paginates
+   * automatically; no local re-sort call needed here.
+   */
+  const handleGradePaperPress = useCallback(
+    (paper: ResearchPaper) => {
+      if (gradingPaperId !== null) {
+        return; // a grade request is already in flight — ignore extra taps
+      }
+      setGradingPaperId(paper.id);
+      gradePaper(paper.id)
+        .then((response) => {
+          onPaperGraded?.(response.paper);
+        })
+        .catch((error) => {
+          const message =
+            error instanceof Error ? error.message : 'Unknown error occurred.';
+          Alert.alert('Grading failed', message);
+        })
+        .finally(() => {
+          setGradingPaperId(null);
+        });
+    },
+    [gradingPaperId, onPaperGraded]
+  );
+
+  return (
+    <View style={styles.container}>
+      <Text style={styles.header}>LIST OF STUDIES</Text>
+
+      {isLoading && !sortedPapers ? (
+        <Text style={styles.statusText}>Loading studies...</Text>
+      ) : errorMessage ? (
+        <Text style={styles.statusText}>{errorMessage}</Text>
+      ) : !sortedPapers || sortedPapers.length === 0 ? (
+        <Text style={styles.statusText}>
+          No studies available yet. Click &apos;Grade&apos; to fetch research.
+        </Text>
+      ) : (
+        <>
+          <View style={styles.list}>
+            {pageItems.map((paper, index) => (
+              <View
+                key={paper.id}
+                style={[
+                  styles.row,
+                  index === pageItems.length - 1 && styles.rowLast,
+                ]}
+              >
+                <Text style={styles.paperTitle} numberOfLines={2}>
+                  {paper.title}
+                </Text>
+                <View style={styles.rowActions}>
+                  {isPaperGrade(paper.grade) ? (
+                    <PaperGradeBadge
+                      grade={paper.grade}
+                      onPress={() => setActiveRubricPaper(paper)}
+                    />
+                  ) : gradingPaperId === paper.id ? (
+                    <View
+                      style={[styles.gradeBadge, styles.gradeBadgeLoading]}
+                      accessibilityLabel={`Grading ${paper.title}`}
+                      accessibilityState={{ busy: true }}
+                    >
+                      <ActivityIndicator size="small" color={colors.orange} />
+                    </View>
+                  ) : (
+                    <Pressable
+                      onPress={() => handleGradePaperPress(paper)}
+                      accessibilityRole="button"
+                      accessibilityLabel={`Grade paper: ${paper.title}`}
+                      hitSlop={6}
+                      style={[styles.gradeBadge, styles.gradeBadgeUngraded]}
+                    >
+                      <Text style={styles.gradeBadgeText}>-</Text>
+                    </Pressable>
+                  )}
+                  <Pressable
+                    style={styles.iconButton}
+                    onPress={() => setActivePaper(paper)}
+                    accessibilityRole="button"
+                    accessibilityLabel={`View details for ${paper.title}`}
+                    hitSlop={6}
+                  >
+                    <Ionicons
+                      name="information-circle-outline"
+                      size={20}
+                      color={colors.orange}
+                    />
+                  </Pressable>
+                  <Pressable
+                    style={styles.iconButton}
+                    onPress={() => handleOpenSource(paper)}
+                    accessibilityRole="button"
+                    accessibilityLabel={`Open original source for ${paper.title}`}
+                    hitSlop={6}
+                  >
+                    <Ionicons name="globe-outline" size={20} color={colors.orange} />
+                  </Pressable>
+                </View>
+              </View>
+            ))}
+          </View>
+
+          {totalPages > 1 && (
+            <View style={styles.paginationRow}>
+              <Pressable
+                style={[styles.navButton, page === 0 && styles.navButtonDisabled]}
+                onPress={() => setPage((current) => Math.max(0, current - 1))}
+                disabled={page === 0}
+                accessibilityRole="button"
+                accessibilityLabel="Previous page"
+              >
+                <Text
+                  style={[
+                    styles.navButtonText,
+                    page === 0 && styles.navButtonTextDisabled,
+                  ]}
+                >
+                  ← Previous
+                </Text>
+              </Pressable>
+
+              <View style={styles.pageNumberRow}>
+                {Array.from({ length: totalPages }, (_, pageIndex) => (
+                  <Pressable
+                    key={pageIndex}
+                    style={[
+                      styles.pageBadge,
+                      pageIndex === page && styles.pageBadgeActive,
+                    ]}
+                    onPress={() => setPage(pageIndex)}
+                    accessibilityRole="button"
+                    accessibilityLabel={`Go to page ${pageIndex + 1}`}
+                    accessibilityState={{ selected: pageIndex === page }}
+                  >
+                    <Text
+                      style={[
+                        styles.pageBadgeText,
+                        pageIndex === page && styles.pageBadgeTextActive,
+                      ]}
+                    >
+                      {pageIndex + 1}
+                    </Text>
+                  </Pressable>
+                ))}
+              </View>
+
+              <Pressable
+                style={[
+                  styles.navButton,
+                  page === totalPages - 1 && styles.navButtonDisabled,
+                ]}
+                onPress={() =>
+                  setPage((current) => Math.min(totalPages - 1, current + 1))
+                }
+                disabled={page === totalPages - 1}
+                accessibilityRole="button"
+                accessibilityLabel="Next page"
+              >
+                <Text
+                  style={[
+                    styles.navButtonText,
+                    page === totalPages - 1 && styles.navButtonTextDisabled,
+                  ]}
+                >
+                  Next →
+                </Text>
+              </Pressable>
+            </View>
+          )}
+        </>
+      )}
+
+      <Modal
+        visible={activePaper !== null}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setActivePaper(null)}
+      >
+        <Pressable style={styles.modalBackdrop} onPress={() => setActivePaper(null)}>
+          {/* Swallow taps inside the card so they don't bubble to the
+              backdrop Pressable and close the modal while reading it. */}
+          <Pressable style={styles.modalCard} onPress={(event) => event.stopPropagation()}>
+            {activePaper && (
+              <>
+                <View style={styles.modalHeaderRow}>
+                  <Text style={styles.modalTitle} numberOfLines={4}>
+                    {activePaper.title}
+                  </Text>
+                  <Pressable
+                    onPress={() => setActivePaper(null)}
+                    accessibilityRole="button"
+                    accessibilityLabel="Close"
+                    hitSlop={8}
+                  >
+                    <Ionicons name="close" size={22} color={colors.orange} />
+                  </Pressable>
+                </View>
+
+                <Text style={styles.modalMeta}>
+                  {formatMetaLine(
+                    activePaper.authors,
+                    activePaper.publication_date,
+                    activePaper.source_domain
+                  ) || 'No metadata available.'}
+                </Text>
+
+                {activePaper.keywords.length > 0 && (
+                  <View style={styles.keywordSection}>
+                    <Text style={styles.keywordSectionLabel}>Matched Keywords</Text>
+                    <View style={styles.keywordPillRow}>
+                      {activePaper.keywords.map((keyword) => (
+                        <View key={keyword} style={styles.keywordPill}>
+                          <Text style={styles.keywordPillText}>{keyword}</Text>
+                        </View>
+                      ))}
+                    </View>
+                  </View>
+                )}
+
+                <ScrollView style={styles.modalAbstractScroll}>
+                  <Text style={styles.modalAbstract}>
+                    {activePaper.abstract ?? 'No abstract available.'}
+                  </Text>
+                </ScrollView>
+
+                <Pressable
+                  style={styles.modalLinkButton}
+                  onPress={() => handleOpenSource(activePaper)}
+                  accessibilityRole="button"
+                  accessibilityLabel="Open original source"
+                >
+                  <Ionicons name="globe-outline" size={16} color={colors.offWhite} />
+                  <Text style={styles.modalLinkButtonText}>View Source</Text>
+                </Pressable>
+              </>
+            )}
+          </Pressable>
+        </Pressable>
+      </Modal>
+
+      <Modal
+        visible={activeRubricPaper !== null}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setActiveRubricPaper(null)}
+      >
+        <Pressable style={styles.modalBackdrop} onPress={() => setActiveRubricPaper(null)}>
+          <Pressable style={styles.modalCard} onPress={(event) => event.stopPropagation()}>
+            {activeRubricPaper &&
+              isPaperGrade(activeRubricPaper.grade) &&
+              activeRubricPaper.rubric_evaluation && (
+                <>
+                  <View style={styles.modalHeaderRow}>
+                    <Text style={styles.modalTitle} numberOfLines={3}>
+                      {activeRubricPaper.title}
+                    </Text>
+                    <Pressable
+                      onPress={() => setActiveRubricPaper(null)}
+                      accessibilityRole="button"
+                      accessibilityLabel="Close"
+                      hitSlop={8}
+                    >
+                      <Ionicons name="close" size={22} color={colors.orange} />
+                    </Pressable>
+                  </View>
+
+                  <View style={styles.rubricScoreRow}>
+                    <PaperGradeBadge grade={activeRubricPaper.grade} large />
+                    <Text style={styles.rubricTotalScore}>
+                      {activeRubricPaper.rubric_evaluation.total_score} / 100
+                    </Text>
+                  </View>
+
+                  <ScrollView style={styles.modalAbstractScroll}>
+                    <View style={styles.rubricSection}>
+                      <Text style={styles.rubricSectionLabel}>
+                        Study Design ({activeRubricPaper.rubric_evaluation.study_type_score} pts)
+                      </Text>
+                      <Text style={styles.rubricSectionValue}>
+                        {activeRubricPaper.rubric_evaluation.study_type}
+                      </Text>
+                    </View>
+
+                    <View style={styles.rubricSection}>
+                      <Text style={styles.rubricSectionLabel}>
+                        Journal Rigor ({activeRubricPaper.rubric_evaluation.journal_score} pts)
+                      </Text>
+                      <Text style={styles.rubricSectionValue}>
+                        {activeRubricPaper.rubric_evaluation.journal_reputation}
+                      </Text>
+                    </View>
+
+                    <View style={styles.rubricSection}>
+                      <Text style={styles.rubricSectionLabel}>
+                        Methodology &amp; Sample ({activeRubricPaper.rubric_evaluation.sample_score}{' '}
+                        pts)
+                      </Text>
+                      <Text style={styles.rubricSectionValue}>
+                        {activeRubricPaper.rubric_evaluation.sample_info}
+                      </Text>
+                    </View>
+
+                    <View style={styles.rubricSection}>
+                      <Text style={styles.rubricSectionLabel}>
+                        Funding &amp; Bias ({activeRubricPaper.rubric_evaluation.funding_score} pts)
+                      </Text>
+                      <Text style={styles.rubricSectionValue}>
+                        {activeRubricPaper.rubric_evaluation.funding_status}
+                      </Text>
+                    </View>
+
+                    <View style={[styles.rubricSection, styles.rubricSectionLast]}>
+                      <Text style={styles.rubricSectionLabel}>AI Summary Note</Text>
+                      <Text style={[styles.rubricSectionValue, styles.rubricSummaryText]}>
+                        {activeRubricPaper.rubric_evaluation.summary_notes}
+                      </Text>
+                    </View>
+                  </ScrollView>
+                </>
+              )}
+          </Pressable>
+        </Pressable>
+      </Modal>
+    </View>
+  );
+};
+
+const styles = StyleSheet.create({
+  container: {
+    backgroundColor: `${colors.olive}18`,
+    borderRadius: 8,
+    padding: spacing.md,
+    gap: spacing.sm,
+  },
+  header: {
+    fontSize: typography.resultCardLabel,
+    fontWeight: '700',
+    color: colors.orange,
+    textAlign: 'center',
+    letterSpacing: 0.5,
+  },
+  statusText: {
+    fontSize: typography.resultCardLabel,
+    fontStyle: 'italic',
+    color: `${colors.orange}AA`,
+    textAlign: 'center',
+    paddingVertical: spacing.sm,
+  },
+  list: {
+    gap: 0,
+  },
+  row: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    gap: spacing.sm,
+    paddingVertical: spacing.sm,
+    borderStyle: 'dashed',
+    borderBottomWidth: 1,
+    // Palette orange rather than a neutral gray — this component only
+    // ever renders inside an expanded card (see the docstring above), so
+    // every visible line/border here follows the same "orange, not
+    // green" rule as the text/icons.
+    borderColor: colors.orange,
+  },
+  rowLast: {
+    borderBottomWidth: 0,
+  },
+  paperTitle: {
+    flex: 1,
+    fontSize: typography.resultCardLabel,
+    color: colors.orange,
+  },
+  rowActions: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.xs,
+  },
+  iconButton: {
+    padding: spacing.xs,
+  },
+  // --- Round letter-grade badge (per-row + Rubric Breakdown header) ---
+  gradeBadge: {
+    width: 26,
+    height: 26,
+    borderRadius: 13,
+    alignItems: 'center',
+    justifyContent: 'center',
+    // Border stays the active-theme orange regardless of the badge's own
+    // grade color — the fill is what carries the grade signal, the
+    // border is what ties it visually to the rest of the expanded
+    // card's orange chrome (icons, dividers, pagination), per spec.
+    borderWidth: 1.5,
+    borderColor: colors.orange,
+  },
+  gradeBadgeLarge: {
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    borderWidth: 2,
+  },
+  gradeBadgeText: {
+    fontSize: 12,
+    fontWeight: '700',
+    // White reads with sufficient contrast against all five grade
+    // colors (they're all fairly saturated/mid-to-dark) without needing
+    // a per-grade text color lookup.
+    color: '#FFFFFF',
+  },
+  gradeBadgeTextLarge: {
+    fontSize: 18,
+  },
+  // Gray fill for an ungraded paper's tappable "(-)" badge — same
+  // circular shape/orange border as a lettered badge (per spec: "Maintain
+  // the existing circular badge styling and active orange border rules"),
+  // only the fill color and content differ.
+  gradeBadgeUngraded: {
+    backgroundColor: UNGRADED_BADGE_COLOR,
+  },
+  // Swapped in for the ungraded badge while a grade request for that
+  // paper is in flight — keeps the same circular/bordered footprint so
+  // the row doesn't reflow, just replaces the fill+content with a
+  // transparent background and a spinner.
+  gradeBadgeLoading: {
+    backgroundColor: 'transparent',
+  },
+  paginationRow: {
+    flexDirection: 'row',
+    justifyContent: 'center',
+    alignItems: 'center',
+    flexWrap: 'wrap',
+    gap: spacing.sm,
+    paddingTop: spacing.xs,
+  },
+  navButton: {
+    paddingHorizontal: spacing.sm,
+    paddingVertical: spacing.xs,
+  },
+  navButtonDisabled: {
+    opacity: 0.4,
+  },
+  navButtonText: {
+    fontSize: typography.resultCardLabel,
+    fontWeight: '700',
+    color: colors.orange,
+  },
+  navButtonTextDisabled: {
+    color: `${colors.orange}88`,
+  },
+  pageNumberRow: {
+    flexDirection: 'row',
+    gap: spacing.xs,
+  },
+  pageBadge: {
+    borderWidth: 1,
+    borderColor: colors.orange,
+    borderRadius: 4,
+    paddingHorizontal: 8,
+    paddingVertical: 2,
+    minWidth: 26,
+    alignItems: 'center',
+  },
+  // Active page is filled solid orange (vs. the outline-only style
+  // above) — that fill/outline contrast is what distinguishes the
+  // active page now that both states live in the same orange family.
+  pageBadgeActive: {
+    backgroundColor: colors.orange,
+    borderColor: colors.orange,
+  },
+  pageBadgeText: {
+    fontSize: typography.resultCardLabel,
+    fontWeight: '700',
+    color: colors.orange,
+  },
+  pageBadgeTextActive: {
+    color: colors.offWhite,
+  },
+  // --- Info modal ---
+  modalBackdrop: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.4)',
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: spacing.lg,
+  },
+  modalCard: {
+    width: '100%',
+    maxWidth: 480,
+    maxHeight: '80%',
+    backgroundColor: colors.offWhite,
+    borderRadius: 12,
+    borderWidth: 2,
+    borderColor: colors.orange,
+    padding: spacing.lg,
+    gap: spacing.sm,
+  },
+  modalHeaderRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'flex-start',
+    gap: spacing.sm,
+  },
+  modalTitle: {
+    flex: 1,
+    fontSize: typography.resultCardTitle,
+    fontWeight: '700',
+    color: colors.orange,
+  },
+  modalMeta: {
+    fontSize: typography.resultCardLabel,
+    fontStyle: 'italic',
+    color: `${colors.orange}CC`,
+  },
+  // --- "Matched Keywords" pills (info modal) ---
+  keywordSection: {
+    gap: spacing.xs,
+  },
+  keywordSectionLabel: {
+    fontSize: typography.resultCardLabel,
+    fontWeight: '700',
+    color: colors.orange,
+  },
+  keywordPillRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: spacing.xs,
+  },
+  keywordPill: {
+    borderWidth: 1,
+    borderColor: colors.orange,
+    borderRadius: 12,
+    paddingHorizontal: 10,
+    paddingVertical: 3,
+    backgroundColor: `${colors.orange}18`,
+  },
+  keywordPillText: {
+    fontSize: typography.resultCardLabel,
+    fontWeight: '600',
+    color: colors.orange,
+  },
+  modalAbstractScroll: {
+    maxHeight: 220,
+  },
+  modalAbstract: {
+    fontSize: typography.resultCardLabel,
+    color: colors.orange,
+    lineHeight: 19,
+  },
+  // --- Rubric Breakdown modal ---
+  rubricScoreRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.sm,
+  },
+  rubricTotalScore: {
+    fontSize: typography.resultCardTitle,
+    fontWeight: '700',
+    color: colors.orange,
+  },
+  rubricSection: {
+    gap: spacing.xs,
+    paddingBottom: spacing.sm,
+    borderStyle: 'dashed',
+    borderBottomWidth: 1,
+    borderColor: colors.orange,
+  },
+  rubricSectionLast: {
+    borderBottomWidth: 0,
+    paddingBottom: 0,
+  },
+  rubricSectionLabel: {
+    fontSize: typography.resultCardLabel,
+    fontWeight: '700',
+    color: colors.orange,
+  },
+  rubricSectionValue: {
+    fontSize: typography.resultCardLabel,
+    color: colors.orange,
+    lineHeight: 19,
+  },
+  rubricSummaryText: {
+    fontStyle: 'italic',
+  },
+  modalLinkButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: spacing.xs,
+    backgroundColor: colors.orange,
+    borderRadius: 8,
+    paddingVertical: spacing.sm,
+    marginTop: spacing.xs,
+  },
+  modalLinkButtonText: {
+    fontSize: typography.buttonLabel,
+    fontWeight: '700',
+    color: colors.offWhite,
+  },
+});
+
+export default StudiesList;

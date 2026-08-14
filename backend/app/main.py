@@ -7,6 +7,8 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.routes import dev_router
+from app.api.routes import ingredients_router
+from app.api.routes import papers_router
 from app.api.routes import products_router
 from app.api.routes import router as scan_router
 from app.api.routes import search_router
@@ -55,6 +57,8 @@ app.add_middleware(
 app.include_router(scan_router, prefix="/api/v1")
 app.include_router(search_router, prefix="/api/v1")
 app.include_router(products_router, prefix="/api/v1")
+app.include_router(ingredients_router, prefix="/api/v1")
+app.include_router(papers_router, prefix="/api/v1")
 app.include_router(dev_router, prefix="/api/v1")
 
 

@@ -104,9 +104,26 @@ class Ingredient(SQLModel, table=True):
         ),
     )
 
+    # --- Phase 2: research paper search / debug grading ---
+    # See app/services/grading.py for what sets these. There's no real
+    # grading algorithm yet — `grade_badge_text` is currently just the
+    # stored paper count formatted three times (e.g. "14 / 14 / 14"),
+    # purely so the frontend badge has something non-placeholder to show
+    # while the actual grading pipeline is built out.
+    is_graded: bool = Field(default=False)
+    grade_badge_text: Optional[str] = Field(default=None)
+
     product_links: List["ProductIngredientLink"] = Relationship(
         back_populates="ingredient",
     )
+    # Forward-referenced as a string ("ResearchPaper") rather than
+    # imported directly — app/models/research.py imports *this* module
+    # (for its own `ingredient: Optional[Ingredient]` relationship), so a
+    # real import here would be circular. SQLAlchemy resolves the string
+    # against the shared SQLModel registry once ResearchPaper has been
+    # imported anywhere (see app/db.py, which imports both modules at
+    # startup specifically for this).
+    papers: List["ResearchPaper"] = Relationship(back_populates="ingredient")
 
 
 class ProductIngredientLink(SQLModel, table=True):

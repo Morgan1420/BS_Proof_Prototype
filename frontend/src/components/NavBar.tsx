@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   View,
   Text,
@@ -11,7 +11,7 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
 
 import { colors, spacing, typography } from '../theme';
-import { navigateTo } from '../navigation/navigationRef';
+import { navigateTo, navigationRef } from '../navigation/navigationRef';
 import { resetDatabase } from '../services/api';
 
 /**
@@ -22,6 +22,30 @@ import { resetDatabase } from '../services/api';
  */
 const NavBar: React.FC = () => {
   const [isResetting, setIsResetting] = useState(false);
+
+  // Same reasoning as navigateTo() above: NavBar renders outside the
+  // Stack Navigator's own screen tree, so hooks like useRoute()/
+  // useNavigationState() (which need a Navigator's React context) aren't
+  // available here — only the imperative navigationRef is. Defaults to
+  // 'HomeScreen' to match the Stack's initialRouteName, so the very
+  // first render (before the container reports "ready") already shows
+  // the correct (overlay) style instead of flashing the solid bar first.
+  const [currentRouteName, setCurrentRouteName] = useState<
+    string | undefined
+  >('HomeScreen');
+
+  useEffect(() => {
+    const updateRouteName = (): void => {
+      setCurrentRouteName(navigationRef.getCurrentRoute()?.name);
+    };
+    if (navigationRef.isReady()) {
+      updateRouteName();
+    }
+    const unsubscribe = navigationRef.addListener('state', updateRouteName);
+    return unsubscribe;
+  }, []);
+
+  const isHomeScreen = currentRouteName === 'HomeScreen';
 
   const performReset = async (): Promise<void> => {
     setIsResetting(true);
@@ -53,7 +77,10 @@ const NavBar: React.FC = () => {
   };
 
   return (
-    <SafeAreaView edges={['top']} style={styles.safeArea}>
+    <SafeAreaView
+      edges={['top']}
+      style={[styles.safeArea, isHomeScreen && styles.safeAreaHome]}
+    >
       <View style={styles.container}>
         <Pressable
           onPress={() => navigateTo('HomeScreen')}
@@ -105,11 +132,26 @@ const NavBar: React.FC = () => {
 };
 
 const styles = StyleSheet.create({
+  // Default (non-Home): a normal, in-flow, opaque bar — unchanged from
+  // before. Background lives here (not on `container`) so the Home
+  // overlay variant below can override it in one place.
   safeArea: {
     backgroundColor: colors.darkGreen,
   },
+  // Home-only: floats over the top of the Hero instead of pushing it
+  // down. Removing NavBar from normal flow (position: 'absolute') is
+  // what lets the Hero occupy the full viewport height behind it — no
+  // change needed on HomeScreen's own layout for this to work.
+  safeAreaHome: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    zIndex: 100,
+    elevation: 100, // Android needs elevation, not just zIndex, to stack above the Hero.
+    backgroundColor: 'rgba(53, 90, 53, 0.8)', // darkGreen (#355A35) @ 80% opacity
+  },
   container: {
-    backgroundColor: colors.darkGreen,
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
