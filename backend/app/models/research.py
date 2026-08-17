@@ -1,16 +1,20 @@
 """SQLModel ORM tables for scientific research: ResearchPaper (one row
 per paper linked to a canonical Ingredient — Phase 2, automated paper
-scraping/grading) and PaperConclusion (one row per synthesized claim
-built up across those papers — Phase 5, see
-app/services/conclusion_grader.py).
+scraping/grading), PaperConclusion (one row per synthesized claim built
+up across those papers — Phase 5, see
+app/services/conclusion_grader.py), and VerifiedResource (one row per
+official government/regulatory reference link — Phase 7, see
+app/services/resource_fetcher.py).
 
 ResearchPaper rows are populated by app/services/paper_search.py, which
 queries PubMed, Europe PMC, Semantic Scholar, and OpenAlex per
 Gemini-generated keyword (see app/services/research_keywords.py) and
 persists deduplicated results here. PaperConclusion rows are populated
 by app/services/conclusion_grader.py, driven by
-app/services/paper_analysis_pipeline.py. See app/services/grading.py for
-the full pipeline both feed into.
+app/services/paper_analysis_pipeline.py. VerifiedResource rows are
+populated by app/services/resource_fetcher.py, which queries the
+official APIs configured in docs/verified_resource_apis.json. See
+app/services/grading.py for the full pipeline all three feed into.
 
 Deliberately its own module (not folded into app/models/supplement.py):
 these are distinct, independently-growing tables with no direct
@@ -35,6 +39,18 @@ from app.models.supplement import Ingredient
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+# --- Phase 6: ingredient relevance verification ---
+# ResearchPaper.status lifecycle values (see that field's docstring
+# below, and app/services/paper_grader.py::grade_single_paper, which is
+# what actually sets it). Named constants rather than bare string
+# literals scattered across paper_grader.py/conclusion_grader.py/
+# paper_analysis_pipeline.py/search.py — every one of those modules
+# imports from here rather than re-typing the literal, so a rename can't
+# silently desync one call site from another.
+PAPER_STATUS_ACTIVE = "ACTIVE"
+PAPER_STATUS_DISCARDED_IRRELEVANT = "DISCARDED_IRRELEVANT"
 
 
 # `ResearchPaper.keywords` is stored as a single comma-separated string
@@ -138,6 +154,24 @@ class ResearchPaper(SQLModel, table=True):
     # genuinely structured/nested data, not a flat list.
     rubric_evaluation: Optional[dict] = Field(default=None, sa_column=Column(JSON))
 
+    # --- Phase 6: ingredient relevance verification
+    # (app/services/paper_grader.py) ---
+    # One of PAPER_STATUS_ACTIVE / PAPER_STATUS_DISCARDED_IRRELEVANT
+    # (defined above). Every paper starts "ACTIVE" at ingestion time
+    # (search_papers_for_ingredient doesn't grade or relevance-check
+    # anymore — see paper_search.py) and stays that way until it's
+    # graded: grade_single_paper's same Gemini call that produces
+    # `grade`/`grade_score`/`rubric_evaluation` also asks whether the
+    # paper is actually about the target ingredient it was found under,
+    # and flips this to "DISCARDED_IRRELEVANT" if not (e.g. a Vitamin D
+    # paper that turned up during a Vitamin C search). Nullable/added
+    # after `research_papers` already existed in deployed databases —
+    # same additive-migration story as `keywords`/`grade` above; see
+    # app/db.py::_migrate_research_paper_columns. Every paper-list/
+    # summary query in app/services/search.py excludes
+    # DISCARDED_IRRELEVANT rows — see get_ingredient_papers.
+    status: str = Field(default=PAPER_STATUS_ACTIVE)
+
     created_at: datetime = Field(default_factory=_utcnow, nullable=False)
 
     ingredient: Optional[Ingredient] = Relationship(back_populates="papers")
@@ -218,3 +252,107 @@ class PaperConclusion(SQLModel, table=True):
     # Bumped manually wherever a merge updates this row (not an ORM
     # `onupdate` hook) — see conclusion_grader.py.
     updated_at: datetime = Field(default_factory=_utcnow, nullable=False)
+
+
+class VerifiedResource(SQLModel, table=True):
+    """A single official, government/regulatory reference link for one
+    canonical Ingredient — Phase 7, see
+    app/services/resource_fetcher.py::fetch_verified_resources_for_ingredient.
+    Quality-graded against docs/resource_grading_rubric.json — Phase 8,
+    see app/services/resource_grader.py.
+
+    Unlike ResearchPaper (any source domain, relevance/quality judged
+    afterward by Gemini — see Phase 3/6), every row here has already
+    cleared a strict domain allow-list (`.gov`, `.europa.eu`,
+    `ncbi.nlm.nih.gov`, `efsa.europa.eu` — see
+    resource_fetcher.py::_is_verified_domain) *before* it's ever
+    persisted — a generic blog post, unverified news site, or
+    user-edited page (e.g. a wiki) can never end up in this table, so
+    nothing downstream needs to re-check `domain` before displaying it.
+    `grade`/`score`/`reasoning_summary` (Phase 8) are a *separate*,
+    independent quality signal on top of that domain gate — a resource
+    can be from an unquestionably official domain and still score poorly
+    on the rubric (e.g. thin content, no citations, outdated), so these
+    columns are never used to decide whether a row exists, only how it's
+    badged once displayed. Deduplicated per-ingredient by `url`, same
+    convention as ResearchPaper's `source_url` dedup — see
+    resource_fetcher.py.
+
+    This is a brand-new table (not columns added to an existing one), so
+    unlike ResearchPaper's `keywords`/`grade`/`status` columns it needed
+    no additive `ALTER TABLE` migration in app/db.py when it was first
+    introduced (Phase 7) — `SQLModel.metadata.create_all()` alone was
+    sufficient. The Phase 8 `grade`/`score`/`reasoning_summary` columns
+    below, however, DO need one — `verified_resources` now already
+    exists in deployed (Phase 7) databases, so these three are additive
+    columns on an existing table, same story as ResearchPaper's own
+    `grade`/`grade_score` — see app/db.py::_migrate_verified_resource_columns.
+    """
+
+    __tablename__ = "verified_resources"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    ingredient_id: int = Field(foreign_key="ingredients.id", index=True)
+
+    # e.g. "MedlinePlus Vitamin C Health Topic" — either lifted directly
+    # from the source API's own title/name field, or (for sources that
+    # don't reliably expose one) synthesized from the source's display
+    # name + ingredient name — see resource_fetcher.py's per-source
+    # parsers for exactly which.
+    title: str
+    # e.g. "National Institutes of Health" — the human-readable agency/
+    # organization name, distinct from `domain` (the machine hostname)
+    # below. Falls back to the configured API's own display name (see
+    # docs/verified_resource_apis.json's `name` field) when the source's
+    # response doesn't carry its own publisher/organization field.
+    publisher: str
+    url: str
+    # The verified hostname the link resolved to (e.g.
+    # "medlineplus.gov", "pubchem.ncbi.nlm.nih.gov") — always one that
+    # already passed `_is_verified_domain` at fetch time (see class
+    # docstring). Kept as its own column (rather than re-parsed from
+    # `url` on every read) so the frontend's authority badge
+    # (`src/components/VerifiedResourcesList.tsx`) can derive "NIH" /
+    # "USDA" / "EFSA" without needing a URL-parsing dependency.
+    domain: str
+    # Optional 1-2 sentence overview snippet, where the source API
+    # provides one (e.g. PubChem's compound `Description` field). None
+    # for sources/entries that don't expose a summary — the frontend
+    # simply omits the snippet for those rather than showing an empty
+    # or placeholder string.
+    summary: Optional[str] = Field(default=None)
+
+    # --- Phase 8: automated resource grading
+    # (app/services/resource_grader.py) ---
+    # Set together, once, right after a resource is first persisted by
+    # fetch_verified_resources_for_ingredient() — never re-graded on a
+    # subsequent re-grade run (same "a paper's evaluation doesn't change
+    # once assigned" convention as ResearchPaper.grade). All three are
+    # nullable — None until resource_grader.py successfully grades this
+    # row (best-effort: a Gemini failure for one resource is logged and
+    # skipped rather than failing the whole fetch, leaving that one row
+    # permanently ungraded rather than retried — see resource_fetcher.py),
+    # so the frontend must handle a null `grade` (no badge rendered) as a
+    # normal, expected state, not an error — same convention as
+    # ResearchPaper.grade.
+    #
+    # `grade` is always one of "A"/"B"/"C"/"D"/"E", derived server-side
+    # from `score` via docs/resource_grading_rubric.json's `grade_bands`
+    # (not trusted directly from Gemini's own output) — see
+    # resource_grader.py::grade_resource for why, same "derive the
+    # letter ourselves" philosophy as paper_grader.py.
+    grade: Optional[str] = Field(default=None)
+    # 0-100, strictly clamped — see resource_grader.py::grade_resource's
+    # "Score Calculation Guard".
+    score: Optional[int] = Field(default=None)
+    # A concise rationale for the overall evaluation, straight from
+    # Gemini's response (nothing to clamp/re-derive, unlike `grade`/
+    # `score`). Deliberately just this one summary column rather than a
+    # full per-category JSON breakdown (contrast with ResearchPaper.
+    # rubric_evaluation) — the task spec for this feature only calls for
+    # `grade`/`score`/`reasoning_summary` on this table; the four
+    # category_scores Gemini also returns (see resource_grader.py) are
+    # used to compute `score` but aren't separately persisted.
+    reasoning_summary: Optional[str] = Field(default=None)
+
+    created_at: datetime = Field(default_factory=_utcnow, nullable=False)

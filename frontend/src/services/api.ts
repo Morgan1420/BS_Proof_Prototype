@@ -352,6 +352,17 @@ export async function fetchProductDetail(
 export type PaperGrade = 'A' | 'B' | 'C' | 'D' | 'E';
 
 /**
+ * ResearchPaper.status lifecycle values (Phase 6 ingredient relevance
+ * verification) — mirrors the backend's PAPER_STATUS_ACTIVE /
+ * PAPER_STATUS_DISCARDED_IRRELEVANT constants (app/models/research.py).
+ * Named constants rather than bare string literals, same reasoning as
+ * the backend side: IngredientCard.tsx compares against
+ * PAPER_STATUS_DISCARDED_IRRELEVANT rather than the literal string.
+ */
+export const PAPER_STATUS_ACTIVE = 'ACTIVE';
+export const PAPER_STATUS_DISCARDED_IRRELEVANT = 'DISCARDED_IRRELEVANT';
+
+/**
  * Structured per-category rubric breakdown for a graded paper — mirrors
  * the backend's RubricEvaluationResponse (app/schemas/research.py),
  * which itself mirrors app/services/paper_grader.py's RubricEvaluation
@@ -406,6 +417,16 @@ export interface ResearchPaper {
   /** Full per-category breakdown backing `grade`/`grade_score`. Null iff
    * `grade` is null. */
   rubric_evaluation?: RubricEvaluation | null;
+  /** One of PAPER_STATUS_ACTIVE / PAPER_STATUS_DISCARDED_IRRELEVANT
+   * above (Phase 6). In practice a DISCARDED_IRRELEVANT paper never
+   * comes back from GET /api/v1/ingredients/{id} or the grade-ingredient
+   * endpoint — the backend filters those out server-side (see
+   * app/services/search.py::get_ingredient_papers) — but the on-demand
+   * single-paper-grade endpoint (gradePaper below) returns the
+   * just-graded paper regardless of outcome, so IngredientCard checks
+   * this field to remove a just-discarded paper from local state — see
+   * handlePaperGraded in IngredientCard.tsx. */
+  status: string;
 }
 
 /**
@@ -453,6 +474,54 @@ export interface PaperConclusion {
   contradicting_paper_ids: number[];
 }
 
+/**
+ * A single official government/regulatory reference link for an
+ * ingredient (Phase 7) — mirrors the backend's VerifiedResourceResponse
+ * (app/schemas/research.py), which itself mirrors the VerifiedResource
+ * table (app/models/research.py). Rendered by VerifiedResourcesList.tsx.
+ *
+ * Every resource the backend returns has already cleared its strict
+ * domain allow-list (`.gov`, `.europa.eu`, `ncbi.nlm.nih.gov`,
+ * `efsa.europa.eu` — see backend/app/services/resource_fetcher.py) before
+ * ever being persisted, so the frontend never needs to re-validate
+ * `domain` itself — only display it (and derive an "NIH"/"USDA"/"EFSA"
+ * -style authority badge from it, see VerifiedResourcesList.tsx).
+ *
+ * `grade`/`score`/`reasoning_summary` (Phase 8 — see
+ * backend/app/services/resource_grader.py) are a separate quality signal
+ * layered on top of that domain gate — all three are `null` until the
+ * backend successfully grades this resource (best-effort at fetch time;
+ * a Gemini/parsing failure leaves a resource permanently ungraded rather
+ * than retried, same convention as ResearchPaper.grade), so the frontend
+ * must handle a null `grade` as a normal, expected state (render no
+ * badge), not an error.
+ */
+export interface VerifiedResource {
+  id: number;
+  ingredient_id: number;
+  title: string;
+  publisher: string;
+  url: string;
+  domain: string;
+  summary?: string | null;
+  /** Typed loosely as `string` rather than `PaperGrade` at this API
+   * boundary, same reasoning as ResearchPaper.grade/PaperConclusion.
+   * confidence_grade — the backend's `Optional[str]` column isn't
+   * enforced beyond "A"-"E" by a DB constraint, so VerifiedResourcesList
+   * validates against `PaperGrade` (via utils/grades.ts's `isPaperGrade`/
+   * `GRADE_COLORS`, same A-E scale reused across every graded entity in
+   * this app — see that file's module docstring) before rendering a
+   * badge. */
+  grade?: string | null;
+  /** Total rubric score, 0-100 (strictly clamped server-side — see
+   * resource_grader.py's "Score Calculation Guard"). Null iff `grade` is
+   * null. */
+  score?: number | null;
+  /** Concise 1-2 sentence rationale for the overall evaluation. Null iff
+   * `grade` is null. */
+  reasoning_summary?: string | null;
+}
+
 /** Shape of the JSON body returned by GET /api/v1/ingredients/{id}. */
 export interface IngredientDetailResponse {
   id: number;
@@ -468,6 +537,11 @@ export interface IngredientDetailResponse {
    * get_ingredient_conclusions on the backend). Not yet included in
    * GradeIngredientResponse below — see that interface's docstring. */
   conclusions: PaperConclusion[];
+  /** Every stored VerifiedResource for this ingredient (Phase 7 — see
+   * app/services/search.py::get_ingredient_resources on the backend).
+   * Same "not yet included in GradeIngredientResponse" caveat as
+   * `conclusions` above. */
+  verified_resources: VerifiedResource[];
 }
 
 /** Shape of the JSON body returned by

@@ -25,22 +25,24 @@ backend/
     │   ├── supplement.py   # Ingredient, SupplementAnalysis — Pydantic I/O models (Gemini + API response)
     │   ├── search.py       # FilterType, ResultType, SearchResultItem (now with nested ingredients), SearchResponse, SuggestResponse
     │   ├── dev.py           # MockDataResetResponse
-    │   ├── research.py      # RubricEvaluationResponse (Phase 3), ResearchPaperResponse, PaperConclusionResponse (Phase 5), IngredientDetailResponse (now with conclusions), GradeIngredientResponse (Phase 2), GradePaperResponse (Phase 4)
+    │   ├── research.py      # RubricEvaluationResponse (Phase 3), ResearchPaperResponse (now with status — Phase 6), PaperConclusionResponse (Phase 5), VerifiedResourceResponse (Phase 7; now with grade/score/reasoning_summary — Phase 8), IngredientDetailResponse (now with conclusions + verified_resources), GradeIngredientResponse (Phase 2), GradePaperResponse (Phase 4)
     │   └── (supplement.py adds LinkedIngredientResponse, ProductDetailResponse)
     ├── models/
     │   ├── schemas.py      # ScanResponse (superseded by schemas/supplement.py; unused)
     │   ├── supplement.py   # Product, Ingredient (now with is_graded/grade_badge_text/papers), ProductIngredientLink — SQLModel ORM tables (M2M)
-    │   └── research.py     # ResearchPaper — SQLModel ORM table (Phase 2; now with keywords + grade/grade_score/rubric_evaluation from Phase 3), FK'd to Ingredient. Also: serialize_keywords()/parse_keywords(). PaperConclusion (Phase 5) — one row per synthesized cross-paper claim, FK'd to Ingredient (no ORM relationship — queried directly, see search.py)
+    │   └── research.py     # ResearchPaper — SQLModel ORM table (Phase 2; now with keywords + grade/grade_score/rubric_evaluation from Phase 3, status from Phase 6), FK'd to Ingredient. Also: serialize_keywords()/parse_keywords(), PAPER_STATUS_ACTIVE/PAPER_STATUS_DISCARDED_IRRELEVANT (Phase 6). PaperConclusion (Phase 5) — one row per synthesized cross-paper claim, FK'd to Ingredient (no ORM relationship — queried directly, see search.py). VerifiedResource (Phase 7; now with grade/score/reasoning_summary — Phase 8) — one row per official government/regulatory reference link, FK'd to Ingredient (same no-relationship convention as PaperConclusion)
     └── services/
         ├── vision.py       # Gemini API calls for label parsing
         ├── storage.py      # save_scan() (M2M find-or-create), delete_all_data(), delete_mock_data() (legacy, unused by the route)
-        ├── search.py       # suggest() / search() queries, get_linked_ingredients()/get_product_detail() (explicit joins), get_ingredient_papers()/get_ingredient_detail()/to_research_paper_response() (shared ORM->response mapper), get_ingredient_conclusions() (Phase 5)
+        ├── search.py       # suggest() / search() queries, get_linked_ingredients()/get_product_detail() (explicit joins), get_ingredient_papers() (excludes DISCARDED_IRRELEVANT papers — Phase 6)/get_ingredient_detail()/to_research_paper_response() (shared ORM->response mapper), get_ingredient_conclusions() (Phase 5), get_ingredient_resources() (Phase 7, now includes grade/score/reasoning_summary — Phase 8)
         ├── research_keywords.py  # Gemini: generate_ingredient_keywords() (Phase 2)
         ├── paper_search.py       # Europe PMC/PubMed/Semantic Scholar/OpenAlex (async, concurrent): search_papers_for_ingredient() (Phase 2; search-only as of Phase 5 — grading moved to paper_analysis_pipeline.py)
-        ├── paper_grader.py       # Gemini: grade_paper() — evaluates one paper against docs/paper_grading_rubric.json (Phase 3); grade_single_paper() — on-demand/idempotent DB-aware wrapper for one already-stored paper (Phase 4; also the per-paper grading step of the Phase 5 pipeline)
-        ├── conclusion_grader.py  # Gemini: process_paper_conclusions() — extracts one graded paper's findings and merges/creates PaperConclusion rows against docs/conclusion_grading_rubric.json (Phase 5)
-        ├── paper_analysis_pipeline.py  # analyze_ingredient_papers() — sequential per-paper grade + conclusion-synthesis loop with per-paper error isolation (Phase 5)
-        └── grading.py             # Orchestrates keyword-gen + paper-search + the Phase 5 grade/conclusion-synthesis pipeline + debug grade assignment: grade_ingredient() (Phase 2, updated Phase 5)
+        ├── paper_grader.py       # Gemini: grade_paper() — evaluates one paper against docs/paper_grading_rubric.json AND relevance-checks it against its target ingredient in the same call (Phase 3 grading, Phase 6 relevance); grade_single_paper() — on-demand/idempotent DB-aware wrapper for one already-stored paper, also sets ResearchPaper.status (Phase 4; also the per-paper grading step of the Phase 5 pipeline)
+        ├── conclusion_grader.py  # Gemini: process_paper_conclusions() — extracts one graded paper's findings and merges/creates PaperConclusion rows against docs/conclusion_grading_rubric.json (Phase 5); defensively gates on paper.status != DISCARDED_IRRELEVANT (Phase 6)
+        ├── paper_analysis_pipeline.py  # analyze_ingredient_papers() — sequential per-paper grade + relevance-check + conclusion-synthesis loop with per-paper error isolation (Phase 5); discards/skips conclusion synthesis for DISCARDED_IRRELEVANT papers (Phase 6)
+        ├── resource_fetcher.py   # Plain HTTP: fetch_verified_resources_for_ingredient() queries docs/verified_resource_apis.json's official gov/regulatory APIs by ingredient name, strictly domain-filters results, persists VerifiedResource rows (Phase 7); also grades each new one via resource_grader.py, sequentially (Phase 8)
+        ├── resource_grader.py    # Gemini: grade_resource() — evaluates one already-fetched, already-domain-verified resource against docs/resource_grading_rubric.json (Phase 8); pure, no DB — called directly by resource_fetcher.py, no separate on-demand endpoint/pipeline module (unlike papers)
+        └── grading.py             # Orchestrates keyword-gen + paper-search + verified-resource lookup/grading + the Phase 5/6 grade/relevance/conclusion-synthesis pipeline + debug grade assignment: grade_ingredient() (Phase 2, updated Phase 5/6/7/8)
 ```
 
 Note: `app/schemas/supplement.py` and `app/models/supplement.py` both define an
@@ -150,15 +152,32 @@ one-off `_migrate_*` functions here.
 
 Same pattern again for `ResearchPaper.keywords` (added after
 `research_papers` already existed in deployed databases — see "Matched
-keyword tracking" in the Phase 2 section below), and later `grade`/
+keyword tracking" in the Phase 2 section below), later `grade`/
 `grade_score`/`rubric_evaluation` (Phase 3 automated paper grading — see
-"Automated paper grading" below): `init_db()` also calls
-`_migrate_research_paper_columns()` right after
-`_migrate_ingredient_grading_columns()`, checking `PRAGMA
+"Automated paper grading" below), and now `status` (Phase 6 ingredient
+relevance verification — see "Ingredient Relevance Verification (Phase 6)"
+below): `init_db()` also calls `_migrate_research_paper_columns()` right
+after `_migrate_ingredient_grading_columns()`, checking `PRAGMA
 table_info(research_papers)` and adding whichever of `keywords VARCHAR`,
-`grade VARCHAR`, `grade_score INTEGER`, `rubric_evaluation JSON` are
-missing. No `DEFAULT` needed for any of these (unlike `is_graded`) since
-all four columns are nullable.
+`grade VARCHAR`, `grade_score INTEGER`, `rubric_evaluation JSON`,
+`status VARCHAR DEFAULT 'ACTIVE' NOT NULL` are missing. No `DEFAULT`
+needed for the first four (nullable columns) — but `status` mirrors
+`is_graded` in needing one, since `ResearchPaper.status` is a
+non-Optional `str` field (`Field(default=PAPER_STATUS_ACTIVE)`), so
+`create_all()` generates it `NOT NULL` on a fresh database and the
+`ALTER TABLE` here has to match that on a migrated one.
+
+One more additive migration, `_migrate_verified_resource_columns()`
+(also called from `init_db()`): `VerifiedResource.grade`/`score`/
+`reasoning_summary` (Phase 8 automated resource grading — see "Automated
+Resource Grading (Phase 8)" below) were added after `verified_resources`
+already existed in deployed (Phase 7) databases — unlike
+`verified_resources` itself, which needed no migration when it was
+first introduced (a brand-new table, not new columns on an existing
+one — see that model's docstring). Checks `PRAGMA
+table_info(verified_resources)` and adds whichever of `grade VARCHAR`,
+`score INTEGER`, `reasoning_summary TEXT` are missing; all three are
+nullable, so no `DEFAULT` is needed.
 
 `get_session()` is a FastAPI dependency yielding one `Session` per
 request.
@@ -330,42 +349,69 @@ same explicit-join approach as `/supplements/search` above
   field — but available for a future dedicated product-detail screen.
 
 ### `GET /api/v1/ingredients/{id}`
-Returns a single canonical `Ingredient` plus every `ResearchPaper` stored
-for it, and (Phase 5) every synthesized `PaperConclusion`
+Returns a single canonical `Ingredient` plus every currently-*active*
+`ResearchPaper` stored for it, (Phase 5) every synthesized
+`PaperConclusion`, and (Phase 7) every stored `VerifiedResource`
 (`app/services/search.py::get_ingredient_detail`). Added to back
 standalone `IngredientCard`'s "List of Studies" panel
 (`src/components/StudiesList.tsx`) — this is a pure read, it never
-triggers a new paper search itself; `papers`/`conclusions` are just
-whatever's already been persisted by a prior `POST .../grade` call (`[]`
-for both if the ingredient hasn't been graded yet).
+triggers a new paper search (or verified-resource lookup) itself;
+`papers`/`conclusions`/`verified_resources` are just whatever's already
+been persisted by a prior `POST .../grade` call (`[]` for all three if
+the ingredient hasn't been graded yet).
 
 - **Params:** `id` (path, int).
 - **Response (200):** `IngredientDetailResponse` — `{ id, name,
   recommended_daily_dosage, scientific_data, product_count, is_graded,
   grade_badge_text, papers: ResearchPaperResponse[], conclusions:
-  PaperConclusionResponse[] }`. Each `ResearchPaperResponse` is `{ id,
+  PaperConclusionResponse[], verified_resources: VerifiedResourceResponse[]
+  }`. Each `ResearchPaperResponse` is `{ id,
   title, abstract, authors, publication_date, source_url, source_domain,
   ingredient_id, keywords: string[], grade, grade_score,
-  rubric_evaluation }` — a direct mirror of the `ResearchPaper` table
-  columns, except `keywords` (parsed from the stored comma-separated
-  string via `parse_keywords()`) and `rubric_evaluation` (the stored
-  JSON dict, validated straight into `RubricEvaluationResponse`).
-  `grade`/`grade_score`/`rubric_evaluation` are `null` for a paper that
-  hasn't been graded yet (Phase 3 — see "Automated paper grading"
-  below). Each `PaperConclusionResponse` (Phase 5 — see "Cross-Paper
-  Conclusion Synthesis" below) is `{ id, ingredient_id, claim_summary,
-  detailed_conclusion, dosage_mentioned, rubric_evaluation,
-  confidence_score, confidence_grade, cross_paper_consensus,
-  supporting_paper_ids: number[], contradicting_paper_ids: number[] }`,
-  ordered highest-`confidence_score`-first.
+  rubric_evaluation, status }` — a direct mirror of the `ResearchPaper`
+  table columns, except `keywords` (parsed from the stored
+  comma-separated string via `parse_keywords()`) and `rubric_evaluation`
+  (the stored JSON dict, validated straight into
+  `RubricEvaluationResponse`). `grade`/`grade_score`/`rubric_evaluation`
+  are `null` for a paper that hasn't been graded yet (Phase 3 — see
+  "Automated paper grading" below). `status` (Phase 6 — see "Ingredient
+  Relevance Verification" below) is always `"ACTIVE"` here — a paper
+  Gemini determines is off-topic for this ingredient is flipped to
+  `"DISCARDED_IRRELEVANT"` and excluded from this list entirely
+  (`app/services/search.py::get_ingredient_papers`), so it never counts
+  toward `grade_badge_text`/the "Total studies" or "Average grade" the
+  frontend derives from `papers`. Each `PaperConclusionResponse` (Phase 5
+  — see "Cross-Paper Conclusion Synthesis" below) is `{ id,
+  ingredient_id, claim_summary, detailed_conclusion, dosage_mentioned,
+  rubric_evaluation, confidence_score, confidence_grade,
+  cross_paper_consensus, supporting_paper_ids: number[],
+  contradicting_paper_ids: number[] }`, ordered
+  highest-`confidence_score`-first. Each `VerifiedResourceResponse`
+  (Phase 7 — see "Verified Online Resources" below) is `{ id,
+  ingredient_id, title, publisher, url, domain, summary, grade, score,
+  reasoning_summary }`, most recently added first — every row already
+  cleared the backend's strict domain allow-list at fetch time, so
+  (unlike `papers`) there's no further status/relevance field to check
+  before displaying one. `grade`/`score`/`reasoning_summary` (Phase 8 —
+  see "Automated Resource Grading" below) are `null` until
+  `app/services/resource_fetcher.py` successfully grades that resource
+  (best-effort at fetch time, never retried) — the frontend renders no
+  grade badge for a `null` grade, same convention as `papers`.
 - **Errors:** `404` if no `Ingredient` with that id exists.
 
 ### `POST /api/v1/ingredients/{id}/grade`
 **[Phase 2, debug]** Runs the research-paper search pipeline for a single
-canonical `Ingredient`, grades every stored paper and synthesizes/merges
-cross-paper conclusions (Phase 5), and assigns a debug grade — see
-"Research Paper Search & Ingredient Grading (Phase 2)" and "Cross-Paper
-Conclusion Synthesis (Phase 5)" below for the full pipeline.
+canonical `Ingredient`, grades and relevance-checks every stored active
+paper (Phase 6 — discarding any Gemini determines aren't actually about
+this ingredient), synthesizes/merges cross-paper conclusions from the
+rest (Phase 5), queries the official government/regulatory APIs
+configured in `docs/verified_resource_apis.json` for new verified
+resource links and grades each one against
+`docs/resource_grading_rubric.json` (Phase 7/8), and assigns a debug
+grade — see "Research Paper Search & Ingredient Grading (Phase 2)",
+"Cross-Paper Conclusion Synthesis (Phase 5)", "Ingredient Relevance
+Verification (Phase 6)", "Verified Online Resources (Phase 7)", and
+"Automated Resource Grading (Phase 8)" below for the full pipeline.
 
 - **Params:** `ingredient_id` (path, int).
 - **Response (200):** `GradeIngredientResponse` — `{ status,
@@ -404,7 +450,13 @@ ingredient re-grade.
   (`app/services/paper_grader.py::grade_single_paper` treats this as a
   safe, idempotent no-op, not an error), so re-tapping an already-graded
   badge or a duplicate request from a slow double-tap can't double-charge
-  a Gemini call or corrupt the stored grade.
+  a Gemini call or corrupt the stored grade. Unlike every other
+  paper-bearing endpoint, `paper.status` here **can** come back
+  `"DISCARDED_IRRELEVANT"` (Phase 6) — this is the one place a discarded
+  paper is ever returned to the frontend at all, since it's the freshly-
+  graded row itself, not a list query that already filters discards out.
+  The frontend checks this and removes the paper from local state instead
+  of leaving it displayed — see `IngredientCard.tsx::handlePaperGraded`.
 - **Errors:** `404` if no `ResearchPaper` with that id exists; `502` if
   grading fails (`PaperGradingError` — Gemini request failure, unparsable
   response, or a DB commit failure) or the rubric file can't be loaded.
@@ -609,54 +661,110 @@ unchanged — only *when* and *from where* grading is triggered moved.
 
 - **Rubric — `docs/paper_grading_rubric.json`** (repo root, same
   absolute-path resolution as `paperApis.json`; currently `version:
-  "1.1"`). Defines four weighted categories whose *positive* maximums
-  sum to 100 — `study_type` 35, `journal_reputation` 25,
-  `sample_methodology` 30, `funding_bias` **10** — each with a
-  human-readable `description` and a handful of `score_tiers` (a point
-  range + a worked example of what earns it), plus `grade_bands` mapping
-  contiguous 0-100 score ranges onto letters A-E (A: 85-100 down to E:
-  0-29). `_load_rubric()` reads and `@lru_cache`s this file for the
-  process lifetime — unlike `paperApis.json` (re-read every call so
-  `enabled: false` takes effect live), the rubric isn't meant to be
-  hot-swapped, and it's read once per *paper* rather than once per
-  *request*, so re-parsing it every time would add up.
-  - **`funding_bias` is a penalty scale, not a plain 0-to-max score.**
-    It's the one category with an explicit `min_score` (`-10`, alongside
-    `max_score: 10`) — independent/well-disclosed funding earns up to
-    +10, neutral/undisclosed funding scores near 0, and industry-biased,
-    undisclosed-conflict, or "suspicious commercial interference" funding
-    is *penalized* down to -10. A paper can therefore land below what its
-    other three categories alone would suggest — e.g. a methodologically
-    excellent but transparently marketing-driven study loses points
-    overall rather than merely forfeiting a category's positive credit.
-    This is why the categories' positive maximums (35+25+30+10=100) sum
-    to exactly 100 while the theoretical floor is -10, not 0 —
-    `grade_paper` clamps the final total back to 0-100 (see "Structured
-    output" below), so that floor never surfaces as a negative
-    `grade_score` in the API/UI.
+  "1.5"`). Defines four weighted categories whose *positive* maximums
+  sum to 100 — `study_type` **40** (raised from 35 in v1.5),
+  `journal_reputation` **15** (lowered from 20 in v1.5 — the 5 points
+  moved directly to `study_type`, unlike v1.4's transfer to
+  `sample_methodology`), `sample_methodology` 40, `funding_bias` 5 —
+  each with a human-readable `description` and a handful of
+  `score_tiers` (a point range + a worked example of what earns it),
+  plus `grade_bands` mapping contiguous 0-100 score ranges onto letters
+  A-E (A: 80-100 down to E: 0-24, per v1.3). `_load_rubric()`
+  reads and `@lru_cache`s this file for the process lifetime — unlike
+  `paperApis.json` (re-read every call so `enabled: false` takes effect
+  live), the rubric isn't meant to be hot-swapped, and it's read once
+  per *paper* rather than once per *request*, so re-parsing it every
+  time would add up.
+  - **Two categories are penalty scales, not plain 0-to-max scores.**
+    - `funding_bias` — `min_score: -15`, `max_score: 5` — independent/
+      well-disclosed funding earns up to +5, and industry-biased,
+      undisclosed-conflict, or "suspicious commercial interference"
+      funding is *heavily penalized* down to -15. Funding that simply
+      isn't mentioned in the abstract/metadata at all doesn't score a
+      neutral 0 — it defaults to **+2** (see "Prompting" below): the
+      intent is specifically that an otherwise-strong paper shouldn't be
+      dragged toward a lower grade purely because its abstract happens
+      not to discuss funding, as opposed to actively indicating a
+      conflict of interest.
+    - **`journal_reputation` — `min_score: -5`, `max_score: 15` (lowered
+      from `20` in v1.5, which itself was new in v1.4, transferred down
+      from a plain `0`-`25` scale).** Highly reputable journals still
+      earn up to +15 (down from the v1.4 +20 ceiling — v1.5 moved those 5
+      points to `study_type`'s max, 35 -> 40, not to
+      `sample_methodology` as v1.4's own transfer did), but a publisher
+      *actively identified* as predatory, a vanity press, an unvetted
+      pay-to-publish outlet, or one using fake/absent peer review is
+      still penalized down to -5, same floor as v1.4. Critically, an
+      *unidentified* publisher (metadata just doesn't say) still scores
+      near-neutral (0-1), not negative — same "penalty only for a
+      publisher actively flagged as disreputable" rule v1.4 introduced,
+      mirroring how `funding_bias`'s own negative range is reserved for
+      actively indicated bias, not silence (see "Prompting" below for
+      both).
+    - A paper can therefore land well below what its other categories
+      alone would suggest when funding *and/or* the journal are flagged
+      as bad — e.g. a methodologically excellent but transparently
+      marketing-driven study in a predatory journal now loses points on
+      two fronts at once rather than merely forfeiting positive credit
+      on each. This is why the categories' positive maximums
+      (40+15+40+5=100, per v1.5) sum to exactly 100 while the
+      theoretical floor is -20 (-15 funding + -5 journal), not 0 —
+      `grade_paper` clamps the final total back to 0-100 (see
+      "Structured output" below), so that floor never surfaces as a
+      negative `grade_score` in the API/UI.
+  - **A grade threshold + score-tier calibration (v1.3, unchanged by
+    v1.4/v1.5).** The A threshold was lowered from 85 to 80 (B/C/D
+    shifted down to match: B 65-79, C 45-64, D 25-44, E 0-24, still
+    contiguous/covering 0-100 with no gaps), and
+    `study_type`/`sample_methodology`'s score-tier text was nudged so
+    best-in-class study designs/sample sizes sit closer to each
+    category's ceiling — both changes were prompted by top-tier
+    systematic reviews/meta-analyses landing around 74 pts ('B') purely
+    because their abstract didn't happen to mention funding. v1.4/v1.5
+    continue that same "don't penalize a strong paper for what its
+    metadata is silent on" direction, first extended to
+    `journal_reputation` in v1.4; v1.5 is purely a point-allocation
+    rebalance (`journal_reputation`'s max down 5, `study_type`'s max up
+    the same 5) with no new scoring behavior.
 - **Prompting.** `_format_rubric_for_prompt` renders every category's
   label/max score/description/score tiers as plain text and embeds it in
   the Gemini prompt alongside the paper's title/abstract/authors/
   journal/publication info — the actual scoring criteria live in the
   JSON file (editable without a code change), not hardcoded into a
   Python string. Gemini is explicitly told to score conservatively in
-  the lower tiers of a category when the given metadata doesn't cover it
-  (e.g. no funding info in an abstract), rather than assuming the best
-  case.
+  the lower tiers of a category when the given metadata doesn't cover
+  it — **except `funding_bias` and, as of v1.4, `journal_reputation`,
+  both called out in `_build_prompt` as deliberate exceptions**:
+  - `funding_score`: funding not being mentioned at all defaults to a
+    neutral **+2**, not that category's lower (negative) tiers; a
+    negative score is only awarded when the abstract/metadata *actively*
+    indicates industry-biased/undisclosed-conflict/suspicious commercial
+    funding — never as a penalty for the metadata simply being silent.
+  - `journal_score`: an unidentified publisher scores near the neutral
+    0-1 tier (not the negative range); a negative score (down to -5) is
+    only awarded when the abstract/metadata *actively* identifies a
+    predatory publisher, vanity press, unvetted pay-to-publish outlet,
+    or fake/absent peer review — again, never merely for the publisher
+    being unnamed.
 - **Structured output — `_RubricEvaluationSchema`.** Same
   `response_schema` + `.parsed`-with-raw-text-fallback pattern as
   `research_keywords.py`/`vision.py`. Deliberately does **not** ask
   Gemini for a letter grade directly — only the four category scores,
   their descriptive text, `total_score`, and `summary_notes`; the prompt
-  explicitly calls out that `funding_score` is the one field allowed to
-  go negative (-10 to 10), every other category score must be
-  non-negative. Each category score is clamped to that category's own
-  `(min_score, max_score)` bounds from the rubric (`category_bounds`,
-  built from each category's `min_score`/`max_score` — `0` by default,
-  `-10` for `funding_bias`) in case Gemini's raw output overshoots either
-  side. The final `total_score` is then recomputed server-side as the
-  sum of those clamped category scores (funding's contribution may be
-  negative) rather than trusted from Gemini's own arithmetic, clamped
+  explicitly calls out that `funding_score` (-15 to 5, defaulting to +2
+  when funding goes unmentioned) and `journal_score` (-5 to 15 as of
+  v1.5, previously -5 to 20, defaulting to 0-1 when the publisher goes
+  unidentified) are the two fields allowed to go negative — see
+  "Prompting" above for both — `study_type_score` (0 to 40 as of v1.5)
+  and `sample_score` must be non-negative. Each category score is
+  clamped to that category's own `(min_score, max_score)` bounds from
+  the rubric (`category_bounds`, built from each category's
+  `min_score`/`max_score` — `0` by default, `-15` for `funding_bias`,
+  `-5` for `journal_reputation`) in case Gemini's raw output overshoots
+  either side. The final
+  `total_score` is then recomputed server-side as the sum of those
+  clamped category scores (funding's and/or journal's contribution may
+  be negative) rather than trusted from Gemini's own arithmetic, clamped
   again to 0-100, and `grade` is derived purely from that final total via
   `grade_bands` (`_score_to_grade`). This guarantees `grade` and
   `grade_score` can never disagree with each other or with the category
@@ -874,30 +982,39 @@ conclusions. Otherwise it:
   the commit itself).
 
 **4. Pipeline — `app/services/paper_analysis_pipeline.py`.**
-`analyze_ingredient_papers(session, ingredient_id)` is the sequential,
-per-paper loop the task's "replace bulk/batch evaluation with a
-sequential pipeline" requirement asks for: it fetches **every**
-`ResearchPaper` currently stored for the ingredient (not just ones from
-the current request — this also catches papers left ungraded/
-unsynthesized by an earlier, partially-failed run) and, for each one in
-turn:
+`analyze_ingredient_papers(session, ingredient_id, ingredient_name)` is
+the sequential, per-paper loop the task's "replace bulk/batch evaluation
+with a sequential pipeline" requirement asks for: it fetches **every
+currently-active** `ResearchPaper` stored for the ingredient — excluding
+any already `DISCARDED_IRRELEVANT` from a previous run (Phase 6 — see
+"Ingredient Relevance Verification (Phase 6)" below) — not just ones
+from the current request (this also catches papers left
+ungraded/unsynthesized by an earlier, partially-failed run) and, for each
+one in turn:
 1. Calls `paper_grader.grade_single_paper` (Phase 4's idempotent,
-   DB-aware grader — a no-op, no Gemini call, if already graded).
-2. If that succeeds, calls `conclusion_grader.process_paper_conclusions`
-   for the now-graded paper.
+   DB-aware grader — a no-op, no Gemini call, if already graded; as of
+   Phase 6 this same call also relevance-checks the paper and sets its
+   `status`).
+2. If the paper's `status` just came back `DISCARDED_IRRELEVANT`, logs
+   `[Pipeline] Discarded Paper ID #{id}: Unrelated to target ingredient
+   '{ingredient_name}'` and moves straight to the next paper —
+   `process_paper_conclusions` is never called for it (Phase 6).
+3. Otherwise, calls `conclusion_grader.process_paper_conclusions` for the
+   now-graded, confirmed-relevant paper.
 
-Both steps are wrapped in their own `try/except`, and a failure in
-either (rate limiting, a transient network error, a malformed Gemini
-response) is logged and the loop **moves on to the next paper** rather
-than aborting — the whole point being that `grade_single_paper` and
-`process_paper_conclusions` each commit their own work independently, so
-whatever succeeded before a mid-loop failure is already durably saved,
-never rolled back by a later paper's problem. `analyze_ingredient_papers`
-itself never raises for a single paper's failure; it only would if the
-initial paper-lookup query itself broke (a sign of a dead DB connection,
-not a transient API issue). Returns a `PipelineResult` (papers
-considered/graded/failed, conclusions attempted/failed) — informational
-only, nothing branches on it today beyond logging.
+Every step is wrapped in its own `try/except`, and a failure in grading
+or conclusion synthesis (rate limiting, a transient network error, a
+malformed Gemini response) is logged and the loop **moves on to the next
+paper** rather than aborting — the whole point being that
+`grade_single_paper` and `process_paper_conclusions` each commit their
+own work independently, so whatever succeeded before a mid-loop failure
+is already durably saved, never rolled back by a later paper's problem.
+`analyze_ingredient_papers` itself never raises for a single paper's
+failure; it only would if the initial paper-lookup query itself broke (a
+sign of a dead DB connection, not a transient API issue). Returns a
+`PipelineResult` (papers considered/graded/failed, discarded-irrelevant,
+conclusions attempted/failed) — informational only, nothing branches on
+it today beyond logging.
 
 Deliberately **per-paper and sequential, never bulk/batched into fewer,
 larger Gemini calls** — both to stay within free-tier rate limits (many
@@ -956,6 +1073,708 @@ consuming this new field is unbuilt.
   the prompt, not on any server-side similarity check.
 - Same unauthenticated-endpoint caveat as the rest of this API surface.
 
+## Ingredient Relevance Verification (Phase 6)
+
+Papers found by `paper_search.py` are keyword-matched, not
+topic-verified — a Vitamin C search can surface a Vitamin D paper that
+merely happens to share a keyword (e.g. both call themselves an
+"antioxidant" or "immune support" study). Phase 6 adds a strict
+relevance gate so an off-topic paper never contaminates an ingredient's
+grade badge, "Total studies"/"Average grade" figures, or synthesized
+conclusions.
+
+**1. Data model — `app/models/research.py`.** Two module-level string
+constants, `PAPER_STATUS_ACTIVE = "ACTIVE"` and
+`PAPER_STATUS_DISCARDED_IRRELEVANT = "DISCARDED_IRRELEVANT"`, are the
+only two values `ResearchPaper.status: str = Field(default=
+PAPER_STATUS_ACTIVE)` ever takes. Every module that sets or compares
+against paper status (`paper_grader.py`, `conclusion_grader.py`,
+`paper_analysis_pipeline.py`, `search.py`) imports these rather than
+re-typing the literal, so a future rename can't silently desync one call
+site from another. `status` is non-Optional (unlike `grade`/
+`grade_score`/`rubric_evaluation`), so a fresh `create_all()` generates
+it `NOT NULL DEFAULT` — see `app/db.py::_migrate_research_paper_columns`
+above for the matching `ALTER TABLE` DDL on already-deployed databases.
+Every paper starts `"ACTIVE"` at ingestion (`paper_search.py` doesn't
+grade or relevance-check — see Phase 2 above) and is only ever flipped
+to `"DISCARDED_IRRELEVANT"`, never back.
+
+**2. Relevance check — `app/services/paper_grader.py`.** Rather than a
+third Gemini call per paper (on top of the existing grading call), the
+relevance check is folded into the *same* Gemini call that already
+grades a paper against `docs/paper_grading_rubric.json` — consistent
+with this pipeline's "minimize Gemini calls per paper" philosophy (see
+Phase 2/5 above on rate-limit-driven sequential design).
+`_RubricEvaluationSchema` gained two fields, listed *first* (before
+`study_type`) since relevance is conceptually a gating question prior
+to quality scoring: `is_relevant_to_ingredient: bool` and
+`relevance_reasoning: str` (one sentence explaining the call).
+`_build_prompt` now takes the target `ingredient_name` and instructs
+Gemini to strictly judge whether the paper's title/abstract explicitly
+studies, tests, or analyzes that ingredient itself (or a direct synonym
+/ specific active compound of it) — not a different ingredient, and not
+merely a broader category it happens to belong to — with a worked
+Vitamin C/Vitamin D example, and an explicit instruction to judge
+relevance on topic alone, never on quality, and to still fill in every
+rubric field regardless of the relevance outcome (so a `false` paper
+still gets a real, if moot, grade). `grade_paper()`'s return dict gained
+`is_relevant_to_ingredient`/`relevance_reasoning` alongside the existing
+`grade`/`grade_score`/`rubric_evaluation` keys. Unlike the numeric rubric
+scores (always clamped/re-derived server-side — see Phase 3's "never
+trust Gemini's own aggregate" rule), the boolean is trusted directly:
+there's nothing to clamp on a plain `true`/`false`.
+
+**3. Persisting the result — `paper_grader.py::grade_single_paper`.**
+This function (Phase 4's idempotent, DB-aware single-paper grader — also
+the per-paper grading step of the Phase 5 pipeline) now also fetches the
+paper's `Ingredient` row (`session.get(Ingredient, paper.ingredient_id)`
+— raising `PaperGradingError` if somehow missing), passes
+`ingredient.name` into `grade_paper()`, and — alongside setting
+`grade`/`grade_score`/`rubric_evaluation` as before — sets `paper.status
+= PAPER_STATUS_ACTIVE if result["is_relevant_to_ingredient"] else
+PAPER_STATUS_DISCARDED_IRRELEVANT`. Status-setting lives here (not in
+the pipeline) specifically because `grade_single_paper` is also called
+directly by the on-demand `POST /api/v1/papers/{paper_id}/grade` route,
+outside the Phase 5/6 pipeline entirely — putting it here means both
+callers get uniform, guaranteed status-setting rather than needing the
+pipeline to duplicate it.
+
+**4. Defensive gate — `app/services/conclusion_grader.py`.**
+`process_paper_conclusions` checks `paper.status ==
+PAPER_STATUS_DISCARDED_IRRELEVANT` and returns `False` (no-op, not an
+error) as its very first check, *before* the existing
+`grade_score <= MIN_GRADE_SCORE_FOR_CONCLUSIONS` gate. This is
+defense-in-depth: the pipeline (below) already never calls this function
+for a discarded paper, but a defensive check here means the business
+rule ("never synthesize conclusions from an irrelevant paper") holds
+even for a hypothetical future caller that skips the pipeline.
+
+**5. Pipeline discard logic — `app/services/paper_analysis_pipeline.py`.**
+`analyze_ingredient_papers` gained a required `ingredient_name: str`
+parameter (needed for the exact log message format below) and now
+excludes `PAPER_STATUS_DISCARDED_IRRELEVANT` papers from its initial
+query (`.where(ResearchPaper.status != PAPER_STATUS_DISCARDED_IRRELEVANT)`)
+so an already-discarded paper is never re-relevance-checked or re-logged
+on a subsequent re-grade. After `grade_single_paper` succeeds for a
+paper, if its `status` just came back `DISCARDED_IRRELEVANT`, the
+pipeline logs `logger.warning("[Pipeline] Discarded Paper ID #%s:
+Unrelated to target ingredient %r", ...)`, increments the new
+`PipelineResult.papers_discarded_irrelevant` counter, and `continue`s —
+skipping `process_paper_conclusions` for that paper entirely (requirement
+#2.1: "Skip conclusion extraction and grading for this paper
+completely"). `app/services/grading.py::grade_ingredient` was updated to
+pass `ingredient.name` through to this new parameter.
+
+**6. Exclusion from summaries — `app/services/search.py`.**
+`get_ingredient_papers` (backing both `GET /api/v1/ingredients/{id}` and
+`POST /api/v1/ingredients/{id}/grade`) gained a
+`.where(ResearchPaper.status != PAPER_STATUS_DISCARDED_IRRELEVANT)`
+filter, so a discarded paper is excluded from the `papers` list the
+frontend's "Total studies"/"Average grade"/"List of Studies" all derive
+from (`StudiesAnalysisBar.tsx`/`StudiesList.tsx`) — satisfying
+requirement #2.3 without either table needing its own separate
+count/average query. `to_research_paper_response` also now includes
+`status` on every response (see API exposure below), and
+`ResearchPaperResponse` (`app/schemas/research.py`) gained a matching
+non-Optional `status: str` field.
+
+**API exposure & frontend.** `status` is now present on every
+`ResearchPaperResponse` (default `PAPER_STATUS_ACTIVE`), mirrored on the
+frontend's `ResearchPaper` interface (`src/services/api.ts`), which also
+exports `PAPER_STATUS_ACTIVE`/`PAPER_STATUS_DISCARDED_IRRELEVANT`
+constants matching the backend's. In practice a `DISCARDED_IRRELEVANT`
+paper is never returned by `GET /api/v1/ingredients/{id}` or
+`POST /api/v1/ingredients/{id}/grade` (both go through the now-filtered
+`get_ingredient_papers`) — but `POST /api/v1/papers/{paper_id}/grade`
+(on-demand single-paper grading) *does* return the just-graded paper
+regardless of outcome, since it's not a list query. `IngredientCard.tsx`'s
+`handlePaperGraded` (passed to `StudiesList` as `onPaperGraded`) checks
+`updatedPaper.status` and, if `DISCARDED_IRRELEVANT`, **filters the
+paper out of local state** instead of splicing it back in — otherwise a
+stale "irrelevant" paper would stay visible in `StudiesList` and counted
+in `StudiesAnalysisBar` until the next full `fetchIngredientDetail()`
+call.
+
+**Known gaps:**
+- No UI surfaces *why* a paper was discarded — `relevance_reasoning` is
+  returned by `grade_paper()` internally but never persisted on
+  `ResearchPaper` or exposed via any API response; a discarded paper
+  simply stops appearing.
+- A `DISCARDED_IRRELEVANT` row is kept in the database, not hard-deleted
+  (requirement #2.2 offered either "flag or delete" — flagging was
+  chosen, consistent with this codebase's general preference for
+  soft-state over destructive deletes, e.g. `PaperConclusion.is_active`).
+  There's no admin/debug view of discarded papers, so this is currently
+  a one-way, silent trip to invisible-but-present state.
+- Same unauthenticated-endpoint caveat as the rest of this API surface.
+
+## Verified Online Resources (Phase 7)
+
+Every paper-derived signal so far (Phase 2-6) comes from academic search
+APIs and an LLM's own judgment of quality/relevance. Phase 7 adds a
+second, independent category of evidence: direct links to official
+government and regulatory reference pages (NIH, USDA, EFSA) — no Gemini
+call involved at all, just plain HTTP requests to public APIs plus a
+strict domain allow-list.
+
+**1. Config — `docs/verified_resource_apis.json`.** Same
+config-file-driven-source pattern as `docs/paperApis.json`
+(Phase 2/Research Paper Search below): a JSON array of `{id, name,
+domain, endpoint, query_param, extra_params, auth, access_type,
+description}` entries. As shipped in Phase 7, four free/keyless sources
+were configured (MedlinePlus, PubChem, USDA FoodData Central, OpenEFSA);
+as of Phase 10 this expanded to six — see "Verified Resource Fetcher
+Expansion (Phase 10)" below for the current source list and what changed.
+`enabled: false` (or removing an entry) disables querying that source,
+same convention as `paperApis.json`.
+
+**2. Data model — `app/models/research.py`.** A new `VerifiedResource`
+SQLModel table (`verified_resources`) — `id`, `ingredient_id` (FK to
+`ingredients.id`), `title`, `publisher`, `url`, `domain`, `summary`
+(optional), `created_at`. No ORM `Relationship()` back to `Ingredient` —
+same convention as `PaperConclusion`, queried directly by
+`ingredient_id` in `search.py`. Unlike every other Phase 2-6 addition to
+`research_papers` (`keywords`, `grade`, `status`, ...), this is a
+brand-new table rather than new columns on an existing one, so it needs
+no additive `_migrate_*` step in `app/db.py` —
+`SQLModel.metadata.create_all()` alone creates it on both a fresh
+database and one upgraded from a pre-Phase-7 version.
+
+**3. Query + strict domain filtering —
+`app/services/resource_fetcher.py`.** `fetch_verified_resources_for_ingredient(session,
+ingredient_id, ingredient_name)` queries every enabled source in
+`docs/verified_resource_apis.json` by `ingredient_name`, concurrently
+(one `httpx.AsyncClient` + `asyncio.gather`, same fan-out pattern as
+`paper_search.py`), each individually guarded against timeouts/HTTP
+errors/malformed responses so one flaky government API never fails the
+whole request. As shipped in Phase 7, three of the four sources
+(MedlinePlus, USDA, EFSA) were queried through a schema-tolerant generic
+extractor (`_extract_generic_records`); as of Phase 10, every source
+except Health Canada LNHPD has its own precise, shape-verified parser
+instead — see "Verified Resource Fetcher Expansion (Phase 10)" below for
+why (the generic extractor turned out not to actually match either
+MedlinePlus's or USDA's real response shape, which silently produced
+zero results from both).
+
+**Every candidate result, regardless of source or parser, is checked
+against `_is_verified_domain` before it's ever turned into a
+`VerifiedResource` row** — this is the actual safety mechanism, not the
+per-source parsing — even a malformed or unexpected response shape can
+only ever produce *fewer* results, never an unverified one, since the
+domain check runs on every extracted URL unconditionally. The allow-list
+itself was widened in Phase 10 — see below for the current list.
+
+Deduplicated per-ingredient by `url` (same convention as
+`ResearchPaper.source_url`); `session.flush()`s rather than
+`session.commit()`s, so its work lands in the same first commit
+`grade_ingredient` already does right after paper search.
+
+**4. Pipeline wiring — `app/services/grading.py`.** `grade_ingredient`
+calls `fetch_verified_resources_for_ingredient` right after
+`search_papers_for_ingredient`, before the first commit — wrapped in its
+own `try`/`except` (logged, not re-raised) since this is an independent
+subsystem (no Gemini call, no shared state with paper grading): a
+resource-lookup failure should never fail the whole grade request, same
+"one subsystem's hiccup isn't everyone's failure" philosophy as
+paper-search's own per-source error handling.
+
+**5. API exposure — `app/schemas/research.py` /
+`app/services/search.py`.** `VerifiedResourceResponse` mirrors the
+`VerifiedResource` table field-for-field, including the Phase 8
+`grade`/`score`/`reasoning_summary` columns (see "Automated Resource
+Grading (Phase 8)" below). `get_ingredient_resources` (new) returns
+every stored resource for an ingredient, most recently added first — no
+status/relevance filter needed here (unlike `get_ingredient_papers`'s
+Phase 6 filter), since every row already cleared the domain allow-list
+before being persisted in the first place. `IngredientDetailResponse`
+gained a `verified_resources` field, populated by `get_ingredient_detail`
+alongside `papers`/`conclusions`. Not added to
+`GradeIngredientResponse`/`GradePaperResponse` — same convention as
+`conclusions`: the frontend re-fetches ingredient detail after a grade
+request to pick up anything Phase 7/8 just found/graded.
+
+**6. Frontend — `src/components/VerifiedResourcesList.tsx`.** Renders
+the "Verified Online Resources" panel: header, the subheading
+"Authoritative reference sheets and official health agency
+documentation.", and one row per resource — title (bold) + a derived
+authority pill badge ("NIH"/"USDA"/"EFSA"/"GOV", from the resource's
+already-verified `domain`) on the left, a Phase 8 grade/score badge
+(circular A-E letter badge + "N/100" score text, same visual treatment
+as `RecommendedUsesList`'s conclusion grade badge — rendered only when
+`resource.grade` is non-null) plus a "View Resource ↗" link on the
+right, dashed separators between rows (same visual convention as
+`RecommendedUsesList`'s rows). The empty state renders the spec's exact
+copy: "No verified government or regulatory reference pages found for
+this ingredient." The container uses a 2px `colors.orange` (`#E85D04`)
+border — the "active card outline theme" — distinguishing it visually
+from its border-less siblings (`RecommendedUsesList`/`StudiesAnalysisBar`
+only use a tinted background).
+
+The "View Resource" link renders differently per platform:
+on web, a genuine `<a href={url} target="_blank" rel="noopener
+noreferrer">` via a raw `React.createElement('a', ...)` call (not RN's
+`Text`/`Pressable`, which don't reliably pass `href`/`target`/`rel`
+through react-native-web to the underlying DOM node) — this is the one
+place in the app with an explicit `target`/`rel` requirement to satisfy
+literally; on native (iOS/Android), a `Pressable` calling
+`Linking.openURL`, since `target`/`rel` have no native equivalent and
+`Linking.openURL` already hands the URL to the system browser/app.
+
+Wired into `IngredientCard.tsx`'s "Scientific information" composite
+section directly between `RecommendedUsesList` ("Recomended uses list")
+and `StudiesAnalysisBar` ("Studies Analisis"), per spec. Its data
+(`verifiedResources` state) follows the exact same
+undefined/loading/error/fetch-once-per-mount lifecycle as `papers`/
+`conclusions` — populated by the same `GET /api/v1/ingredients/{id}`
+call on first expand, and refreshed by a follow-up
+`fetchIngredientDetail()` call after a grade request completes (since
+`GradeIngredientResponse` doesn't carry it — see point 5 above).
+
+**Known gaps (as shipped in Phase 7 — see "Verified Resource Fetcher
+Expansion (Phase 10)" below for what was subsequently fixed):**
+- The generic extractor (`_extract_generic_records`) is a best-effort
+  heuristic, not a guaranteed-correct parser for MedlinePlus/USDA/EFSA's
+  actual response shapes — it may under-extract (miss a resource whose
+  fields don't match any of the tried key names) or, less likely thanks
+  to the "must have a title/publisher/summary-ish field too" guard,
+  over-extract an incidental URL-bearing object that isn't really a
+  standalone reference page. The domain allow-list bounds the *risk*
+  (nothing unverified ever gets through) but not the *completeness* or
+  *precision* of what's found. **(Phase 10: this was, in fact, the actual
+  bug — see below.)**
+- No retry/backoff on a failed source — same fail-open, log-and-skip
+  behavior as `paper_search.py`'s sources; a transient failure just
+  means fewer resources found this run, not a queued retry. **(Phase 10
+  adds one same-source retry using a chemical/systematic name — still no
+  cross-source retry/backoff.)**
+- Same unauthenticated-endpoint caveat as the rest of this API surface.
+
+## Automated Resource Grading (Phase 8)
+
+Phase 7 guarantees every `VerifiedResource` comes from an official
+government/regulatory *domain* — but domain authority alone doesn't say
+whether one particular page is actually any good (thin content, no
+citations, an outdated entry, or even a stray commercial page hosted
+under an otherwise-official domain). Phase 8 adds a second, independent
+quality signal on top: an automated 0-100 rubric score, graded by
+Gemini, using `docs/resource_grading_rubric.json`.
+
+**1. Rubric — `docs/resource_grading_rubric.json`.** Same shape/tooling
+as `docs/paper_grading_rubric.json` (`categories` + `grade_bands`,
+verified via the same sum-to-100 / contiguous-bands sanity checks used
+for every other rubric in this codebase). Four categories: `publisher_authority`
+(0-35 — domain/institutional authority), `evidence_citations` (0-30 —
+scientific citations & primary sources), `comprehensiveness_currency`
+(0-20 — content breadth & recency), and `transparency_bias` (-10 to 15 —
+the one category that can go negative, penalizing commercial/sales
+motives). Category maxes sum to exactly 100; `grade_bands` map a clamped
+0-100 total onto A (80-100) through E (0-24), contiguous and covering
+the full range, same convention as every other rubric here.
+
+**2. Grading service — `app/services/resource_grader.py`.**
+`grade_resource(resource_metadata)` is pure (no DB access) — it takes
+`{"resource_title", "url", "publisher", "page_snippet_or_text"}` (any
+value may be `None`; Gemini is instructed to score conservatively where
+content is missing, same "don't assume the best case" philosophy as
+`paper_grader.py`) and returns `{"total_score", "grade",
+"category_scores", "reasoning_summary"}` via a single Gemini call with a
+structured `response_schema`.
+
+Same "never trust the model's own aggregate" rule as every other
+Gemini-graded entity in this codebase: `_ResourceEvaluationSchema` asks
+Gemini for the four `category_scores` and a `reasoning_summary` only —
+deliberately NOT `total_score`/`grade`, even though the task's own
+example Gemini output includes them, because asking for both risks the
+two disagreeing (e.g. category scores summing to 72 paired with a
+returned "A"). `grade_resource` instead clamps each category score to
+its rubric bounds (`0` to `max_score` for three categories;
+`transparency_bias` clamped to its `-10` to `15` penalty range), sums
+the clamped scores into `total_score`, clamps that sum to `0`-`100` once
+more (the task's explicit "Score Calculation Guard" — the four category
+bounds alone already keep the raw sum within `-10` to `100`, so this
+final clamp only ever has to catch the low end), and derives `grade`
+from that final total via the rubric's `grade_bands` — identical
+`_clamp`/`_score_to_grade` logic to `paper_grader.py`, just applied to a
+resource's four categories instead of a paper's.
+
+Unlike `paper_grader.py`, there is no DB-aware
+`grade_single_resource()`/on-demand grading endpoint here — this task's
+scope doesn't include a "tap a badge to grade this one resource" UI
+(unlike papers' `POST /api/v1/papers/{paper_id}/grade`). Keeping this
+module DB-agnostic means `resource_fetcher.py` — which already owns
+every `VerifiedResource` ORM object's construction/`session.add()`/flush
+lifecycle — doesn't have to hand a half-built row back and forth across
+a module boundary just to get it graded.
+
+**3. Wiring — `app/services/resource_fetcher.py`.** Per the task's
+explicit instruction ("when resource_fetcher.py retrieves online
+reference pages... evaluate each resource"), grading happens inline,
+directly inside `fetch_verified_resources_for_ingredient`'s loop — right
+after each new `VerifiedResource` row is built, before it's added to the
+session. One Gemini call per resource, sequentially (never batched, same
+rate-limit-friendly philosophy as every other Gemini-calling loop in
+this codebase). `page_snippet_or_text` is populated from the resource's
+own `summary` field (itself optional — not every source provides one;
+see Phase 7). A grading failure for one resource
+(`ResourceGradingError` — a Gemini request/parsing error) is caught and
+logged, not re-raised: that resource is still persisted, just with
+`grade`/`score`/`reasoning_summary` left at their default `None`
+(permanently ungraded, never retried — same best-effort convention as
+`ResearchPaper.grade`), so one flaky Gemini call never costs an
+otherwise-good, already-domain-verified link its spot in the list.
+
+**4. Data model — `app/models/research.py`.** `VerifiedResource` gained
+three nullable columns: `grade` (`Optional[str]`, one of "A"-"E"),
+`score` (`Optional[int]`, 0-100), `reasoning_summary` (`Optional[str]`).
+All three `None` until grading succeeds. Deliberately no separate
+per-category JSON breakdown column (contrast with
+`ResearchPaper.rubric_evaluation`) — the task spec for this feature only
+calls for `grade`/`score`/`reasoning_summary` on this table; the four
+`category_scores` Gemini also returns are used to compute `score` but
+aren't separately persisted. Since `verified_resources` already existed
+in deployed (Phase 7) databases before these three columns were added,
+they need the same additive `ALTER TABLE` migration treatment as
+`ResearchPaper`'s own `grade`/`grade_score` — see
+`app/db.py::_migrate_verified_resource_columns` (Database section
+above).
+
+**5. API exposure — `app/schemas/research.py` /
+`app/services/search.py`.** `VerifiedResourceResponse` gained matching
+`grade`/`score`/`reasoning_summary` fields (all `Optional`, default
+`None`). `get_ingredient_resources`/`to_...` mapping in `search.py`
+passes all three through from the ORM row — no filtering logic needed
+(unlike Phase 6's relevance filter), since an ungraded resource is still
+shown, just without a grade badge.
+
+**6. Frontend — `src/components/VerifiedResourcesList.tsx`.** Each
+resource row gained a grade/score badge — a circular A-E letter badge
+(`GRADE_COLORS`, same green-to-red mapping and `isPaperGrade` type guard
+shared across `ResearchPaper.grade`/`PaperConclusion.confidence_grade`/
+`VerifiedResource.grade`, see `src/utils/grades.ts`) plus its "N/100"
+score text, rendered on the row's right side alongside the "View
+Resource ↗" link, and omitted entirely (no badge at all, not a
+placeholder) for a `null` grade — same "null grade = normal ungraded
+state, not an error" convention as `StudiesList`/`RecommendedUsesList`.
+`VerifiedResource` (`src/services/api.ts`) gained matching
+`grade`/`score`/`reasoning_summary` fields. `IngredientCard.tsx` itself
+needed no changes for this — the `verified_resources` data it already
+fetches/passes through to `VerifiedResourcesList` picks up the new
+fields automatically, since the type-level plumbing was already in place
+from Phase 7.
+
+**Known gaps:**
+- `reasoning_summary` is fetched and persisted but not yet surfaced
+  anywhere in the UI beyond being available on the `VerifiedResource`
+  object — no info-modal/tooltip exposes it yet (contrast with
+  `RecommendedUsesList`'s conclusion detail modal, which does show its
+  own rubric reasoning).
+- No admin/debug view of ungraded (`grade: null`) resources — a
+  permanently-failed grading attempt is silent and indistinguishable
+  from "grading hasn't run yet" from the frontend's point of view.
+- Same unauthenticated-endpoint caveat as the rest of this API surface.
+
+## Scientific Information Redesign (Phase 9)
+
+Unifies the visual/interaction design of the three "Scientific
+Information" list panels (`RecommendedUsesList`, `VerifiedResourcesList`,
+`StudiesList`) and adds a consistent two-modal pattern (rubric breakdown
+vs. general metadata) to all three — frontend-only, no backend or schema
+changes.
+
+**1. Outer section — `src/components/IngredientCard.tsx`.** The
+"Scientific information" block is now "Scientific Information": wrapped
+in a bordered card (`borderWidth: 1`, `borderColor: colors.orange`
+i.e. `#E85D04`, `borderRadius: 12`, `padding: spacing.md`), with a
+centered, bold, 22px title (`typography.sectionTitle`) and a synthesized
+one-sentence summary directly beneath it (e.g. *"Analyzed 12 studies
+across databases. Average score: B (78/100). Primary consensus
+indicates: '...'"*). The summary is built client-side in a `useMemo`
+(`scientificSummary`) from data already fetched for the three lists — no
+new endpoint. Its average-grade math (`computeAverageGrade`, moved into
+`src/utils/grades.ts`) is the same band table (`grade_bands`: A 85-100
+down to E 0-29) `StudiesAnalysisBar.tsx` used to compute; the top
+synthesized claim comes from `conclusions[0]`, which
+`IngredientDetailResponse` already documents as sorted
+highest-confidence-first server-side.
+
+**2. Removed — `StudiesAnalysisBar.tsx`.** The standalone "Studies
+Analisis" metrics block (total studies / average grade / placeholder
+"Rating: XX") is no longer imported or rendered anywhere. Its total-count
+metric now lives inside `StudiesList`'s own collapsible title bar
+("List of Studies (Total: N)"); its average-grade computation was ported
+to `computeAverageGrade` (`src/utils/grades.ts`) and now feeds
+`IngredientCard.tsx`'s summary sentence instead. The file itself is left
+in place, unused, rather than deleted (no delete tooling in this pass) —
+docs/Architecture.md's file-structure listing below reflects that it is
+no longer part of the render tree.
+
+**3. Shared components (new):**
+- `src/components/CollapsibleSection.tsx` — the common
+  click-title-bar-to-toggle wrapper (chevron `▲`/`▼`, `isOpen` state
+  defaulting to `true`) and container border (`1px solid`
+  `colors.neutralBorder` i.e. `#E0E0E0`, `borderRadius: 8`) shared by all
+  three list panels, replacing three near-identical hand-copied
+  container/header implementations. `colors.neutralBorder` is a new
+  `theme.ts` palette entry, added specifically so this `#E0E0E0` never
+  has to appear as an inline hex value in a component's `StyleSheet`,
+  honoring that file's own "every color used anywhere in the UI should
+  come from this file" rule. Deliberately distinct from `colors.orange`
+  — each list's own border is this subtler gray, while the bolder orange
+  is now reserved for the outer "Scientific Information" card only (see
+  point 1) — so `VerifiedResourcesList`'s previous orange container
+  border (Phase 7's "active card outline theme") changed to this gray.
+- `src/components/GradeCircleBadge.tsx` — the shared round A-E
+  letter-grade badge (`GRADE_COLORS` fill, white bold letter,
+  palette-orange border, optional `onPress`/`large` variants), factored
+  out of `StudiesList.tsx`'s previously-local `PaperGradeBadge` so
+  `RecommendedUsesList`/`VerifiedResourcesList` render an identical badge
+  for `PaperConclusion.confidence_grade`/`VerifiedResource.grade`.
+- `src/components/ExternalLinkIconButton.tsx` — the shared "🌐" row
+  action (Ionicons `globe-outline`), factored out of `StudiesList.tsx`'s
+  inline globe icon so `VerifiedResourcesList` renders the same
+  icon/interaction for `VerifiedResource.url` instead of its old
+  separate "View Resource ↗" text link. Preserves the dual web/native
+  open-in-new-tab behavior (`<a target="_blank" rel="noopener
+  noreferrer">` on web via `React.createElement`, `Linking.openURL` on
+  native) that `VerifiedResourcesList`'s old `ViewResourceLink`
+  established in Phase 7. `RecommendedUsesList` never renders this — a
+  `PaperConclusion` is a synthesized cross-paper claim, not a single
+  external page, so per spec its rows have no website icon.
+
+**4. Standard row layout, all three lists:**
+`flexDirection: 'row'`, `justifyContent: 'space-between'`,
+`alignItems: 'center'` — title/claim text on the left, up to three
+action icons on the right in a fixed order: grade badge (if graded) →
+info `(i)` icon → website `🌐` icon (`StudiesList`/`VerifiedResourcesList`
+only). Pagination unchanged (`src/components/Pagination.tsx`, already
+matched the `← Previous [1][2] Next →` spec exactly) but now capped at
+`PAGE_SIZE = 5` on every list — `RecommendedUsesList` was previously 3;
+`VerifiedResourcesList` had no pagination at all before this pass (every
+resource rendered on one unbroken page).
+
+**5. Two-modal-per-list-item pattern, all three lists.** Each list keeps
+two separate `useState<T | null>` selections,
+`activeRubricModalItem`/`activeInfoModalItem`, replacing any prior single
+combined modal:
+- **Rubric & Comments Modal** (tap the grade badge) — total score/grade
+  plus a per-category breakdown and AI reviewer notes, using whichever
+  categories that item type actually has: `StudiesList` shows the paper
+  rubric's four categories (Study Design, Journal Rigor, Methodology &
+  Sample, Funding & Bias — unchanged from Phase 3/4, already matched this
+  spec exactly); `RecommendedUsesList` shows the *conclusion* rubric's
+  own three categories (Evidence Strength, Cross-Paper Consensus, Claim
+  Specificity — a different rubric shape, `ConclusionRubricEvaluation`,
+  not the paper's); `VerifiedResourcesList` shows only the total
+  score/grade and `reasoning_summary` with an explicit "category
+  breakdown not available for this source" note, since
+  `VerifiedResource` deliberately persists only one summary column, not
+  per-category scores (Phase 8's `resource_grader.py` design decision).
+- **General Info Modal** (tap the `(i)` icon) — general metadata, per
+  type: Studies show title/authors/publication date/`source_domain` (the
+  closest available stand-in for "journal" — no dedicated column exists)
+  /abstract/`rubric_evaluation.sample_info` (closest available stand-in
+  for "sample size") /Matched Keywords; Recommended Uses show the claim/
+  detailed conclusion plus confidence score, dosage notes, and
+  supporting/contradicting paper counts; Resources show publisher,
+  a derived "domain authority" rating (`deriveAuthorityBadge`), and
+  summary — with "citation count" shown as an explicit "not tracked for
+  this resource type" rather than a fabricated number, since
+  `VerifiedResource` has no such field.
+
+**6. File-level changes:**
+- `src/theme.ts` — added `colors.neutralBorder` (`#E0E0E0`).
+- `src/utils/grades.ts` — added `computeAverageGrade()` +
+  `AverageGradeResult` (ported from `StudiesAnalysisBar.tsx`).
+- `src/components/StudiesList.tsx` — least changed of the three (it
+  already matched most of this spec): now wrapped in
+  `CollapsibleSection`, title includes `(Total: N)`, modal state renamed
+  to `activeRubricModalItem`/`activeInfoModalItem`, grade badge/globe
+  icon now use the shared `GradeCircleBadge`/`ExternalLinkIconButton`.
+- `src/components/RecommendedUsesList.tsx` — `PAGE_SIZE` 3 → 5, wrapped
+  in `CollapsibleSection`, grade badge made pressable, single combined
+  modal split into separate rubric/info modals.
+- `src/components/VerifiedResourcesList.tsx` — most changed: added
+  pagination (previously none), wrapped in `CollapsibleSection` (border
+  orange → `colors.neutralBorder`), added an info `(i)` icon and its
+  modal (neither existed before), grade badge made pressable with a new
+  rubric modal, "View Resource ↗" text link replaced by
+  `ExternalLinkIconButton`.
+
+**Known gaps:**
+- `VerifiedResource`'s "citation count" and precise numeric "domain
+  authority rating" remain unavailable by design (no backing column) —
+  the General Info Modal shows honest placeholders rather than
+  fabricated values; adding real citation-count tracking would require a
+  new backend field/data source.
+- `StudiesAnalysisBar.tsx` is orphaned (unused but not deleted) — no file
+  delete tooling was available in this pass.
+
+## Verified Resource Fetcher Expansion (Phase 10)
+
+Fixes a bug where `fetch_verified_resources_for_ingredient` effectively
+only ever returned PubChem results, and expands
+`app/services/resource_fetcher.py` to properly support all six sources
+listed in `docs/verified_resource_apis.json`. Backend-only — no schema,
+model, or API-shape changes; `VerifiedResource`/`VerifiedResourceResponse`
+and `fetch_verified_resources_for_ingredient`'s call signature are
+untouched, so nothing else in the pipeline (grading.py, search.py, the
+frontend) needed to change.
+
+**Root cause.** Three of the four Phase 7 sources (MedlinePlus, USDA,
+EFSA) shared one schema-tolerant generic extractor
+(`_extract_generic_records`) that assumes a flat `{"url": "...", "title":
+"..."}`-shaped dict somewhere in the response. Two of those never
+actually matched it: MedlinePlus was pointed at the wrong service
+entirely (`connect.medlineplus.gov`'s Connect API takes a standardized
+ICD/RxNorm *code*, not a free-text ingredient name — it could never
+resolve "Vitamin C" to anything), and USDA FoodData Central's
+`/foods/search` response has no URL field at all, only an `fdcId` a
+caller has to build a link from. Both silently produced zero results on
+every call, leaving PubChem — which already had its own precise parser —
+as the only source that ever actually worked.
+
+**1. Precise, shape-verified parsers replace the generic extractor for
+every source except Health Canada.** Real response shapes were confirmed
+against each provider's live API/documentation before writing its
+parser (not assumed):
+- **MedlinePlus (`_query_medlineplus`)** — `docs/verified_resource_apis.json`'s
+  `medlineplus_api` entry now points at the real free-text health topic
+  search (`wsearch.nlm.nih.gov/ws/query?db=healthTopics&term=...`), which
+  returns XML: `<nlmSearchResult><list><document url="...">
+  <content name="title">...</content>...</document></list></nlmSearchResult>`.
+  `_query_medlineplus` parses this via `xml.etree.ElementTree`, stripping
+  the embedded highlight-span HTML MedlinePlus's own search-term
+  highlighting leaves inside `<content>` text (`_strip_html`). It also
+  handles a JSON response defensively (falls back to
+  `_extract_generic_records` if the response's content-type/body looks
+  like JSON instead) — satisfying "parse both JSON and XML cleanly."
+- **USDA (`_query_usda`)** — parses the real `{"foods": [{"fdcId",
+  "description", "dataType", "foodCategory"}]}` shape and *constructs* a
+  detail-page URL from `fdcId`
+  (`https://fdc.nal.usda.gov/food-details/{fdcId}/nutrients`), since the
+  response itself carries no link. `api_key` is resolved fresh per
+  request from the `USDA_API_KEY` environment variable when set,
+  overriding the checked-in `DEMO_KEY` default in the config file — a
+  403 response is logged with an explicit
+  `USDA FoodData Central: 403 error - invalid or rate-limited api_key`
+  line before the generic HTTP-status handler would otherwise catch it.
+- **DailyMed (`_query_dailymed`, new source)** — queries
+  `/dailymed/services/v2/spls.json?drug_name=...` (confirmed against
+  NLM's own API docs: `{"data": [{"setid", "title", "published_date"}]}`)
+  and constructs the SPL detail page URL from `setid`
+  (`https://dailymed.nlm.nih.gov/dailymed/drugInfo.cfm?setid={setid}`).
+- **Europe PMC (`_query_europe_pmc`, new source)** — builds its own query
+  string as `"{ingredient_name} AND (monograph OR review)"` (not a bare
+  ingredient-name search — overriding what `_resolve_endpoint` would
+  otherwise substitute), keeps only `isOpenAccess == "Y"` results, and
+  prefers an HTML link from `fullTextUrlList.fullTextUrl[]`, falling back
+  to Europe PMC's own canonical article page
+  (`https://europepmc.org/article/{source}/{id}`) when the full-text-URL
+  list is missing one. Uses `resultType: core` (not the original `lite`)
+  specifically to get `abstractText` back for the resource's summary.
+- **Health Canada LNHPD (`_query_health_canada`, new source)** — still
+  uses the schema-tolerant `_extract_generic_records` path, because its
+  real JSON response envelope could not be confirmed at implementation
+  time (a live test request against the configured endpoint returned an
+  empty body) — extended with LNHPD-plausible field names
+  (`product_name`/`licence_number`/`company_name`) added to the generic
+  extractor's key lists. Flagged in code as the one source that should be
+  upgraded to a precise parser once its real shape is confirmed, the same
+  way the other four were in this pass.
+- **PubChem** — unchanged; it already had a precise parser.
+
+**2. Parallel execution — `_search_all_records_async`.** Now uses
+`asyncio.gather(*tasks, return_exceptions=True)` (previously
+`asyncio.gather(*tasks)` with no `return_exceptions`). Every per-source
+coroutine was, and still is, independently wrapped in its own
+try/except (`_run_source_query`) so nothing should actually raise past
+it — `return_exceptions=True` is kept as a defense-in-depth guarantee on
+top of that, and the aggregation loop explicitly checks for a stray
+exception object and logs+skips it rather than propagating, so a timeout
+or error in one source's coroutine categorically cannot cancel or block
+another's in-flight request. Verified with an offline test harness
+(stubbed sources: one timing out, one raising an unexpected exception,
+one succeeding, one needing its fallback retry — all four ran to
+completion independently, see point 4).
+
+**3. Common-name -> chemical-name fallback retry —
+`_CHEMICAL_NAME_FALLBACKS`/`_fallback_name_for`/`_safe_query_async`.** A
+small, hand-curated table maps common supplement-label names to their
+primary chemical/systematic name (e.g. "Vitamin C" -> "Ascorbic acid",
+"Vitamin D3" -> "Cholecalciferol", "CoQ10" -> "Ubiquinone" — about 20
+entries covering the standard vitamin/coenzyme naming pairs, not a
+general chemistry name-resolution service). `_safe_query_async` runs a
+source's query with the ingredient's common name first; if that comes
+back with zero results (not necessarily an error) and a fallback name
+exists, it retries that same source once with the chemical name before
+giving up — each attempt still goes through the same per-request 5s
+timeout and independent try/except. An ingredient not in the table
+simply isn't retried.
+
+**4. Standardized result shape — `VerifiedResourceSchema`.** Every
+per-source parser now returns `List[VerifiedResourceSchema]` (a Pydantic
+`BaseModel` — `title: str`, `publisher: str`, `url: str`, `domain: str`,
+`summary: Optional[str]`) instead of the old plain `ResourceRecord`
+dataclass — same two-stage "parser output -> DB row" split as before,
+just with Pydantic's construction-time type validation catching a parser
+bug immediately instead of it surfacing later as a confusing DB-layer
+error.
+
+**5. Widened domain allow-list — `_VERIFIED_DOMAIN_SUFFIXES`.** Now
+`.gov`, `.europa.eu`, `.org`, `ebi.ac.uk`, `canada.ca` (plus
+`ncbi.nlm.nih.gov`/`efsa.europa.eu`, kept for readability even though
+both are now redundant with `.gov`/`.europa.eu`) — widened specifically
+to admit `europepmc.org` (`.org`), `www.ebi.ac.uk` (Europe PMC's actual
+API host), and `health-products.canada.ca` (`canada.ca`, Health Canada
+LNHPD). **`.org` is a deliberately broad suffix** — it admits any `.org`
+domain whatsoever, not just EMBL-EBI's — accepted here only because it
+was an explicit requirement; narrowing it to specific known-good hosts
+would meaningfully tighten this without losing any currently-configured
+source, if ever revisited.
+
+**6. Logging convention.** Every log line in this module is now prefixed
+`[ResourceFetcher]` and names the source's display label — an explicit
+per-provider status line is logged on every outcome
+(`[ResourceFetcher] MedlinePlus (NIH/NLM): 2 resource(s) found for
+'Vitamin C'.`, `[ResourceFetcher] USDA FoodData Central: 403 error -
+invalid or rate-limited api_key.`, a fallback-retry notice, etc.) so a
+single ingredient's grade-request log output makes it immediately
+obvious which of the six sources actually contributed results.
+
+**Verification.** Since this sandbox has no installed `httpx`/
+`pydantic`/`sqlmodel` (and package installation isn't run automatically
+per this repo's CLAUDE.md), correctness was verified with a standalone
+offline test harness: lightweight stub modules stood in for
+`httpx`/`pydantic`/`sqlmodel`/the `app.models`/`app.services` import
+graph so the *real* `resource_fetcher.py` could be imported and exercised
+directly, then: (1) the domain allow-list was checked against every
+provider's real hostname plus a rejected example; (2) `_parse_medlineplus_xml`
+was run against the actual XML payload captured from a live MedlinePlus
+wsearch request; (3) `_query_usda`/`_query_dailymed`/`_query_europe_pmc`
+were each run against a synthetic payload built from that provider's
+documented/confirmed real response shape, with a fake `httpx.AsyncClient`
+standing in for the network call; (4) `_fallback_name_for` was checked
+against known and unknown ingredient names; (5)
+`docs/verified_resource_apis.json` was confirmed to parse into exactly
+the six expected, all-enabled source ids; (6) a full
+`_search_all_records_async` fan-out was run against four stubbed sources
+(one timeout, one unexpected exception, one immediate success, one
+needing its fallback retry) confirming none of the four blocked or
+cancelled another and the fallback retry fired correctly. All checks
+passed. `python3 -m py_compile app/services/resource_fetcher.py` also
+passes.
+
+**Known gaps:**
+- Health Canada LNHPD's real response shape is still unconfirmed —
+  `_query_health_canada` relies on the schema-tolerant generic extractor
+  with plausible field-name guesses, not a verified parser (see point 1).
+- The `_CHEMICAL_NAME_FALLBACKS` table is small and hand-curated (~20
+  entries, common vitamins/coenzymes only) — an ingredient outside that
+  set gets no fallback retry even if its common name genuinely doesn't
+  resolve on a given source.
+- `.org`'s breadth (point 5) remains a known, accepted tradeoff, not an
+  oversight — see that point for the narrowing option if ever revisited.
+
 ## Frontend Structure
 
 ```
@@ -978,8 +1797,15 @@ frontend/
     │   ├── Footer.tsx             # Persistent footer, reused on every screen
     │   ├── ImageUploader.tsx     # Upload button + image preview (styled to palette)
     │   ├── ProductCard.tsx       # Expandable product card (metadata + nested Ingredient accordion + grade badge + orange-on-expand text)
-    │   ├── IngredientCard.tsx    # Accordion card, two variants: 'nested' (dosage/%DV/research) and 'standalone' (grade badge + 3 placeholder info blocks + real StudiesList "Science Info" block + orange-on-expand text)
-    │   ├── StudiesList.tsx       # Paginated (5/page) "List of Studies" panel — ResearchPaper rows, info modal, external-link button (Phase 2)
+    │   ├── IngredientCard.tsx    # Accordion card, two variants: 'nested' (dosage/%DV/research) and 'standalone' (grade badge + 3 placeholder info blocks + bordered "Scientific Information" section with centered title + summary sentence + orange-on-expand text)
+    │   ├── CollapsibleSection.tsx     # Shared collapsible/bordered list wrapper (chevron toggle, #E0E0E0 border) used by StudiesList/RecommendedUsesList/VerifiedResourcesList (Phase 9)
+    │   ├── GradeCircleBadge.tsx       # Shared round A-E letter-grade badge (row + modal-header variants) used by all three lists (Phase 9)
+    │   ├── ExternalLinkIconButton.tsx # Shared "🌐" open-in-new-tab row action used by StudiesList/VerifiedResourcesList (Phase 9)
+    │   ├── StudiesList.tsx       # Paginated (5/page) "List of Studies (Total: N)" panel — ResearchPaper rows, rubric + info modals, external-link button (Phase 2, unified Phase 9)
+    │   ├── RecommendedUsesList.tsx    # "Recommended Uses List" — paginated (5/page) PaperConclusion list, graded C+, rubric + info modals (Phase 5, unified Phase 9)
+    │   ├── VerifiedResourcesList.tsx  # "Verified Online Resources" — official government/regulatory reference links (Phase 7), grade/score badges (Phase 8), paginated (5/page) with rubric + info modals (Phase 9)
+    │   ├── StudiesAnalysisBar.tsx     # UNUSED as of Phase 9 (no longer imported by IngredientCard.tsx) — its total-count/average-grade metrics moved into StudiesList's title bar and IngredientCard's summary sentence, respectively; left in place, not deleted
+    │   ├── Pagination.tsx        # Shared prev/next + page indicator, used by all three Scientific Information lists
     │   └── GradeBadge.tsx        # Shared top-right grade pill/button (graded vs. ungraded), used by ProductCard + standalone IngredientCard
     ├── screens/
     │   ├── HomeScreen.tsx        # Marketing hero (full-width, looping video background via expo-video) + "Why BSProof?" info section (20% inset) + Footer
@@ -989,7 +1815,8 @@ frontend/
     ├── services/
     │   └── api.ts                # API_BASE_URL, uploadSupplementImage(), fetchSuggestions(), searchSupplements(), fetchProductDetail(), fetchIngredientDetail(), gradeIngredient(), resetDatabase()
     └── utils/
-        └── animations.ts          # animateCardToggle() — shared LayoutAnimation helper for accordion cards
+        ├── animations.ts          # animateCardToggle() — shared LayoutAnimation helper for accordion cards
+        └── grades.ts               # GRADE_COLORS, GRADE_RANK, getGradeRank(), isPaperGrade() — shared grade-letter helpers (Phase 5)
 ```
 
 ### Navigation
@@ -1265,12 +2092,15 @@ ingredient's stored `ResearchPaper` rows:
   dashed-divider-separated sections pulled straight from
   `rubric_evaluation` — "Study Design" (`study_type` +
   `study_type_score`), "Journal Rigor" (`journal_reputation` +
-  `journal_score`), "Methodology & Sample" (`sample_info` +
-  `sample_score`), "Funding & Bias" (`funding_status` + `funding_score`
-  — as of rubric v1.1 this one can be negative, e.g. "-6 pts" for
-  penalized industry-biased funding; rendered as plain signed text, no
-  special-casing needed since `total_score` (shown at the top) is
-  already the post-penalty, 0-100-clamped figure)
+  `journal_score` — as of rubric v1.4 this one can also be negative,
+  down to -5, for an actively-flagged predatory/blacklisted publisher),
+  "Methodology & Sample" (`sample_info` + `sample_score`), "Funding &
+  Bias" (`funding_status` + `funding_score` — as of rubric v1.2 this one
+  can be negative down to -15 (sharpened from v1.1's -10 floor), e.g.
+  "-12 pts" for penalized industry-biased funding; both negative-capable
+  fields render as plain signed text, no special-casing needed since
+  `total_score` (shown at the top) is already the post-penalty,
+  0-100-clamped figure)
   — and a final "AI Summary Note" section showing `summary_notes` in
   italics. `PaperGradeBadge` renders as a plain (non-`Pressable`) `View`
   when used without an `onPress` (the modal-header usage) rather than

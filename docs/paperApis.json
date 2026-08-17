@@ -11,6 +11,7 @@
     },
     "auth": "none",
     "enabled": true,
+    "access_type": "hybrid",
     "description": "Open-access REST API for biomedical/life-science literature. Returns JSON directly, no key required. resultType=core (added beyond the base query/format params) is required to get abstractText back — the default resultType=lite omits it."
   },
   {
@@ -25,6 +26,7 @@
     },
     "auth": "none",
     "enabled": true,
+    "access_type": "hybrid",
     "description": "NCBI E-utilities esearch returns matching PMIDs as JSON, not full article metadata. app/services/paper_search.py follows up with a second, internal efetch call (XML, rettype=abstract) per batch of PMIDs to actually get title/abstract/authors/date — esearch alone can't populate those fields."
   },
   {
@@ -38,6 +40,7 @@
     },
     "auth": "none",
     "enabled": true,
+    "access_type": "hybrid",
     "description": "Public/unauthenticated tier — returns JSON directly, no key required, but subject to a fairly aggressive shared rate limit (handled as a soft failure, logged, not fatal). publicationDate is included alongside year for a more precise date when available."
   },
   {
@@ -49,6 +52,7 @@
     "extra_params": {},
     "auth": "none",
     "enabled": true,
+    "access_type": "hybrid",
     "description": "Open catalog of scholarly works. Keyless REST API returning JSON directly. Abstracts come back as an `abstract_inverted_index` (word -> position list) rather than plain text for copyright reasons; paper_search.py reconstructs the plain-text abstract from it."
   },
   {
@@ -62,6 +66,7 @@
     },
     "auth": "none",
     "enabled": true,
+    "access_type": "hybrid",
     "description": "Global DOI registration metadata API. Keyless REST returning JSON. Excellent for finding peer-reviewed article titles, publisher DOIs, publication dates, and author lists across all scientific publishers."
   },
   {
@@ -77,6 +82,7 @@
     },
     "auth": "none",
     "enabled": true,
+    "access_type": "open_access",
     "description": "Public Library of Science Solr-backed REST API. Keyless and returns JSON directly. High-quality peer-reviewed biological, nutritional, and medical studies with clean, full abstracts."
   },
   {
@@ -90,6 +96,7 @@
     },
     "auth": "none",
     "enabled": true,
+    "access_type": "public_domain",
     "description": "Official US NLM registry for human clinical trials. Keyless REST API returning structured JSON. Useful for identifying active and completed human efficacy/safety studies on specific supplement ingredients."
   },
   {
@@ -104,6 +111,7 @@
     },
     "auth": "none",
     "enabled": true,
+    "access_type": "hybrid",
     "description": "European open-access scientific graph infrastructure. Keyless REST API returning JSON responses covering peer-reviewed open access papers and clinical datasets across Europe."
   },
   {
@@ -117,6 +125,7 @@
     },
     "auth": "none",
     "enabled": true,
+    "access_type": "open_access",
     "description": "Open preprint repository. Keyless API returning Atom XML. Requires XML parsing in paper_search.py to extract title, summary (abstract), and authors for biochemistry/molecular biology preprints."
   },
   {
@@ -130,6 +139,7 @@
     },
     "auth": "none",
     "enabled": true,
+    "access_type": "open_access",
     "description": "Global open access repository aggregator. Public endpoint returning JSON containing paper titles, full abstracts, and repository links."
   },
   {
@@ -143,6 +153,7 @@
     },
     "auth": "none",
     "enabled": true,
+    "access_type": "open_access",
     "description": "Global consortium API for DOIs, open datasets, clinical trials, and research publications. Keyless REST API returning structured JSON metadata including abstracts and publisher details."
   },
   {
@@ -156,6 +167,7 @@
     },
     "auth": "none",
     "enabled": true,
+    "access_type": "open_access",
     "description": "Directory of Open Access Journals API. Keyless REST returning JSON with peer-reviewed open access papers across pharmacology, medicine, chemistry, and life sciences."
   },
   {
@@ -171,6 +183,7 @@
     },
     "auth": "none",
     "enabled": true,
+    "access_type": "open_access",
     "description": "Major European open-access research repository. Solr-backed REST API returning JSON directly with complete author lists, full abstracts, and publication dates."
   },
   {
@@ -184,6 +197,7 @@
     },
     "auth": "none",
     "enabled": true,
+    "access_type": "open_access",
     "description": "Open preprint server for chemistry, biochemistry, bio-active compounds, and natural products. Keyless REST API returning JSON with paper abstracts and publication metadata."
   },
   {
@@ -197,6 +211,74 @@
     },
     "auth": "none",
     "enabled": true,
+    "access_type": "open_access",
     "description": "Indexed search API for bioRxiv and medRxiv preprints covering biomedical research, human clinical trials, and biochemistry. Keyless REST API returning JSON metadata."
+  },
+  {
+    "id": "zenodo",
+    "name": "Zenodo REST API",
+    "domain": "zenodo.org",
+    "endpoint": "https://zenodo.org/api/records",
+    "query_param": "q",
+    "extra_params": {
+      "size": "10"
+    },
+    "auth": "none",
+    "enabled": true,
+    "access_type": "open_access",
+    "description": "General-purpose open-access repository operated by CERN. Keyless REST API returning JSON metadata, preprints, datasets, and open-access publications."
+  },
+  {
+    "id": "unpaywall",
+    "name": "Unpaywall API",
+    "domain": "unpaywall.org",
+    "endpoint": "https://api.unpaywall.org/v2/search",
+    "query_param": "query",
+    "extra_params": {
+      "email": "user@example.com"
+    },
+    "auth": "none",
+    "enabled": true,
+    "access_type": "open_access",
+    "description": "Database indexing open-access scholarly articles. Designed to find legal, free open-access full-text PDFs and metadata across paywalled DOIs."
+  },
+  {
+    "id": "osf_preprints",
+    "name": "OSF Preprints API",
+    "domain": "osf.io",
+    "endpoint": "https://api.osf.io/v2/preprints/",
+    "query_param": "filter[title]",
+    "extra_params": {},
+    "auth": "none",
+    "enabled": true,
+    "access_type": "open_access",
+    "description": "Open Science Framework preprint aggregator API. Keyless JSON metadata API spanning multiple open preprint servers across life sciences and medicine."
+  },
+  {
+    "id": "ia_scholar",
+    "name": "Internet Archive Scholar API",
+    "domain": "scholar.archive.org",
+    "endpoint": "https://scholar.archive.org/api/v0/search",
+    "query_param": "q",
+    "extra_params": {},
+    "auth": "none",
+    "enabled": true,
+    "access_type": "open_access",
+    "description": "Search index of digitized academic literature, web-harvested research papers, and open access journal archives maintained by the Internet Archive."
+  },
+  {
+    "id": "pmc_oa",
+    "name": "PubMed Central OA API",
+    "domain": "pmc.ncbi.nlm.nih.gov",
+    "endpoint": "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi",
+    "query_param": "term",
+    "extra_params": {
+      "db": "pmc",
+      "retmode": "json"
+    },
+    "auth": "none",
+    "enabled": true,
+    "access_type": "open_access",
+    "description": "NCBI PubMed Central repository subset containing full open-access biomedical and life-science papers with free public text."
   }
 ]

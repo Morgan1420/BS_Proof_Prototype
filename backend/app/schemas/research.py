@@ -7,6 +7,11 @@ from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
+# Only imported for the ACTIVE default below — these are plain string
+# constants (not ORM/DB machinery), so importing them here doesn't pull
+# app.schemas.research into any SQLModel/SQLAlchemy dependency chain.
+from app.models.research import PAPER_STATUS_ACTIVE
+
 
 class RubricEvaluationResponse(BaseModel):
     """Structured per-category breakdown backing a paper's `grade`/
@@ -64,6 +69,21 @@ class ResearchPaperResponse(BaseModel):
     grade: Optional[str] = None
     grade_score: Optional[int] = None
     rubric_evaluation: Optional[RubricEvaluationResponse] = None
+    # --- Phase 6: ingredient relevance verification
+    # (app/services/paper_grader.py) ---
+    # One of PAPER_STATUS_ACTIVE / PAPER_STATUS_DISCARDED_IRRELEVANT
+    # (app/models/research.py). In practice the frontend never actually
+    # receives a DISCARDED_IRRELEVANT paper through the normal list
+    # endpoints — app/services/search.py::get_ingredient_papers filters
+    # those out server-side — but the on-demand single-paper-grade
+    # endpoint (POST /api/v1/papers/{paper_id}/grade,
+    # GradePaperResponse.paper below) returns the just-graded paper
+    # regardless of its outcome, so the frontend needs this field to
+    # detect and remove a just-discarded paper from local state — see
+    # src/components/IngredientCard.tsx::handlePaperGraded. Defaults to
+    # PAPER_STATUS_ACTIVE (not Optional) since every ResearchPaper row
+    # always has a non-null `status` — see that column's own docstring.
+    status: str = PAPER_STATUS_ACTIVE
 
 
 class PaperConclusionResponse(BaseModel):
@@ -96,6 +116,40 @@ class PaperConclusionResponse(BaseModel):
     contradicting_paper_ids: List[int] = Field(default_factory=list)
 
 
+class VerifiedResourceResponse(BaseModel):
+    """A single stored VerifiedResource row (app/models/research.py,
+    Phase 7/8) — mirrors that table's columns directly, field-for-field,
+    so the frontend's `VerifiedResourcesList` component can render
+    straight off this shape (see `src/components/VerifiedResourcesList.tsx`).
+
+    Every row this endpoint returns has already cleared the backend's
+    strict domain allow-list at fetch time (see
+    app/services/resource_fetcher.py::_is_verified_domain) — the frontend
+    never needs to re-validate `domain` itself, only display it (and
+    derive an "NIH"/"USDA"/"EFSA"-style authority badge from it).
+
+    `grade`/`score`/`reasoning_summary` (Phase 8 — see
+    app/services/resource_grader.py) are a separate quality signal on top
+    of that domain gate — all three are `None` until
+    app/services/resource_fetcher.py successfully grades this resource
+    (best-effort at fetch time — a Gemini/parsing failure leaves a
+    resource permanently ungraded rather than retried, same convention as
+    ResearchPaper.grade), so the frontend must handle a null `grade` (no
+    badge rendered) as a normal, expected state, not an error.
+    """
+
+    id: int
+    ingredient_id: int
+    title: str
+    publisher: str
+    url: str
+    domain: str
+    summary: Optional[str] = None
+    grade: Optional[str] = None
+    score: Optional[int] = None
+    reasoning_summary: Optional[str] = None
+
+
 class IngredientDetailResponse(BaseModel):
     """Response body for GET /api/v1/ingredients/{id}.
 
@@ -109,11 +163,14 @@ class IngredientDetailResponse(BaseModel):
 
     `conclusions` (Phase 5) is every *active* synthesized
     PaperConclusion for this ingredient, highest-confidence first — see
-    app/services/search.py::get_ingredient_conclusions. Not yet returned
-    by GradeIngredientResponse/GradePaperResponse below (those still only
-    refresh `papers`) — the frontend re-fetches ingredient detail to see
-    updated conclusions after a grade request, same as it does today for
-    any state this endpoint alone exposes.
+    app/services/search.py::get_ingredient_conclusions. `verified_resources`
+    (Phase 7) is every stored VerifiedResource for this ingredient — see
+    app/services/search.py::get_ingredient_resources. Neither is yet
+    returned by GradeIngredientResponse/GradePaperResponse below (those
+    still only refresh `papers`) — the frontend re-fetches ingredient
+    detail to see updated conclusions/verified resources after a grade
+    request, same as it does today for any state this endpoint alone
+    exposes.
     """
 
     id: int
@@ -125,6 +182,7 @@ class IngredientDetailResponse(BaseModel):
     grade_badge_text: Optional[str] = None
     papers: List[ResearchPaperResponse] = Field(default_factory=list)
     conclusions: List[PaperConclusionResponse] = Field(default_factory=list)
+    verified_resources: List[VerifiedResourceResponse] = Field(default_factory=list)
 
 
 class GradeIngredientResponse(BaseModel):

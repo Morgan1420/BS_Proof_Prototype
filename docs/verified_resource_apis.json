@@ -1,0 +1,80 @@
+[
+  {
+    "id": "pubchem_pug_rest",
+    "name": "PubChem PUG REST API (NIH)",
+    "domain": "pubchem.ncbi.nlm.nih.gov",
+    "endpoint": "https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/{ingredient_name}/description/JSON",
+    "query_param": "path",
+    "extra_params": {},
+    "auth": "none",
+    "access_type": "public_domain",
+    "description": "NIH chemical and bioactive database offering official compound descriptions, biological roles, safety summaries, and pharmacology reference links."
+  },
+  {
+    "id": "medlineplus_api",
+    "name": "MedlinePlus Web Service (NIH / NLM)",
+    "domain": "medlineplus.gov",
+    "endpoint": "https://wsearch.nlm.nih.gov/ws/query",
+    "query_param": "term",
+    "extra_params": {
+      "db": "healthTopics",
+      "retmax": 3
+    },
+    "auth": "none",
+    "access_type": "public_domain",
+    "description": "Official US National Library of Medicine free-text health topic search — returns authoritative dietary supplement and vitamin summary pages under medlineplus.gov. Note: this endpoint returns XML, not JSON (the old connect.medlineplus.gov/service endpoint took standardized diagnosis/procedure codes, not free-text ingredient names, and could never actually resolve a plain ingredient name like \"Vitamin C\" — see resource_fetcher.py's _query_medlineplus)."
+  },
+  {
+    "id": "usda_fooddata",
+    "name": "USDA FoodData Central API",
+    "domain": "fdc.nal.usda.gov",
+    "endpoint": "https://api.nal.usda.gov/fdc/v1/foods/search",
+    "query_param": "query",
+    "extra_params": {
+      "api_key": "DEMO_KEY",
+      "dataType": ["Foundation", "SR Legacy"]
+    },
+    "auth": "api_key_required",
+    "access_type": "public_domain",
+    "description": "Official US Department of Agriculture database for exact nutrient compositions and standard intake baselines. `api_key` above is the checked-in fallback (rate-limited DEMO_KEY) — resource_fetcher.py's _query_usda overrides it at request time with the USDA_API_KEY environment variable when set."
+  },
+  {
+    "id": "dailymed_api",
+    "name": "DailyMed Label Database (NIH / NLM)",
+    "domain": "dailymed.nlm.nih.gov",
+    "endpoint": "https://dailymed.nlm.nih.gov/dailymed/services/v2/spls.json",
+    "query_param": "drug_name",
+    "extra_params": {},
+    "auth": "none",
+    "access_type": "public_domain",
+    "description": "Official NLM repository for dietary supplement product labels, active ingredients, and manufacturer safety disclosures."
+  },
+  {
+    "id": "europe_pmc",
+    "name": "Europe PMC Open Access (EMBL-EBI)",
+    "domain": "europepmc.org",
+    "endpoint": "https://www.ebi.ac.uk/europepmc/webservices/rest/search",
+    "query_param": "query",
+    "extra_params": {
+      "format": "json",
+      "resultType": "core"
+    },
+    "auth": "none",
+    "access_type": "open_access",
+    "description": "European Molecular Biology Laboratory repository providing open-access scientific monographs, systematic reviews, and regulatory papers. resource_fetcher.py's _query_europe_pmc builds the actual `query` value as \"{ingredient_name} AND (monograph OR review)\" rather than using the bare ingredient name from this config's query_param, and filters results to isOpenAccess == \"Y\" only. `resultType: core` (rather than `lite`) is needed to get `abstractText` back for the resource's summary."
+  },
+  {
+    "id": "health_canada_lnhpd",
+    "name": "Licensed Natural Health Products Database (Health Canada)",
+    "domain": "health-products.canada.ca",
+    "endpoint": "https://health-products.canada.ca/api/natural-licences/ingredient/",
+    "query_param": "ingredient_name",
+    "extra_params": {
+      "lang": "en",
+      "type": "json"
+    },
+    "auth": "none",
+    "access_type": "public_domain",
+    "description": "Official Canadian government regulatory database containing safety monographs, approved health claims, and dosage limits."
+  }
+]

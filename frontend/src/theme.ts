@@ -21,6 +21,18 @@ export const colors = {
   olive: '#899536',
   /** NavBar and Footer background. */
   darkGreen: '#355A35',
+  /** Neutral list-container border — Scientific Information redesign
+   * (`src/components/CollapsibleSection.tsx`, used by StudiesList/
+   * RecommendedUsesList/VerifiedResourcesList). Deliberately separate
+   * from `orange` — each individual list panel gets its own subtle
+   * `#E0E0E0` border, distinct from the bolder `#E85D04` border around
+   * the whole "Scientific Information" section those lists sit inside
+   * (see IngredientCard.tsx). The one deliberate, spec-mandated
+   * exception to this file's "every color used anywhere in the UI
+   * should come from this file" rule staying literally true — this
+   * entry exists specifically so that hex never has to appear directly
+   * in a component's StyleSheet. */
+  neutralBorder: '#E0E0E0',
 } as const;
 
 export type ColorKey = keyof typeof colors;

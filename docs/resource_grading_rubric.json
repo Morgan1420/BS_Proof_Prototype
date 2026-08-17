@@ -1,0 +1,65 @@
+{
+  "version": "1.0",
+  "description": "Quality evaluation rubric for online health, scientific, and ingredient reference resources. Evaluates web resources across four categories totaling up to 100 points to map sources to letter grades A-E.",
+
+  "grade_bands": [
+    { "grade": "A", "min_score": 80, "max_score": 100, "label": "Tier 1 — Official government agency, clinical database, or top academic institution" },
+    { "grade": "B", "min_score": 65, "max_score": 79, "label": "Tier 2 — High-quality, peer-reviewed independent repository or medical health center" },
+    { "grade": "C", "min_score": 45, "max_score": 64, "label": "Tier 3 — Fair consumer information site; minor gaps in citations or editorial detail" },
+    { "grade": "D", "min_score": 25, "max_score": 44, "label": "Tier 4 — Weak or promotional resource with notable gaps in evidence or bias" },
+    { "grade": "E", "min_score": 0, "max_score": 24, "label": "Tier 5 — Low credibility, heavily commercial, unverified, or outdated resource" }
+  ],
+
+  "categories": [
+    {
+      "id": "publisher_authority",
+      "label": "Domain & Institutional Authority",
+      "max_score": 35,
+      "description": "Evaluates the standing and credentials of the publishing entity or domain extension.",
+      "score_tiers": [
+        { "range": "30-35", "example": "Official national health agency or international regulator (e.g., NIH, USDA, EFSA, WHO, NLM)" },
+        { "range": "22-29", "example": "Major medical center, university department, or academic health portal (e.g., Linus Pauling Institute, MSKCC)" },
+        { "range": "14-21", "example": "Established independent evidence aggregator or scientific publication platform (e.g., Examine.com, PubChem)" },
+        { "range": "6-13", "example": "Generic health media outlet or non-specialized general information site" },
+        { "range": "0-5", "example": "Commercial blog, affiliate product site, or unverified personal web domain" }
+      ]
+    },
+    {
+      "id": "evidence_citations",
+      "label": "Scientific Citations & Primary Sources",
+      "max_score": 30,
+      "description": "Measures whether claims are backed by direct links to peer-reviewed literature, DOIs, clinical trial IDs, or official regulatory monographs.",
+      "score_tiers": [
+        { "range": "25-30", "example": "Fully cited with direct PubMed/DOI links, explicit clinical study IDs, or systematic monographs" },
+        { "range": "17-24", "example": "Provides a robust reference list or scientific bibliography, but lacks direct inline hyperlinks" },
+        { "range": "9-16", "example": "Refers to general scientific consensus or studies vaguely without providing specific references" },
+        { "range": "0-8", "example": "No citations, references, or primary source evidence provided" }
+      ]
+    },
+    {
+      "id": "comprehensiveness_currency",
+      "label": "Content Breadth & Recency",
+      "max_score": 20,
+      "description": "Assesses the detail provided (definition, dosage, safety/UL, food sources) and how recently the entry was updated.",
+      "score_tiers": [
+        { "range": "16-20", "example": "Comprehensive coverage (RDAs, safety limits, mechanism, drug interactions) updated within the last 2-3 years" },
+        { "range": "10-15", "example": "Good overview covering main uses and standard dosages, updated within the last 5 years" },
+        { "range": "4-9", "example": "Basic surface overview missing key safety details or updated >5 years ago" },
+        { "range": "0-3", "example": "Extremely sparse summary or outdated content without clear revision dates" }
+      ]
+    },
+    {
+      "id": "transparency_bias",
+      "label": "Commercial Neutrality & Disclosures",
+      "max_score": 15,
+      "min_score": -10,
+      "description": "Measures independence from sales motives. Neutral, grant-funded resources earn full positive points; product promotion or undisclosed affiliate links penalize the score.",
+      "score_tiers": [
+        { "range": "12 to 15", "example": "100% independent, non-commercial mandate; zero product advertising or affiliate links" },
+        { "range": "6 to 11", "example": "Transparent editorial guidelines with clearly separated, non-intrusive display ads" },
+        { "range": "0 to 5", "example": "Slight commercial influence or undisclosed sponsorship context" },
+        { "range": "-1 to -10", "example": "Direct product sales, affiliate buy-links, sponsored posts, or disguised marketing content" }
+      ]
+    }
+  ]
+}

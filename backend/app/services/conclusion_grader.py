@@ -38,7 +38,11 @@ from pydantic import BaseModel, Field
 from sqlmodel import Session, select
 
 from app.core.config import get_settings
-from app.models.research import PaperConclusion, ResearchPaper
+from app.models.research import (
+    PAPER_STATUS_DISCARDED_IRRELEVANT,
+    PaperConclusion,
+    ResearchPaper,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -235,11 +239,18 @@ def process_paper_conclusions(
     """Extracts findings from `paper` and merges them into the
     ingredient's running PaperConclusion set — see module docstring.
 
-    Gatekept by MIN_GRADE_SCORE_FOR_CONCLUSIONS: returns False
-    immediately (no Gemini call) if `paper.grade_score` is missing or
-    <= 50, per spec — a paper that hasn't been graded yet, or graded too
-    low, shouldn't contribute to the ingredient's synthesized
-    conclusions.
+    Gatekept two ways, both returning False immediately (no Gemini call):
+    - `paper.status == PAPER_STATUS_DISCARDED_IRRELEVANT` (Phase 6 —
+      app/services/paper_grader.py determined this paper isn't actually
+      about the target ingredient). This is a defense-in-depth check —
+      app/services/paper_analysis_pipeline.py already skips calling this
+      function at all for a discarded paper — but costs nothing to
+      assert here too, so this function is self-contained-safe
+      regardless of caller discipline.
+    - MIN_GRADE_SCORE_FOR_CONCLUSIONS: `paper.grade_score` is missing or
+      <= 50, per spec — a paper that hasn't been graded yet, or graded
+      too low, shouldn't contribute to the ingredient's synthesized
+      conclusions.
 
     Commits its own changes (new PaperConclusion rows + updates to
     existing ones) — callers (app/services/paper_analysis_pipeline.py)
@@ -250,13 +261,15 @@ def process_paper_conclusions(
     Returns:
         True if Gemini was actually called and its result (possibly
         empty merged/new lists) was committed; False if skipped entirely
-        by the gatekeeper check above.
+        by either gatekeeper check above.
 
     Raises:
         ConclusionGradingError: if the rubric can't load, the Gemini
             request fails, the response can't be parsed, or the DB
             commit fails (session is rolled back first in that case).
     """
+    if paper.status == PAPER_STATUS_DISCARDED_IRRELEVANT:
+        return False
     if paper.grade_score is None or paper.grade_score <= MIN_GRADE_SCORE_FOR_CONCLUSIONS:
         return False
 

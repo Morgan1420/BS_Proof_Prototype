@@ -122,28 +122,38 @@ def _migrate_ingredient_grading_columns() -> None:
 
 
 # Same pattern as _INGREDIENT_GRADING_COLUMNS above: `keywords`, then
-# later `grade`/`grade_score`/`rubric_evaluation` (Phase 3 automated
-# paper grading — see app/services/paper_grader.py) were added to
+# `grade`/`grade_score`/`rubric_evaluation` (Phase 3 automated paper
+# grading — see app/services/paper_grader.py), and now `status` (Phase 6
+# ingredient relevance verification — same module) were all added to
 # `ResearchPaper` (app/models/research.py) after `research_papers`
-# already existed in deployed databases. All nullable, so no DEFAULT is
-# needed even on a non-empty table.
+# already existed in deployed databases. `keywords`/`grade`/
+# `grade_score`/`rubric_evaluation` are nullable, so no DEFAULT is
+# strictly needed for those — but `status` mirrors `is_graded`
+# (_INGREDIENT_GRADING_COLUMNS above) in being a non-nullable column with
+# a real default, since app/models/research.py's `status: str =
+# Field(default=PAPER_STATUS_ACTIVE)` is a plain (non-Optional) type, so
+# SQLModel/SQLAlchemy generates it NOT NULL on a fresh create_all() —
+# the DDL fragment below needs to match that on an ALTER TABLE too, or a
+# migrated (pre-Phase-6) database's `status` column would end up
+# nullable while a freshly-created one wouldn't.
 _RESEARCH_PAPER_COLUMNS: tuple[tuple[str, str], ...] = (
     ("keywords", "VARCHAR"),
     ("grade", "VARCHAR"),
     ("grade_score", "INTEGER"),
     ("rubric_evaluation", "JSON"),
+    ("status", "VARCHAR DEFAULT 'ACTIVE' NOT NULL"),
 )
 
 
 def _migrate_research_paper_columns() -> None:
     """Additive, idempotent migration: adds whichever of `keywords`,
-    `grade`, `grade_score`, `rubric_evaluation` are missing from an
-    existing `research_papers` table — same reasoning and pattern as
-    _migrate_ingredient_grading_columns() above (create_all() never
-    alters an existing table's columns, only creates missing tables by
-    name). Safe to run on every startup; a no-op once every column
-    exists, including on a freshly-created database where create_all()
-    already included all of them.
+    `grade`, `grade_score`, `rubric_evaluation`, `status` are missing
+    from an existing `research_papers` table — same reasoning and
+    pattern as _migrate_ingredient_grading_columns() above (create_all()
+    never alters an existing table's columns, only creates missing
+    tables by name). Safe to run on every startup; a no-op once every
+    column exists, including on a freshly-created database where
+    create_all() already included all of them.
     """
     if "research_papers" not in SQLModel.metadata.tables:
         return  # shouldn't happen — defensive, in case of a future rename
@@ -165,6 +175,50 @@ def _migrate_research_paper_columns() -> None:
         connection.commit()
 
 
+# Columns added to `VerifiedResource` (app/models/research.py) after
+# `verified_resources` already existed in deployed (Phase 7) databases —
+# Phase 8 automated resource grading (app/services/resource_grader.py).
+# Unlike `verified_resources` itself (a brand-new table when it was
+# introduced, needing no migration — see that model's docstring), these
+# three columns need the same additive-`ALTER TABLE` treatment as
+# ResearchPaper's `grade`/`grade_score`/`rubric_evaluation`. All three are
+# nullable, so no DEFAULT is needed (same reasoning as those columns).
+_VERIFIED_RESOURCE_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("grade", "VARCHAR"),
+    ("score", "INTEGER"),
+    ("reasoning_summary", "TEXT"),
+)
+
+
+def _migrate_verified_resource_columns() -> None:
+    """Additive, idempotent migration: adds whichever of `grade`,
+    `score`, `reasoning_summary` are missing from an existing
+    `verified_resources` table — same reasoning and pattern as
+    _migrate_research_paper_columns() above. Safe to run on every
+    startup; a no-op once every column exists, including on a
+    freshly-created database where create_all() already included all of
+    them.
+    """
+    if "verified_resources" not in SQLModel.metadata.tables:
+        return  # shouldn't happen — defensive, in case of a future rename
+
+    with engine.connect() as connection:
+        existing_columns = {
+            row[1]
+            for row in connection.exec_driver_sql("PRAGMA table_info(verified_resources)")
+        }
+        if not existing_columns:
+            return  # table doesn't exist yet somehow — create_all() above should prevent this
+
+        for column_name, column_ddl in _VERIFIED_RESOURCE_COLUMNS:
+            if column_name in existing_columns:
+                continue
+            connection.exec_driver_sql(
+                f"ALTER TABLE verified_resources ADD COLUMN {column_name} {column_ddl}"
+            )
+        connection.commit()
+
+
 def init_db() -> None:
     """Creates backend/data/ (if missing) and all registered tables.
 
@@ -172,11 +226,24 @@ def init_db() -> None:
     Safe to call repeatedly — `create_all` only creates tables that don't
     already exist, and the migration steps below only add columns that
     are actually missing. Non-destructive: existing data is left alone.
+
+    Note: `verified_resources` (Phase 7 — app/models/research.py's
+    `VerifiedResource`, populated by app/services/resource_fetcher.py)
+    itself needed no `_migrate_*` step when it was first introduced,
+    unlike `research_papers`'s additive columns above — it was a
+    brand-new table, not new columns bolted onto one that already
+    existed in deployed databases, so `create_all()` alone created it.
+    Its own `grade`/`score`/`reasoning_summary` columns (Phase 8 —
+    app/services/resource_grader.py), however, WERE added after
+    `verified_resources` already existed in Phase-7 databases, so those
+    three do need `_migrate_verified_resource_columns()` below, same
+    reasoning as `research_papers`'s additive columns.
     """
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     SQLModel.metadata.create_all(engine)
     _migrate_ingredient_grading_columns()
     _migrate_research_paper_columns()
+    _migrate_verified_resource_columns()
 
 
 def reset_database() -> None:

@@ -1,19 +1,27 @@
-"""Gemini-backed automated paper quality grading (Phase 3/4).
+"""Gemini-backed automated paper quality grading + ingredient relevance
+verification (Phase 3/4/6).
 
 Mirrors app/services/research_keywords.py's Gemini usage pattern (cached
 client, structured `response_schema` output, `.parsed` with a raw-text
 fallback), but evaluates one already-found paper against
 docs/paper_grading_rubric.json rather than generating search keywords.
 
-`grade_paper()` (pure — no DB access) is called automatically by
-app/services/paper_search.py::search_papers_for_ingredient for every
-newly-persisted ResearchPaper row — see that module for the per-paper
-resilience handling (a single paper's grading failure never fails the
-whole paper-search/ingestion batch). `grade_single_paper()` (below,
-DB-aware) is the on-demand counterpart: it grades and persists exactly
-one already-stored ResearchPaper row, for the "tap the ungraded badge to
-grade this one paper" flow — see app/api/routes.py's
-`POST /api/v1/papers/{paper_id}/grade`.
+`grade_paper()` (pure — no DB access) evaluates a paper's rubric quality
+*and*, as of Phase 6, whether it's actually relevant to the target
+ingredient it was found under (one Gemini call does both — see
+`_RubricEvaluationSchema`'s `is_relevant_to_ingredient`/
+`relevance_reasoning` fields below). `grade_single_paper()` (below,
+DB-aware) is what actually calls it and persists the result — both for
+`app/services/paper_analysis_pipeline.py::analyze_ingredient_papers`
+(Phase 5/6's main entry point, grading every stored paper for an
+ingredient) and for the on-demand "tap the ungraded badge to grade this
+one paper" flow (`POST /api/v1/papers/{paper_id}/grade` —
+app/api/routes.py). `grade_single_paper` is also what sets
+`ResearchPaper.status` to `PAPER_STATUS_DISCARDED_IRRELEVANT` when
+Gemini determines a paper isn't actually about its ingredient (e.g. a
+Vitamin D paper that turned up during a Vitamin C search) — the pipeline
+then skips conclusion synthesis for it and every paper-list/summary
+query in app/services/search.py excludes it going forward.
 """
 
 from __future__ import annotations
@@ -30,7 +38,12 @@ from pydantic import BaseModel, Field
 from sqlmodel import Session
 
 from app.core.config import get_settings
-from app.models.research import ResearchPaper
+from app.models.research import (
+    PAPER_STATUS_ACTIVE,
+    PAPER_STATUS_DISCARDED_IRRELEVANT,
+    ResearchPaper,
+)
+from app.models.supplement import Ingredient
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +85,18 @@ class GradeResult(TypedDict):
     grade: str
     grade_score: int
     rubric_evaluation: RubricEvaluation
+    # --- Phase 6: ingredient relevance verification ---
+    # Whether the paper's title/abstract actually studies the target
+    # ingredient it was evaluated against (see grade_paper's
+    # `ingredient_name` parameter) — strict check, not swayed by the
+    # paper's own quality (a low-quality but genuinely on-topic paper is
+    # still relevant; a high-quality but off-topic one is still not).
+    # `grade_single_paper` uses this to set `ResearchPaper.status`.
+    is_relevant_to_ingredient: bool
+    # One concise sentence explaining the relevance determination —
+    # surfaced in app/services/paper_analysis_pipeline.py's
+    # "[Pipeline] Discarded Paper ID #..." warning log when False.
+    relevance_reasoning: str
 
 
 class _RubricEvaluationSchema(BaseModel):
@@ -84,20 +109,53 @@ class _RubricEvaluationSchema(BaseModel):
     risks the two disagreeing (e.g. a 72 total paired with a "C"); computing
     the letter ourselves from the one number Gemini has to get right
     guarantees they're always consistent.
+
+    `is_relevant_to_ingredient`/`relevance_reasoning` (Phase 6) are
+    listed first, ahead of the rubric-quality fields — this is
+    deliberately a *gating* question ("is this paper even about the
+    target ingredient?"), conceptually prior to "how good is it?", even
+    though both are produced by the same Gemini call and neither field's
+    presence changes how the other four are scored (a paper judged
+    irrelevant still gets a full rubric evaluation filled in — it's
+    simply never used, since app/services/paper_analysis_pipeline.py
+    skips conclusion synthesis for a discarded paper regardless of its
+    grade_score).
     """
 
+    is_relevant_to_ingredient: bool = Field(
+        description=(
+            "True only if the paper's title/abstract explicitly "
+            "studies, tests, or analyzes the named target ingredient "
+            "itself (or a direct synonym / specific active compound of "
+            "it) — not a different ingredient, and not merely a broader "
+            "category it happens to belong to. False for any paper "
+            "about an unrelated substance or topic."
+        )
+    )
+    relevance_reasoning: str = Field(
+        description="One concise sentence explaining the relevance determination."
+    )
     study_type: str = Field(description="The evaluated study design/hierarchy tier.")
     study_type_score: int = Field(description="Points awarded for study design, out of the category's max_score.")
     journal_reputation: str = Field(description="The evaluated journal/publisher rigor tier.")
-    journal_score: int = Field(description="Points awarded for journal reputation, out of the category's max_score.")
+    journal_score: int = Field(
+        description=(
+            "Points awarded for journal reputation, in the range -5 to "
+            "15 (negative values penalize a predatory publisher, vanity "
+            "press, unvetted pay-to-publish outlet, or fake peer review; "
+            "see the rubric's journal_reputation category)."
+        )
+    )
     sample_info: str = Field(description="Description of the sample: human/animal/cell, size, diversity.")
     sample_score: int = Field(description="Points awarded for methodology & sample, out of the category's max_score.")
     funding_status: str = Field(description="The evaluated funding/conflict-of-interest tier.")
     funding_score: int = Field(
         description=(
-            "Points awarded for funding & bias, in the range -10 to 10 "
-            "(negative values penalize industry-biased/suspicious "
-            "funding; see the rubric's funding_bias category)."
+            "Points awarded for funding & bias, in the range -15 to 5 "
+            "(defaults to a neutral +2 when funding isn't mentioned at "
+            "all; negative values penalize only actively-indicated "
+            "industry-biased/suspicious funding; see the rubric's "
+            "funding_bias category)."
         )
     )
     total_score: int = Field(description="Sum of the four category scores above (funding_score may be negative), clamped to 0-100.")
@@ -184,7 +242,9 @@ def _clamp(value: int, minimum: int, maximum: int) -> int:
     return max(minimum, min(maximum, value))
 
 
-def _build_prompt(paper_metadata: Dict[str, Optional[str]], rubric: Dict[str, Any]) -> str:
+def _build_prompt(
+    paper_metadata: Dict[str, Optional[str]], rubric: Dict[str, Any], ingredient_name: str
+) -> str:
     title = paper_metadata.get("title") or "Unknown title"
     abstract = paper_metadata.get("abstract") or "No abstract available."
     authors = paper_metadata.get("authors") or "Not specified."
@@ -192,11 +252,33 @@ def _build_prompt(paper_metadata: Dict[str, Optional[str]], rubric: Dict[str, An
     publication_date = paper_metadata.get("publication_date") or "Not specified."
 
     return (
+        f"This paper was found while researching the ingredient/compound "
+        f"\"{ingredient_name}\". Before scoring the rubric below, first "
+        f"strictly determine `is_relevant_to_ingredient`: does the title "
+        f"and/or abstract explicitly study, test, or analyze "
+        f"\"{ingredient_name}\" itself — or a direct synonym of it, or "
+        f"one of its specific active/chemical compounds — and not a "
+        f"different, unrelated ingredient or an entirely different "
+        f"topic? For example, if the target is \"Vitamin C\" and the "
+        f"paper is actually about Vitamin D, `is_relevant_to_ingredient` "
+        f"must be false. Judge relevance on topic alone, never on "
+        f"quality: a low-quality but genuinely on-topic paper is still "
+        f"relevant; a high-quality but off-topic paper is still not. "
+        f"Briefly justify your determination in `relevance_reasoning`. "
+        f"Still fill in every rubric field below as best you can "
+        f"regardless of your relevance determination — they'll simply be "
+        f"disregarded downstream for a paper judged irrelevant.\n\n"
         "Evaluate the following scientific paper against the rubric below. "
         "Be strict and evidence-based — only award points the abstract/"
         "metadata actually supports; when information for a category is "
         "missing, score conservatively in that category's lower tiers "
-        "rather than assuming the best case.\n\n"
+        "rather than assuming the best case. The one exception is "
+        "`funding_score` (\"funding_bias\") — see the note below, where "
+        "funding not being mentioned at all defaults to a neutral +2, not "
+        "that category's lower (negative) tiers. (`journal_score` "
+        "(\"journal_reputation\") can also go negative, but only when a "
+        "publisher is actively identified as predatory/blacklisted, not "
+        "merely unidentified — see that note below too.)\n\n"
         f"Title: {title}\n"
         f"Abstract: {abstract}\n"
         f"Authors: {authors}\n"
@@ -204,40 +286,69 @@ def _build_prompt(paper_metadata: Dict[str, Optional[str]], rubric: Dict[str, An
         f"Publication info: {publication_date}\n\n"
         "Rubric categories:\n"
         f"{_format_rubric_for_prompt(rubric)}\n\n"
-        "Note: `funding_score` (\"funding_bias\") is the one exception to "
-        "the usual 0-to-max scoring — it ranges from -10 to 10. Award a "
-        "positive value for independent/well-disclosed funding, 0 for "
-        "neutral/undisclosed, and a negative value (down to -10) to "
-        "penalize industry-biased, undisclosed-conflict, or suspicious "
-        "commercial funding. Every other category score must be a "
-        "non-negative integer.\n\n"
+        "Note: `funding_score` (\"funding_bias\") and `journal_score` "
+        "(\"journal_reputation\") are the two exceptions to the usual "
+        "0-to-max scoring — both can go negative.\n\n"
+        "`funding_score` ranges from -15 to 5. Award a positive value "
+        "(up to +5) for independent/well-disclosed funding; when funding "
+        "isn't mentioned in the abstract/metadata at all, default to a "
+        "neutral **+2** (do not treat missing funding information as a "
+        "reason to penalize an otherwise strong paper); and award a "
+        "negative value (down to -15) only when the abstract/metadata "
+        "actively indicates industry-biased, undisclosed-conflict, or "
+        "suspicious commercial funding — never as a penalty for silence "
+        "alone.\n\n"
+        "`journal_score` ranges from -5 to 15. Award a positive value "
+        "(up to +15) scaled to the journal's reputation/rigor; when the "
+        "publisher simply isn't identified in the metadata, score near "
+        "the neutral 0-1 tier (not the negative range — an unidentified "
+        "publisher is not the same as a known-bad one); and award a "
+        "negative value (down to -5) only when the abstract/metadata "
+        "actively identifies a predatory publisher, vanity press, "
+        "unvetted pay-to-publish outlet, or fake/absent peer review — "
+        "never merely for the publisher being unnamed.\n\n"
+        "`study_type_score` must be a non-negative integer between 0 and "
+        "40. `sample_score` must be a non-negative integer between 0 and "
+        "40.\n\n"
         "Return your evaluation as the required JSON object. `total_score` "
-        "must equal the sum of the four category scores (funding_score "
-        "may be negative)."
+        "must equal the sum of the four category scores (`funding_score` "
+        "and `journal_score` may each be negative)."
     )
 
 
-def grade_paper(paper_metadata: Dict[str, Optional[str]]) -> GradeResult:
-    """Evaluates one paper against docs/paper_grading_rubric.json via
-    Gemini and returns its grade.
+def grade_paper(paper_metadata: Dict[str, Optional[str]], ingredient_name: str) -> GradeResult:
+    """Evaluates one paper against docs/paper_grading_rubric.json *and*
+    checks its relevance to `ingredient_name` (Phase 6), via a single
+    Gemini call, and returns both.
 
     Args:
         paper_metadata: `{"title", "abstract", "authors", "journal",
             "publication_date"}` — any value may be None/missing; Gemini
             is instructed to score conservatively where metadata is
             absent rather than assume the best case.
+        ingredient_name: The canonical Ingredient name this paper was
+            found under (e.g. "Vitamin C") — passed explicitly into the
+            prompt so Gemini can judge whether the paper is actually
+            about it, rather than a different ingredient/topic that
+            happened to surface under the same search keywords.
 
     Returns:
-        `{"grade": "A"-"E", "grade_score": 0-100, "rubric_evaluation": {...}}`
+        `{"grade": "A"-"E", "grade_score": 0-100, "rubric_evaluation": {...},
+        "is_relevant_to_ingredient": bool, "relevance_reasoning": str}`
         — see RubricEvaluation above for the breakdown shape. Every
         category score is clamped to that category's `(min_score,
-        max_score)` range (all `0` to `max_score` except `funding_bias`,
-        which is `-10` to `10` — a penalty scale, not a plain 0-to-max
-        score) in case Gemini's raw output overshoots either bound.
-        `total_score` is the sum of those clamped category scores
-        (funding's contribution may be negative), then clamped again to
-        0-100 — `grade` is derived from that final clamped total, not
-        from Gemini's raw output.
+        max_score)` range — plain `0` to `max_score` for `study_type`
+        (`0`-`40` as of v1.5) / `sample_methodology`, but `funding_bias`
+        (`-15` to `5`) and `journal_reputation` (`-5` to `15` as of
+        v1.5, previously `-5` to `20`) are both penalty scales rather
+        than a plain 0-to-max score — in case Gemini's raw output
+        overshoots either bound. `total_score` is the sum of
+        those clamped category scores (funding's and/or journal's
+        contribution may be negative), then clamped again to 0-100 —
+        `grade` is derived from that final clamped total, not from
+        Gemini's raw output. `is_relevant_to_ingredient`/
+        `relevance_reasoning` are passed through from Gemini's response
+        unmodified (a plain bool/str, nothing to clamp or re-derive).
 
     Raises:
         PaperGradingError: if the rubric can't be loaded, the Gemini
@@ -248,7 +359,7 @@ def grade_paper(paper_metadata: Dict[str, Optional[str]]) -> GradeResult:
     client = _get_client()
     settings = get_settings()
 
-    prompt = _build_prompt(paper_metadata, rubric)
+    prompt = _build_prompt(paper_metadata, rubric, ingredient_name)
 
     try:
         response = client.models.generate_content(
@@ -275,19 +386,27 @@ def grade_paper(paper_metadata: Dict[str, Optional[str]]) -> GradeResult:
             ) from exc
 
     # (min_score, max_score) per category — min_score defaults to 0 for
-    # categories that don't set one explicitly (every category except
-    # funding_bias, which ranges -10 to 10 as a penalty for
-    # industry-biased/suspicious funding rather than a plain 0-to-max
-    # score like the other three).
+    # categories that don't set one explicitly (study_type and
+    # sample_methodology). Two categories are penalty scales rather than
+    # plain 0-to-max scores: funding_bias ranges -15 to 5 ((sharpened,
+    # v1.2) penalty for industry-biased/suspicious funding; the prompt
+    # also defaults this one to a neutral +2 — not 0 — when funding
+    # simply isn't mentioned, so undisclosed funding no longer drags an
+    # otherwise strong paper down — see _build_prompt above), and
+    # journal_reputation ranges -5 to 15 as of v1.5 (previously -5 to 20,
+    # with the 5-point difference moved to study_type's max, 35 -> 40 —
+    # penalty for an actively identified predatory/blacklisted publisher;
+    # an unidentified one still scores near-neutral 0-1, not negative —
+    # see _build_prompt).
     category_bounds = {
         category["id"]: (category.get("min_score", 0), category["max_score"])
         for category in rubric.get("categories", [])
     }
 
-    study_min, study_max = category_bounds.get("study_type", (0, 35))
-    journal_min, journal_max = category_bounds.get("journal_reputation", (0, 25))
-    sample_min, sample_max = category_bounds.get("sample_methodology", (0, 30))
-    funding_min, funding_max = category_bounds.get("funding_bias", (-10, 10))
+    study_min, study_max = category_bounds.get("study_type", (0, 40))
+    journal_min, journal_max = category_bounds.get("journal_reputation", (-5, 15))
+    sample_min, sample_max = category_bounds.get("sample_methodology", (0, 40))
+    funding_min, funding_max = category_bounds.get("funding_bias", (-15, 5))
 
     study_type_score = _clamp(parsed.study_type_score, study_min, study_max)
     journal_score = _clamp(parsed.journal_score, journal_min, journal_max)
@@ -320,14 +439,16 @@ def grade_paper(paper_metadata: Dict[str, Optional[str]]) -> GradeResult:
         "grade": grade,
         "grade_score": total_score,
         "rubric_evaluation": rubric_evaluation,
+        "is_relevant_to_ingredient": parsed.is_relevant_to_ingredient,
+        "relevance_reasoning": parsed.relevance_reasoning,
     }
 
 
 def grade_single_paper(session: Session, paper: ResearchPaper) -> ResearchPaper:
     """Grades and persists exactly one already-stored `ResearchPaper` row
     — the on-demand counterpart to the automatic per-paper grading
-    `search_papers_for_ingredient` does at ingestion time (see
-    app/services/paper_search.py::_apply_grade). Backs
+    `app/services/paper_analysis_pipeline.py::analyze_ingredient_papers`
+    does over every stored paper for an ingredient. Backs
     `POST /api/v1/papers/{paper_id}/grade` (app/api/routes.py), triggered
     by tapping a gray "(-)" ungraded badge in the frontend's StudiesList.
 
@@ -342,13 +463,18 @@ def grade_single_paper(session: Session, paper: ResearchPaper) -> ResearchPaper:
         `paper`, unchanged if it was already graded (idempotent — no
         Gemini call, no commit — per spec: re-tapping an already-graded
         badge, or a race between two taps, is a safe no-op), otherwise
-        with `grade`/`grade_score`/`rubric_evaluation` freshly set and
-        committed.
+        with `grade`/`grade_score`/`rubric_evaluation`/`status` freshly
+        set and committed. `status` becomes `PAPER_STATUS_DISCARDED_IRRELEVANT`
+        (Phase 6) if Gemini determines this paper isn't actually about
+        its own `ingredient_id`'s Ingredient, otherwise stays/becomes
+        `PAPER_STATUS_ACTIVE`.
 
     Raises:
-        PaperGradingError: if grading fails (propagated from
-            `grade_paper` or `_load_rubric`) or the commit fails — in
-            either case the session is rolled back so a failed attempt
+        PaperGradingError: if the paper's Ingredient can't be found (a
+            broken FK — shouldn't happen, but relevance-checking needs a
+            name to check against), grading fails (propagated from
+            `grade_paper` or `_load_rubric`), or the commit fails — in
+            every case the session is rolled back so a failed attempt
             doesn't leave a half-updated row.
 
     Known limitation: unlike ingestion-time grading, this has no
@@ -364,6 +490,14 @@ def grade_single_paper(session: Session, paper: ResearchPaper) -> ResearchPaper:
     if paper.grade is not None:
         return paper
 
+    ingredient = session.get(Ingredient, paper.ingredient_id)
+    if ingredient is None:
+        raise PaperGradingError(
+            f"Could not find Ingredient id={paper.ingredient_id} for paper "
+            f"id={paper.id} — cannot relevance-check without a target "
+            "ingredient name."
+        )
+
     result = grade_paper(
         {
             "title": paper.title,
@@ -371,12 +505,18 @@ def grade_single_paper(session: Session, paper: ResearchPaper) -> ResearchPaper:
             "authors": paper.authors,
             "journal": None,
             "publication_date": paper.publication_date,
-        }
+        },
+        ingredient.name,
     )
 
     paper.grade = result["grade"]
     paper.grade_score = result["grade_score"]
     paper.rubric_evaluation = dict(result["rubric_evaluation"])
+    paper.status = (
+        PAPER_STATUS_ACTIVE
+        if result["is_relevant_to_ingredient"]
+        else PAPER_STATUS_DISCARDED_IRRELEVANT
+    )
     session.add(paper)
 
     try:
@@ -385,5 +525,16 @@ def grade_single_paper(session: Session, paper: ResearchPaper) -> ResearchPaper:
     except Exception as exc:  # noqa: BLE001
         session.rollback()
         raise PaperGradingError(f"Failed to save grading result: {exc}") from exc
+
+    if paper.status == PAPER_STATUS_DISCARDED_IRRELEVANT:
+        logger.info(
+            "Paper id=%s (%r) graded but marked %s relative to ingredient "
+            "%r: %s",
+            paper.id,
+            paper.title,
+            PAPER_STATUS_DISCARDED_IRRELEVANT,
+            ingredient.name,
+            result["relevance_reasoning"],
+        )
 
     return paper

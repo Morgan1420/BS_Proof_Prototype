@@ -6,13 +6,20 @@ from typing import List, Optional
 
 from sqlmodel import Session, select
 
-from app.models.research import PaperConclusion, ResearchPaper, parse_keywords
+from app.models.research import (
+    PAPER_STATUS_DISCARDED_IRRELEVANT,
+    PaperConclusion,
+    ResearchPaper,
+    VerifiedResource,
+    parse_keywords,
+)
 from app.models.supplement import Ingredient as IngredientRow
 from app.models.supplement import Product, ProductIngredientLink
 from app.schemas.research import (
     IngredientDetailResponse,
     PaperConclusionResponse,
     ResearchPaperResponse,
+    VerifiedResourceResponse,
 )
 from app.schemas.search import FilterType, ResultType, SearchResultItem
 from app.schemas.supplement import LinkedIngredientResponse, ProductDetailResponse
@@ -101,20 +108,28 @@ def to_research_paper_response(paper: ResearchPaper) -> ResearchPaperResponse:
         # match RubricEvaluationResponse field-for-field — pydantic
         # validates it straight through. None stays None.
         rubric_evaluation=paper.rubric_evaluation,
+        status=paper.status,
     )
 
 
 def get_ingredient_papers(
     session: Session, ingredient_id: int
 ) -> List[ResearchPaperResponse]:
-    """Returns every stored ResearchPaper row for `ingredient_id`, most
-    recently added first (see ResearchPaper.created_at) — backs the
-    `papers` field on both GET /api/v1/ingredients/{id} and
-    POST /api/v1/ingredients/{id}/grade's response.
+    """Returns every stored, *relevant* ResearchPaper row for
+    `ingredient_id`, most recently added first (see
+    ResearchPaper.created_at) — backs the `papers` field on both
+    GET /api/v1/ingredients/{id} and POST /api/v1/ingredients/{id}/grade's
+    response.
+
+    Excludes PAPER_STATUS_DISCARDED_IRRELEVANT rows (Phase 6 — see
+    app/models/research.py) so a paper Gemini determined isn't actually
+    about this ingredient never counts toward "Total studies"/"Average
+    grade" or appears in the "List of Studies"/recommendations panels.
     """
     stmt = (
         select(ResearchPaper)
         .where(ResearchPaper.ingredient_id == ingredient_id)
+        .where(ResearchPaper.status != PAPER_STATUS_DISCARDED_IRRELEVANT)
         .order_by(ResearchPaper.created_at.desc())
     )
     return [to_research_paper_response(paper) for paper in session.exec(stmt).all()]
@@ -152,12 +167,53 @@ def get_ingredient_conclusions(
     ]
 
 
+def get_ingredient_resources(
+    session: Session, ingredient_id: int
+) -> List[VerifiedResourceResponse]:
+    """Returns every stored VerifiedResource for `ingredient_id`, most
+    recently added first — backs the `verified_resources` field on
+    GET /api/v1/ingredients/{id} (Phase 7 — see
+    app/services/resource_fetcher.py for how these are found/persisted;
+    Phase 8 — app/services/resource_grader.py for how `grade`/`score`/
+    `reasoning_summary` are assigned).
+
+    Unlike get_ingredient_papers above, there's no status/relevance
+    filter to apply here — every VerifiedResource row already cleared
+    the strict domain allow-list at fetch time (see
+    resource_fetcher.py::_is_verified_domain), so every stored row is,
+    by construction, one worth showing, regardless of whether it's been
+    graded yet (`grade`/`score`/`reasoning_summary` may still be `None`
+    — see VerifiedResourceResponse's docstring).
+    """
+    stmt = (
+        select(VerifiedResource)
+        .where(VerifiedResource.ingredient_id == ingredient_id)
+        .order_by(VerifiedResource.created_at.desc())
+    )
+    return [
+        VerifiedResourceResponse(
+            id=resource.id,
+            ingredient_id=resource.ingredient_id,
+            title=resource.title,
+            publisher=resource.publisher,
+            url=resource.url,
+            domain=resource.domain,
+            summary=resource.summary,
+            grade=resource.grade,
+            score=resource.score,
+            reasoning_summary=resource.reasoning_summary,
+        )
+        for resource in session.exec(stmt).all()
+    ]
+
+
 def get_ingredient_detail(
     session: Session, ingredient_id: int
 ) -> Optional[IngredientDetailResponse]:
     """Returns a single canonical Ingredient plus its full stored paper
-    list and synthesized conclusion list, or None if no Ingredient with
-    that id exists. Backs GET /api/v1/ingredients/{id}.
+    list, synthesized conclusion list, and verified-resource list, or
+    None if no Ingredient with that id exists. Backs
+    GET /api/v1/ingredients/{id}.
     """
     ingredient = session.get(IngredientRow, ingredient_id)
     if ingredient is None:
@@ -173,6 +229,7 @@ def get_ingredient_detail(
         grade_badge_text=ingredient.grade_badge_text,
         papers=get_ingredient_papers(session, ingredient.id),
         conclusions=get_ingredient_conclusions(session, ingredient.id),
+        verified_resources=get_ingredient_resources(session, ingredient.id),
     )
 
 

@@ -4,20 +4,36 @@ import { Ionicons } from '@expo/vector-icons';
 
 import { colors, spacing, typography } from '../theme';
 import type { PaperConclusion } from '../services/api';
-import { GRADE_COLORS, GRADE_RANK, getGradeRank, isPaperGrade } from '../utils/grades';
+import { GRADE_RANK, getGradeRank, isPaperGrade } from '../utils/grades';
 import Pagination from './Pagination';
+import CollapsibleSection from './CollapsibleSection';
+import GradeCircleBadge from './GradeCircleBadge';
 
-/** Max recommendations shown per page — per spec. */
-const PAGE_SIZE = 3;
+/** Max recommendations shown per page — "Maximum 5 items per page
+ * across all lists" (Scientific Information redesign spec; was 3 before
+ * that unification). */
+const PAGE_SIZE = 5;
 
 /**
- * "Recomended uses list" — the second block of the redesigned Scientific
- * Information section (see IngredientCard.tsx). Renders every
- * synthesized PaperConclusion (Phase 5 — app/models/research.py on the
- * backend) whose confidence grade clears "C or higher", paginated 3 per
- * page, using the exact same pagination look/interaction as
- * StudiesList's "List of Studies" panel (both share components/
- * Pagination.tsx).
+ * "Recommended Uses List" — the second of the three unified, collapsible
+ * list panels inside IngredientCard's "Scientific Information" section
+ * (see CollapsibleSection.tsx for the shared border/toggle chrome).
+ * Renders every synthesized PaperConclusion (Phase 5 — app/models/
+ * research.py on the backend) whose confidence grade clears "C or
+ * higher", paginated using the same components/Pagination.tsx as the
+ * other two lists.
+ *
+ * Unlike StudiesList/VerifiedResourcesList, this list's rows never show
+ * a website icon — a PaperConclusion is a synthesized cross-paper claim,
+ * not a single external page, so there's no one URL for a row to open.
+ *
+ * Per the redesign spec, tapping a row's info icon and tapping its grade
+ * badge now open two *separate* modals instead of one combined one:
+ * `activeInfoModalItem` (general metadata: supporting/contradicting
+ * study counts, dosage notes, confidence score) and
+ * `activeRubricModalItem` (the conclusion rubric's own category
+ * breakdown — Evidence Strength, Cross-Paper Consensus, Claim
+ * Specificity — plus the AI reviewer's summary note).
  *
  * Palette note: same as StudiesList.tsx — this only ever renders while
  * its parent IngredientCard is already expanded (all-orange internals),
@@ -43,7 +59,10 @@ const RecommendedUsesList: React.FC<RecommendedUsesListProps> = ({
   errorMessage = null,
 }) => {
   const [page, setPage] = useState<number>(0);
-  const [activeConclusion, setActiveConclusion] = useState<PaperConclusion | null>(null);
+  const [activeInfoModalItem, setActiveInfoModalItem] = useState<PaperConclusion | null>(null);
+  const [activeRubricModalItem, setActiveRubricModalItem] = useState<PaperConclusion | null>(
+    null
+  );
 
   // "Graded C or higher" — i.e. confidence_grade is A, B, or C (rank 1-3
   // via the shared getGradeRank/GRADE_RANK helpers, same threshold the
@@ -80,10 +99,10 @@ const RecommendedUsesList: React.FC<RecommendedUsesListProps> = ({
     setPage((current) => Math.min(current, totalPages - 1));
   }, [totalPages]);
 
-  return (
-    <View style={styles.container}>
-      <Text style={styles.header}>Recomended uses list</Text>
+  const totalCount = filteredConclusions?.length ?? 0;
 
+  return (
+    <CollapsibleSection title={`Recommended Uses List (Total: ${totalCount})`}>
       {isLoading && !filteredConclusions ? (
         <Text style={styles.statusText}>Loading recommendations...</Text>
       ) : errorMessage ? (
@@ -105,18 +124,14 @@ const RecommendedUsesList: React.FC<RecommendedUsesListProps> = ({
                 </Text>
                 <View style={styles.rowActions}>
                   {isPaperGrade(conclusion.confidence_grade) && (
-                    <View
-                      style={[
-                        styles.gradeBadge,
-                        { backgroundColor: GRADE_COLORS[conclusion.confidence_grade] },
-                      ]}
-                    >
-                      <Text style={styles.gradeBadgeText}>{conclusion.confidence_grade}</Text>
-                    </View>
+                    <GradeCircleBadge
+                      grade={conclusion.confidence_grade}
+                      onPress={() => setActiveRubricModalItem(conclusion)}
+                    />
                   )}
                   <Pressable
                     style={styles.iconButton}
-                    onPress={() => setActiveConclusion(conclusion)}
+                    onPress={() => setActiveInfoModalItem(conclusion)}
                     accessibilityRole="button"
                     accessibilityLabel={`View details for ${conclusion.claim_summary}`}
                     hitSlop={6}
@@ -127,6 +142,8 @@ const RecommendedUsesList: React.FC<RecommendedUsesListProps> = ({
                       color={colors.orange}
                     />
                   </Pressable>
+                  {/* Deliberately no website icon here — a conclusion is a
+                      synthesized claim, not a single external page. */}
                 </View>
               </View>
             ))}
@@ -136,22 +153,88 @@ const RecommendedUsesList: React.FC<RecommendedUsesListProps> = ({
         </>
       )}
 
+      {/* General Info Modal — "Supporting study count, contradicting
+          study count, dosage notes, and confidence score" per spec, plus
+          the claim/detailed-conclusion text itself as context. */}
       <Modal
-        visible={activeConclusion !== null}
+        visible={activeInfoModalItem !== null}
         transparent
         animationType="fade"
-        onRequestClose={() => setActiveConclusion(null)}
+        onRequestClose={() => setActiveInfoModalItem(null)}
       >
-        <Pressable style={styles.modalBackdrop} onPress={() => setActiveConclusion(null)}>
+        <Pressable style={styles.modalBackdrop} onPress={() => setActiveInfoModalItem(null)}>
           <Pressable style={styles.modalCard} onPress={(event) => event.stopPropagation()}>
-            {activeConclusion && (
+            {activeInfoModalItem && (
               <>
                 <View style={styles.modalHeaderRow}>
                   <Text style={styles.modalTitle} numberOfLines={4}>
-                    {activeConclusion.claim_summary}
+                    {activeInfoModalItem.claim_summary}
                   </Text>
                   <Pressable
-                    onPress={() => setActiveConclusion(null)}
+                    onPress={() => setActiveInfoModalItem(null)}
+                    accessibilityRole="button"
+                    accessibilityLabel="Close"
+                    hitSlop={8}
+                  >
+                    <Ionicons name="close" size={22} color={colors.orange} />
+                  </Pressable>
+                </View>
+
+                <ScrollView style={styles.modalScroll}>
+                  <Text style={styles.modalDetailText}>
+                    {activeInfoModalItem.detailed_conclusion ??
+                      'No detailed description available.'}
+                  </Text>
+
+                  <View style={styles.modalSection}>
+                    <Text style={styles.modalSectionLabel}>Confidence Score</Text>
+                    <Text style={styles.modalSectionValue}>
+                      {activeInfoModalItem.confidence_score} / 100
+                    </Text>
+                  </View>
+
+                  <View style={styles.modalSection}>
+                    <Text style={styles.modalSectionLabel}>Dosage Notes</Text>
+                    <Text style={styles.modalSectionValue}>
+                      {activeInfoModalItem.dosage_mentioned ?? 'Not mentioned in reviewed studies.'}
+                    </Text>
+                  </View>
+
+                  <View style={[styles.modalSection, styles.modalSectionLast]}>
+                    <Text style={styles.modalSectionLabel}>Paper Support</Text>
+                    <Text style={styles.modalSectionValue}>
+                      {activeInfoModalItem.supporting_paper_ids.length} supporting ·{' '}
+                      {activeInfoModalItem.contradicting_paper_ids.length} contradicting
+                    </Text>
+                  </View>
+                </ScrollView>
+              </>
+            )}
+          </Pressable>
+        </Pressable>
+      </Modal>
+
+      {/* Rubric & Comments Modal — total score/grade, the conclusion
+          rubric's own three categories (this is a different rubric shape
+          than a paper's — see ConclusionRubricEvaluation in api.ts — so
+          it doesn't reuse StudiesList's Study Design/Journal Rigor/etc.
+          labels), and the AI reviewer's summary note. */}
+      <Modal
+        visible={activeRubricModalItem !== null}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setActiveRubricModalItem(null)}
+      >
+        <Pressable style={styles.modalBackdrop} onPress={() => setActiveRubricModalItem(null)}>
+          <Pressable style={styles.modalCard} onPress={(event) => event.stopPropagation()}>
+            {activeRubricModalItem && isPaperGrade(activeRubricModalItem.confidence_grade) && (
+              <>
+                <View style={styles.modalHeaderRow}>
+                  <Text style={styles.modalTitle} numberOfLines={3}>
+                    {activeRubricModalItem.claim_summary}
+                  </Text>
+                  <Pressable
+                    onPress={() => setActiveRubricModalItem(null)}
                     accessibilityRole="button"
                     accessibilityLabel="Close"
                     hitSlop={8}
@@ -161,118 +244,77 @@ const RecommendedUsesList: React.FC<RecommendedUsesListProps> = ({
                 </View>
 
                 <View style={styles.modalScoreRow}>
-                  {isPaperGrade(activeConclusion.confidence_grade) && (
-                    <View
-                      style={[
-                        styles.gradeBadge,
-                        styles.gradeBadgeLarge,
-                        { backgroundColor: GRADE_COLORS[activeConclusion.confidence_grade] },
-                      ]}
-                    >
-                      <Text style={[styles.gradeBadgeText, styles.gradeBadgeTextLarge]}>
-                        {activeConclusion.confidence_grade}
-                      </Text>
-                    </View>
-                  )}
+                  <GradeCircleBadge grade={activeRubricModalItem.confidence_grade} large />
                   <Text style={styles.modalScoreText}>
-                    {activeConclusion.confidence_score} / 100 confidence
+                    {activeRubricModalItem.confidence_score} / 100 confidence
                   </Text>
                 </View>
 
                 <ScrollView style={styles.modalScroll}>
-                  <Text style={styles.modalDetailText}>
-                    {activeConclusion.detailed_conclusion ?? 'No detailed description available.'}
-                  </Text>
-
-                  {activeConclusion.dosage_mentioned && (
-                    <View style={styles.modalSection}>
-                      <Text style={styles.modalSectionLabel}>Dosage Noted</Text>
-                      <Text style={styles.modalSectionValue}>
-                        {activeConclusion.dosage_mentioned}
-                      </Text>
-                    </View>
-                  )}
-
-                  {activeConclusion.rubric_evaluation && (
+                  {activeRubricModalItem.rubric_evaluation ? (
                     <>
-                      {typeof activeConclusion.rubric_evaluation.evidence_strength_score ===
-                        'number' && (
+                      {typeof activeRubricModalItem.rubric_evaluation
+                        .evidence_strength_score === 'number' && (
                         <View style={styles.modalSection}>
                           <Text style={styles.modalSectionLabel}>
                             Evidence Strength (
-                            {activeConclusion.rubric_evaluation.evidence_strength_score} pts)
+                            {activeRubricModalItem.rubric_evaluation.evidence_strength_score} pts)
                           </Text>
                           <Text style={styles.modalSectionValue}>
-                            {activeConclusion.rubric_evaluation.evidence_strength ?? 'N/A'}
+                            {activeRubricModalItem.rubric_evaluation.evidence_strength ?? 'N/A'}
                           </Text>
                         </View>
                       )}
-                      {typeof activeConclusion.rubric_evaluation.cross_paper_consensus_score ===
-                        'number' && (
+                      {typeof activeRubricModalItem.rubric_evaluation
+                        .cross_paper_consensus_score === 'number' && (
                         <View style={styles.modalSection}>
                           <Text style={styles.modalSectionLabel}>
                             Cross-Paper Consensus (
-                            {activeConclusion.rubric_evaluation.cross_paper_consensus_score} pts)
+                            {activeRubricModalItem.rubric_evaluation.cross_paper_consensus_score}{' '}
+                            pts)
                           </Text>
                           <Text style={styles.modalSectionValue}>
-                            {activeConclusion.rubric_evaluation.cross_paper_consensus ?? 'N/A'}
+                            {activeRubricModalItem.rubric_evaluation.cross_paper_consensus ??
+                              'N/A'}
                           </Text>
                         </View>
                       )}
-                      {typeof activeConclusion.rubric_evaluation.claim_specificity_score ===
-                        'number' && (
+                      {typeof activeRubricModalItem.rubric_evaluation
+                        .claim_specificity_score === 'number' && (
                         <View style={styles.modalSection}>
                           <Text style={styles.modalSectionLabel}>
                             Claim Specificity (
-                            {activeConclusion.rubric_evaluation.claim_specificity_score} pts)
+                            {activeRubricModalItem.rubric_evaluation.claim_specificity_score} pts)
                           </Text>
                           <Text style={styles.modalSectionValue}>
-                            {activeConclusion.rubric_evaluation.claim_specificity ?? 'N/A'}
+                            {activeRubricModalItem.rubric_evaluation.claim_specificity ?? 'N/A'}
                           </Text>
                         </View>
                       )}
-                      {activeConclusion.rubric_evaluation.summary_notes && (
-                        <View style={[styles.modalSection, styles.modalSectionLast]}>
-                          <Text style={styles.modalSectionLabel}>AI Summary Note</Text>
-                          <Text style={[styles.modalSectionValue, styles.modalSummaryText]}>
-                            {activeConclusion.rubric_evaluation.summary_notes}
-                          </Text>
-                        </View>
-                      )}
+                      <View style={[styles.modalSection, styles.modalSectionLast]}>
+                        <Text style={styles.modalSectionLabel}>AI Summary Note</Text>
+                        <Text style={[styles.modalSectionValue, styles.modalSummaryText]}>
+                          {activeRubricModalItem.rubric_evaluation.summary_notes ??
+                            'No reviewer notes available.'}
+                        </Text>
+                      </View>
                     </>
-                  )}
-
-                  <View style={[styles.modalSection, styles.modalSectionLast]}>
-                    <Text style={styles.modalSectionLabel}>Paper Support</Text>
+                  ) : (
                     <Text style={styles.modalSectionValue}>
-                      {activeConclusion.supporting_paper_ids.length} supporting ·{' '}
-                      {activeConclusion.contradicting_paper_ids.length} contradicting
+                      No rubric breakdown available for this recommendation.
                     </Text>
-                  </View>
+                  )}
                 </ScrollView>
               </>
             )}
           </Pressable>
         </Pressable>
       </Modal>
-    </View>
+    </CollapsibleSection>
   );
 };
 
 const styles = StyleSheet.create({
-  container: {
-    backgroundColor: `${colors.olive}18`,
-    borderRadius: 8,
-    padding: spacing.md,
-    gap: spacing.sm,
-  },
-  header: {
-    fontSize: typography.resultCardLabel,
-    fontWeight: '700',
-    color: colors.orange,
-    textAlign: 'center',
-    letterSpacing: 0.5,
-  },
   statusText: {
     fontSize: typography.resultCardLabel,
     fontStyle: 'italic',
@@ -309,30 +351,7 @@ const styles = StyleSheet.create({
   iconButton: {
     padding: spacing.xs,
   },
-  gradeBadge: {
-    width: 26,
-    height: 26,
-    borderRadius: 13,
-    alignItems: 'center',
-    justifyContent: 'center',
-    borderWidth: 1.5,
-    borderColor: colors.orange,
-  },
-  gradeBadgeLarge: {
-    width: 44,
-    height: 44,
-    borderRadius: 22,
-    borderWidth: 2,
-  },
-  gradeBadgeText: {
-    fontSize: 12,
-    fontWeight: '700',
-    color: '#FFFFFF',
-  },
-  gradeBadgeTextLarge: {
-    fontSize: 18,
-  },
-  // --- Info modal ---
+  // --- Modals (shared backdrop/card look with StudiesList/VerifiedResourcesList) ---
   modalBackdrop: {
     flex: 1,
     backgroundColor: 'rgba(0,0,0,0.4)',

@@ -1,67 +1,69 @@
 {
-  "version": "1.1",
-  "description": "Scientific paper quality rubric for the automated paper-grading pipeline. Gemini evaluates paper metadata against four weighted categories (summing to a maximum of 100 points, with negative penalties for funding bias) to produce a total score mapped to letter grades A-E.",
+  "version": "1.5",
+  "description": "Scientific paper quality rubric for the automated paper-grading pipeline. Gemini evaluates paper metadata against four weighted categories (summing to a maximum of 100 points, with negative penalties for funding bias and predatory journals) to produce a total score mapped to letter grades A-E.",
 
   "grade_bands": [
-    { "grade": "A", "min_score": 85, "max_score": 100, "label": "Excellent — high-quality, low-bias evidence" },
-    { "grade": "B", "min_score": 70, "max_score": 84, "label": "Good — solid methodology, minor limitations" },
-    { "grade": "C", "min_score": 50, "max_score": 69, "label": "Fair — moderate quality or notable limitations" },
-    { "grade": "D", "min_score": 30, "max_score": 49, "label": "Weak — significant methodological concerns" },
-    { "grade": "E", "min_score": 0, "max_score": 29, "label": "Poor — low-quality, high-bias, or penalized evidence" }
+    { "grade": "A", "min_score": 80, "max_score": 100, "label": "Excellent — high-quality, low-bias evidence" },
+    { "grade": "B", "min_score": 65, "max_score": 79, "label": "Good — solid methodology, minor limitations" },
+    { "grade": "C", "min_score": 45, "max_score": 64, "label": "Fair — moderate quality or notable limitations" },
+    { "grade": "D", "min_score": 25, "max_score": 44, "label": "Weak — significant methodological concerns" },
+    { "grade": "E", "min_score": 0, "max_score": 24, "label": "Poor — low-quality, high-bias, or penalized evidence" }
   ],
 
   "categories": [
     {
       "id": "study_type",
       "label": "Study Design / Hierarchy",
-      "max_score": 35,
+      "max_score": 40,
       "description": "Where the study sits on the evidence hierarchy. Apply AMSTAR 2 risk-of-bias reasoning for systematic reviews and ROB2 reasoning for RCTs.",
       "score_tiers": [
-        { "range": "31-35", "example": "Systematic review or meta-analysis of RCTs, low AMSTAR 2 risk of bias" },
-        { "range": "25-30", "example": "Double-blind, placebo-controlled human RCT, low-to-moderate ROB2 risk of bias" },
-        { "range": "17-24", "example": "Single-blind or open-label human RCT; or well-controlled prospective cohort study" },
-        { "range": "9-16", "example": "Observational/cross-sectional human study, or well-designed animal model" },
-        { "range": "0-8", "example": "In-vitro/cell study, single case report, or non-peer-reviewed preprint" }
+        { "range": "36-40", "example": "Systematic review or meta-analysis of human trials, low AMSTAR 2 risk of bias" },
+        { "range": "29-35", "example": "Double-blind, placebo-controlled human RCT, low-to-moderate ROB2 risk of bias" },
+        { "range": "20-28", "example": "Single-blind or open-label human RCT; or well-controlled prospective cohort study" },
+        { "range": "11-19", "example": "Observational/cross-sectional human study, or well-designed animal model" },
+        { "range": "0-10", "example": "In-vitro/cell study, single case report, or non-peer-reviewed preprint" }
       ]
     },
     {
       "id": "journal_reputation",
       "label": "Journal / Publisher Rigor",
-      "max_score": 25,
-      "description": "Impact factor, peer-review rigor, and publisher reputation. Score conservatively if publisher is unidentified.",
+      "max_score": 15,
+      "min_score": -5,
+      "description": "Impact factor, peer-review rigor, and publisher reputation. Highly reputable journals earn up to +15 points; predatory publishers or known blacklisted journals penalize score down to -5.",
       "score_tiers": [
-        { "range": "22-25", "example": "Top-tier journal (impact factor > 10), e.g. NEJM, JAMA, Nature, The Lancet" },
-        { "range": "16-21", "example": "High-quality specialty journal (impact factor 4-10)" },
-        { "range": "9-15", "example": "Reputable mid-tier peer-reviewed journal (impact factor 1-4)" },
-        { "range": "3-8", "example": "Low-impact or lesser-known peer-reviewed journal" },
-        { "range": "0-2", "example": "Predatory or non-peer-reviewed journal, self-published, or unidentified publisher" }
+        { "range": "13 to 15", "example": "Top-tier journal (impact factor > 10), e.g. NEJM, JAMA, Nature, The Lancet" },
+        { "range": "9 to 12", "example": "High-quality specialty journal (impact factor 4-10)" },
+        { "range": "5 to 8", "example": "Reputable mid-tier peer-reviewed journal (impact factor 1-4)" },
+        { "range": "2 to 4", "example": "Low-impact or lesser-known peer-reviewed journal" },
+        { "range": "0 to 1", "example": "Neutral / unidentified publisher" },
+        { "range": "-1 to -5", "example": "Predatory journal, vanity press, unvetted pay-to-publish outlet, or fake peer review" }
       ]
     },
     {
       "id": "sample_methodology",
       "label": "Methodology & Sample",
-      "max_score": 30,
-      "description": "Sample size, diversity, human vs animal vs cell model, and overall statistical power implied by abstract.",
+      "max_score": 40,
+      "description": "Sample size, diversity, human vs animal vs cell model, number of included studies in reviews, and overall statistical power.",
       "score_tiers": [
-        { "range": "25-30", "example": "Large (200+), diverse human sample with adequate statistical power" },
-        { "range": "17-24", "example": "Moderate (50-199) human sample, reasonably diverse" },
-        { "range": "9-16", "example": "Small (<50) human sample, or narrow/homogeneous demographic" },
-        { "range": "3-8", "example": "Animal model study (any sample size)" },
-        { "range": "0-2", "example": "Cell/in-vitro study only, or sample details not reported" }
+        { "range": "33-40", "example": "Comprehensive systematic review (20+ studies) or very large (500+), diverse human sample" },
+        { "range": "24-32", "example": "Large (200-499) human sample, or solid review (10-19 studies)" },
+        { "range": "14-23", "example": "Moderate (50-199) human sample, or narrow demographic" },
+        { "range": "5-13", "example": "Small (<50) human sample, or animal model study" },
+        { "range": "0-4", "example": "Cell/in-vitro study only, single case report, or sample details omitted" }
       ]
     },
     {
       "id": "funding_bias",
       "label": "Funding & Commercial Bias",
-      "max_score": 10,
-      "min_score": -10,
-      "description": "Evaluates funding sources and commercial conflicts of interest. Independent funding earns positive points (up to +10); heavy industry influence or suspicious commercial motives penalize the score (down to -10).",
+      "max_score": 5,
+      "min_score": -15,
+      "description": "Evaluates funding sources and commercial conflicts of interest. Independent funding earns up to +5 points; undisclosed funding defaults to a neutral +2; heavy industry influence penalizes score (down to -15).",
       "score_tiers": [
-        { "range": "8 to 10", "example": "Fully independent funding (government/university grant), no conflicts of interest" },
-        { "range": "4 to 7", "example": "Mixed funding (partial industry support), conflicts disclosed and transparently managed" },
-        { "range": "0 to 3", "example": "Neutral / funding source undisclosed or not mentioned in available metadata" },
-        { "range": "-1 to -5", "example": "Primarily industry-funded or manufacturer-funded with author affiliations" },
-        { "range": "-6 to -10", "example": "Clear marketing bias, undisclosed industry funding, or suspicious commercial interference" }
+        { "range": "4 to 5", "example": "Fully independent funding (government/university grant), no conflicts of interest" },
+        { "range": "3", "example": "Mixed funding (partial industry support), conflicts disclosed and transparently managed" },
+        { "range": "2", "example": "Neutral / funding source undisclosed or not mentioned in available metadata" },
+        { "range": "-1 to -7", "example": "Primarily industry-funded or manufacturer-funded with author affiliations" },
+        { "range": "-8 to -15", "example": "Clear marketing bias, undisclosed industry funding, or suspicious commercial interference" }
       ]
     }
   ]

@@ -1,15 +1,20 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { View, Text, Pressable, StyleSheet, Alert } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 
 import { colors, spacing, typography } from '../theme';
 import { animateCardToggle } from '../utils/animations';
+import { computeAverageGrade } from '../utils/grades';
 import GradeBadge, { PLACEHOLDER_GRADE_VALUE } from './GradeBadge';
 import StudiesList from './StudiesList';
 import RecommendedUsesList from './RecommendedUsesList';
-import StudiesAnalysisBar from './StudiesAnalysisBar';
-import { fetchIngredientDetail, gradeIngredient } from '../services/api';
-import type { PaperConclusion, ResearchPaper } from '../services/api';
+import VerifiedResourcesList from './VerifiedResourcesList';
+import {
+  fetchIngredientDetail,
+  gradeIngredient,
+  PAPER_STATUS_DISCARDED_IRRELEVANT,
+} from '../services/api';
+import type { PaperConclusion, ResearchPaper, VerifiedResource } from '../services/api';
 
 /**
  * A single ingredient/nutrient row. This card is used in two different
@@ -72,6 +77,12 @@ export interface Ingredient {
    * "undefined = not loaded yet, lazily fetched on first expand"
    * convention as `papers` above. */
   conclusions?: PaperConclusion[];
+  /** Every stored VerifiedResource for this ingredient (Phase 7 — see
+   * backend/app/models/research.py), rendered by VerifiedResourcesList in
+   * the standalone variant's "Scientific information" block. Same
+   * "undefined = not loaded yet, lazily fetched on first expand"
+   * convention as `papers`/`conclusions` above. */
+  verified_resources?: VerifiedResource[];
 }
 
 /** Renders one generic placeholder info block (label + italic placeholder
@@ -216,6 +227,18 @@ const IngredientCard = React.forwardRef<View, IngredientCardProps>(
     const [conclusionsLoading, setConclusionsLoading] = useState(false);
     const [conclusionsError, setConclusionsError] = useState<string | null>(null);
 
+    // --- VerifiedResourcesList data (standalone variant's "Scientific
+    // information" block, Phase 7) — same undefined/loading/error/fetch-
+    // once-per-mount conventions as `papers`/`conclusions` above.
+    // Populated by the same GET /api/v1/ingredients/{id} call as both
+    // (one fetch, all three fields on the response) — see the shared
+    // effect below.
+    const [verifiedResources, setVerifiedResources] = useState<VerifiedResource[] | undefined>(
+      ingredient.verified_resources
+    );
+    const [verifiedResourcesLoading, setVerifiedResourcesLoading] = useState(false);
+    const [verifiedResourcesError, setVerifiedResourcesError] = useState<string | null>(null);
+
     useEffect(() => {
       if (variant !== 'standalone' || !isExpanded || papersFetchAttemptedRef.current) {
         return;
@@ -225,6 +248,8 @@ const IngredientCard = React.forwardRef<View, IngredientCardProps>(
       setPapersError(null);
       setConclusionsLoading(true);
       setConclusionsError(null);
+      setVerifiedResourcesLoading(true);
+      setVerifiedResourcesError(null);
 
       let cancelled = false;
       fetchIngredientDetail(ingredient.id)
@@ -232,6 +257,7 @@ const IngredientCard = React.forwardRef<View, IngredientCardProps>(
           if (!cancelled) {
             setPapers(detail.papers);
             setConclusions(detail.conclusions);
+            setVerifiedResources(detail.verified_resources);
           }
         })
         .catch((error) => {
@@ -240,12 +266,14 @@ const IngredientCard = React.forwardRef<View, IngredientCardProps>(
               error instanceof Error ? error.message : 'Failed to load studies.';
             setPapersError(message);
             setConclusionsError(message);
+            setVerifiedResourcesError(message);
           }
         })
         .finally(() => {
           if (!cancelled) {
             setPapersLoading(false);
             setConclusionsLoading(false);
+            setVerifiedResourcesLoading(false);
           }
         });
 
@@ -272,22 +300,34 @@ const IngredientCard = React.forwardRef<View, IngredientCardProps>(
           papersFetchAttemptedRef.current = true;
 
           // Unlike `papers`, GradeIngredientResponse deliberately doesn't
-          // include `conclusions` (see backend/app/schemas/research.py) —
-          // the Phase 5 pipeline may have just synthesized new/updated
-          // ones as part of this grade request, so re-fetch ingredient
-          // detail once more to pick them up rather than leaving
-          // RecommendedUsesList showing stale (or empty) data.
+          // include `conclusions`/`verified_resources` (see
+          // backend/app/schemas/research.py) — the Phase 5 pipeline may
+          // have just synthesized new/updated conclusions, and the Phase 7
+          // resource lookup may have just found new official reference
+          // links, as part of this same grade request, so re-fetch
+          // ingredient detail once more to pick both up rather than
+          // leaving RecommendedUsesList/VerifiedResourcesList showing
+          // stale (or empty) data.
           setConclusionsLoading(true);
           setConclusionsError(null);
+          setVerifiedResourcesLoading(true);
+          setVerifiedResourcesError(null);
           fetchIngredientDetail(ingredient.id)
-            .then((detail) => setConclusions(detail.conclusions))
+            .then((detail) => {
+              setConclusions(detail.conclusions);
+              setVerifiedResources(detail.verified_resources);
+            })
             .catch(() => {
               // Best-effort supplementary fetch — the grade request itself
               // already succeeded (papers/grade above are current), so a
-              // failure here just means conclusions stay whatever they
-              // were before rather than surfacing a second error alert.
+              // failure here just means conclusions/verified resources
+              // stay whatever they were before rather than surfacing a
+              // second error alert.
             })
-            .finally(() => setConclusionsLoading(false));
+            .finally(() => {
+              setConclusionsLoading(false);
+              setVerifiedResourcesLoading(false);
+            });
         })
         .catch((error) => {
           const message =
@@ -306,12 +346,66 @@ const IngredientCard = React.forwardRef<View, IngredientCardProps>(
      * component's `onPaperGraded` prop doc), so this is the one place
      * that actually needs to update — StudiesList re-derives its sorted/
      * paginated view from this prop automatically once it changes.
+     *
+     * Phase 6: on-demand grading can determine a paper is actually
+     * irrelevant to this ingredient (`status ===
+     * PAPER_STATUS_DISCARDED_IRRELEVANT`). Every other paper-loading path
+     * (fetchIngredientDetail, gradeIngredient) already excludes discarded
+     * papers server-side (see app/services/search.py::
+     * get_ingredient_papers), but this on-demand endpoint returns the
+     * just-graded paper regardless of outcome — so a discarded paper is
+     * filtered OUT of local state here instead of replaced in place,
+     * keeping StudiesList/StudiesAnalysisBar consistent with what a
+     * fresh fetch would show.
      */
     const handlePaperGraded = useCallback((updatedPaper: ResearchPaper) => {
-      setPapers((current) =>
-        current?.map((paper) => (paper.id === updatedPaper.id ? updatedPaper : paper))
-      );
+      setPapers((current) => {
+        if (updatedPaper.status === PAPER_STATUS_DISCARDED_IRRELEVANT) {
+          return current?.filter((paper) => paper.id !== updatedPaper.id);
+        }
+        return current?.map((paper) => (paper.id === updatedPaper.id ? updatedPaper : paper));
+      });
     }, []);
+
+    /** One-sentence synthesis shown directly under the "Scientific
+     * Information" title (Scientific Information redesign spec) — e.g.
+     * "Analyzed 12 studies across databases. Average score: B (78/100).
+     * Primary consensus indicates: '...'" Entirely client-side/derived
+     * from data already fetched for StudiesList/RecommendedUsesList
+     * (no new backend endpoint) — the average-grade math is the same
+     * band table StudiesAnalysisBar.tsx used to compute before that
+     * standalone metrics block was removed per this redesign (see
+     * `computeAverageGrade` in utils/grades.ts, where that logic now
+     * lives). `conclusions[0]` is the top-confidence synthesized claim —
+     * `IngredientDetailResponse.conclusions` is documented as already
+     * sorted highest-confidence-first by the backend (see api.ts), so no
+     * re-sort is needed here. */
+    const scientificSummary = useMemo(() => {
+      if (papers === undefined) {
+        return 'Loading scientific analysis...';
+      }
+      const studyCount = papers.length;
+      if (studyCount === 0) {
+        return "No studies analyzed yet — tap this ingredient's grade badge above to run the research pipeline.";
+      }
+
+      const { averageGrade, averageScore } = computeAverageGrade(
+        papers.map((paper) => ({ grade: paper.grade, score: paper.grade_score }))
+      );
+      const scoreText =
+        averageGrade && averageScore !== null
+          ? `Average score: ${averageGrade} (${averageScore}/100).`
+          : 'Grading in progress — no average score yet.';
+
+      const topConclusion = conclusions && conclusions.length > 0 ? conclusions[0] : null;
+      const consensusText = topConclusion
+        ? `Primary consensus indicates: "${topConclusion.claim_summary}"`
+        : 'No synthesized consensus available yet.';
+
+      return `Analyzed ${studyCount} ${
+        studyCount === 1 ? 'study' : 'studies'
+      } across databases. ${scoreText} ${consensusText}`;
+    }, [papers, conclusions]);
 
     return (
       <View ref={ref} style={[styles.card, isExpanded && styles.cardExpanded]}>
@@ -363,17 +457,20 @@ const IngredientCard = React.forwardRef<View, IngredientCardProps>(
           <View style={styles.expandedSection}>
             {STANDALONE_INFO_BLOCKS_BEFORE_SCIENCE.map(renderPlaceholderBlock)}
 
-            {/* "Scientific information" — redesigned Phase 5 section:
-                header + overview placeholder, RecommendedUsesList
-                (conclusions graded C+), StudiesAnalysisBar, then the
-                existing StudiesList retained unchanged at the bottom. */}
-            <View style={styles.scienceSection}>
-              <Text style={[styles.standaloneInfoLabel, styles.expandedTextColor]}>
-                Scientific information
-              </Text>
-              <Text style={[styles.standaloneInfoText, styles.expandedTextColor]}>
-                this is a placeholder text
-              </Text>
+            {/* "Scientific Information" — redesigned, unified section:
+                bordered outer card (#E85D04) with a centered title and a
+                synthesized one-sentence summary, wrapping the three
+                collapsible list panels (RecommendedUsesList,
+                VerifiedResourcesList, StudiesList — each now shares the
+                same CollapsibleSection border/toggle chrome). The old
+                standalone "Studies Analisis" metrics block
+                (StudiesAnalysisBar) has been removed entirely — its
+                total-studies count now lives in StudiesList's own title
+                bar ("List of Studies (Total: N)"), and its average-grade
+                math now feeds `scientificSummary` above instead. */}
+            <View style={styles.scienceSectionOuter}>
+              <Text style={styles.scienceSectionTitle}>Scientific Information</Text>
+              <Text style={styles.scienceSectionSummary}>{scientificSummary}</Text>
 
               <RecommendedUsesList
                 conclusions={conclusions}
@@ -381,12 +478,12 @@ const IngredientCard = React.forwardRef<View, IngredientCardProps>(
                 errorMessage={conclusionsError}
               />
 
-              <StudiesAnalysisBar papers={papers} />
+              <VerifiedResourcesList
+                resources={verifiedResources}
+                isLoading={verifiedResourcesLoading}
+                errorMessage={verifiedResourcesError}
+              />
 
-              {/* StudiesList renders its own "LIST OF STUDIES" header and
-                  background/padding container, retained here exactly as
-                  before — only its position within the wider Scientific
-                  information section changed. */}
               <StudiesList
                 papers={papers}
                 isLoading={papersLoading}
@@ -527,14 +624,37 @@ const styles = StyleSheet.create({
     gap: spacing.md,
   },
   // --- Standalone-variant expanded body (stacked info blocks +
-  // "Scientific information" composite section) ---
-  // Wraps the whole "Scientific information" section (header + overview
-  // text + RecommendedUsesList + StudiesAnalysisBar + StudiesList) — no
-  // background/border of its own (unlike standaloneInfoBlock below),
-  // since its three sub-widgets already carry their own container
-  // styling; this just spaces them out consistently.
-  scienceSection: {
+  // "Scientific Information" composite section) ---
+  // Outer bordered card wrapping the whole "Scientific Information"
+  // section (title + summary sentence + the three collapsible list
+  // panels) — per spec: `1px solid #E85D04` / `12px` radius / `16px`
+  // padding. Deliberately the only place in this section that uses the
+  // bold orange border; each list panel inside gets its own subtler
+  // `colors.neutralBorder` (#E0E0E0) via CollapsibleSection instead, so
+  // the two border colors read as "outer section" vs. "inner list" at a
+  // glance rather than competing.
+  scienceSectionOuter: {
+    borderWidth: 1,
+    borderColor: colors.orange,
+    borderRadius: 12,
+    padding: spacing.md,
     gap: spacing.sm,
+  },
+  // Centered, enlarged section title — per spec.
+  scienceSectionTitle: {
+    textAlign: 'center',
+    fontSize: typography.sectionTitle,
+    fontWeight: 'bold',
+    color: colors.orange,
+  },
+  // Synthesized one-sentence summary directly under the title — see
+  // `scientificSummary` above for how this text is built.
+  scienceSectionSummary: {
+    textAlign: 'center',
+    fontSize: typography.resultCardLabel,
+    fontStyle: 'italic',
+    color: colors.orange,
+    lineHeight: 18,
   },
   standaloneInfoBlock: {
     backgroundColor: `${colors.olive}18`,

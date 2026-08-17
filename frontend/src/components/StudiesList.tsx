@@ -14,9 +14,12 @@ import { Ionicons } from '@expo/vector-icons';
 
 import { colors, spacing, typography } from '../theme';
 import { gradePaper } from '../services/api';
-import type { PaperGrade, ResearchPaper } from '../services/api';
-import { GRADE_COLORS, getGradeRank, isPaperGrade } from '../utils/grades';
+import type { ResearchPaper } from '../services/api';
+import { getGradeRank, isPaperGrade } from '../utils/grades';
 import Pagination from './Pagination';
+import CollapsibleSection from './CollapsibleSection';
+import GradeCircleBadge, { GRADE_CIRCLE_SIZE } from './GradeCircleBadge';
+import ExternalLinkIconButton from './ExternalLinkIconButton';
 
 /** Fill color for the "(-)" ungraded badge — per spec, a neutral gray
  * distinct from both the palette (no gray in theme.ts) and every
@@ -24,7 +27,8 @@ import Pagination from './Pagination';
  * rather than implying any particular quality. */
 const UNGRADED_BADGE_COLOR = '#6C757D';
 
-/** Max rows shown per page — per spec. */
+/** Max rows shown per page — "Maximum 5 items per page across all
+ * lists" (Scientific Information redesign spec). */
 const PAGE_SIZE = 5;
 
 /**
@@ -63,51 +67,6 @@ function sortPapersByGrade(papers: readonly ResearchPaper[]): ResearchPaper[] {
     })
     .map(({ paper }) => paper);
 }
-
-interface PaperGradeBadgeProps {
-  grade: PaperGrade;
-  /** Omit entirely to render a plain, non-pressable badge — used for the
-   * Rubric Breakdown modal's header, where the badge is already what got
-   * tapped to open that modal and re-wrapping it in another Pressable
-   * would just announce a button that does nothing to screen readers. */
-  onPress?: () => void;
-  /** Larger variant used in the Rubric Breakdown modal's header — the
-   * per-row badge stays small (26px) so it doesn't crowd the title. */
-  large?: boolean;
-}
-
-/** Round letter-grade badge — tapping it (per-row usage) opens the
- * Rubric Breakdown modal for that paper. A plain Pressable + onPress (no
- * findNodeHandle or other ref-based DOM API), same as every other tap
- * target in this component, so it works identically on web and native. */
-const PaperGradeBadge: React.FC<PaperGradeBadgeProps> = ({ grade, onPress, large = false }) => {
-  const badgeStyle = [
-    styles.gradeBadge,
-    large ? styles.gradeBadgeLarge : null,
-    { backgroundColor: GRADE_COLORS[grade] },
-  ];
-  const textStyle = [styles.gradeBadgeText, large && styles.gradeBadgeTextLarge];
-
-  if (!onPress) {
-    return (
-      <View style={badgeStyle}>
-        <Text style={textStyle}>{grade}</Text>
-      </View>
-    );
-  }
-
-  return (
-    <Pressable
-      onPress={onPress}
-      accessibilityRole="button"
-      accessibilityLabel={`View rubric breakdown — grade ${grade}`}
-      hitSlop={6}
-      style={badgeStyle}
-    >
-      <Text style={textStyle}>{grade}</Text>
-    </Pressable>
-  );
-};
 
 export interface StudiesListProps {
   /** Every stored ResearchPaper for this ingredient (unpaginated) — see
@@ -150,9 +109,15 @@ function formatMetaLine(
 }
 
 /**
- * Paginated "List of Studies" panel — replaces the old placeholder text
- * in standalone IngredientCard's "Science Info" block with real,
- * database-backed ResearchPaper rows.
+ * Paginated "List of Studies" panel — one of the three unified,
+ * collapsible list panels inside IngredientCard's "Scientific
+ * Information" section (see CollapsibleSection.tsx for the shared
+ * border/toggle chrome). Of the three, this one already matched the
+ * unified spec almost exactly before the redesign (PAGE_SIZE 5, the
+ * two-modal grade-badge-vs-info-icon split) — the redesign only added
+ * the collapsible wrapper, the "(Total: N)" title suffix, and renamed
+ * this component's modal-selection state to the spec's
+ * `activeRubricModalItem`/`activeInfoModalItem` naming.
  *
  * Pagination is entirely local/client-side (all papers for the
  * ingredient are fetched once by the parent and handed to this
@@ -176,11 +141,15 @@ const StudiesList: React.FC<StudiesListProps> = ({
   onPaperGraded,
 }) => {
   const [page, setPage] = useState(0);
-  const [activePaper, setActivePaper] = useState<ResearchPaper | null>(null);
-  // Separate from `activePaper` above (the (i) info modal) — the Rubric
-  // Breakdown modal is a distinct pop-up triggered by tapping the round
-  // grade badge, not the info icon.
-  const [activeRubricPaper, setActiveRubricPaper] = useState<ResearchPaper | null>(null);
+  // General Info Modal (triggered by the "(i)" icon) — Title, authors,
+  // publication date, journal (approximated via source_domain — this
+  // app doesn't persist a separate journal-name column, see below),
+  // full abstract, and Matched Keywords.
+  const [activeInfoModalItem, setActiveInfoModalItem] = useState<ResearchPaper | null>(null);
+  // Rubric & Comments Modal (triggered by tapping the round grade badge)
+  // — total score/grade, the paper rubric's four categories, and the AI
+  // reviewer's summary note.
+  const [activeRubricModalItem, setActiveRubricModalItem] = useState<ResearchPaper | null>(null);
   // Id of the paper currently being graded on-demand (tapped "(-)"
   // badge), or null if none is in flight. A single id rather than a Set
   // is enough — the badge is disabled the moment it's tapped (see
@@ -254,10 +223,10 @@ const StudiesList: React.FC<StudiesListProps> = ({
     [gradingPaperId, onPaperGraded]
   );
 
-  return (
-    <View style={styles.container}>
-      <Text style={styles.header}>LIST OF STUDIES</Text>
+  const totalCount = sortedPapers?.length ?? 0;
 
+  return (
+    <CollapsibleSection title={`List of Studies (Total: ${totalCount})`}>
       {isLoading && !sortedPapers ? (
         <Text style={styles.statusText}>Loading studies...</Text>
       ) : errorMessage ? (
@@ -282,9 +251,9 @@ const StudiesList: React.FC<StudiesListProps> = ({
                 </Text>
                 <View style={styles.rowActions}>
                   {isPaperGrade(paper.grade) ? (
-                    <PaperGradeBadge
+                    <GradeCircleBadge
                       grade={paper.grade}
-                      onPress={() => setActiveRubricPaper(paper)}
+                      onPress={() => setActiveRubricModalItem(paper)}
                     />
                   ) : gradingPaperId === paper.id ? (
                     <View
@@ -307,7 +276,7 @@ const StudiesList: React.FC<StudiesListProps> = ({
                   )}
                   <Pressable
                     style={styles.iconButton}
-                    onPress={() => setActivePaper(paper)}
+                    onPress={() => setActiveInfoModalItem(paper)}
                     accessibilityRole="button"
                     accessibilityLabel={`View details for ${paper.title}`}
                     hitSlop={6}
@@ -318,15 +287,10 @@ const StudiesList: React.FC<StudiesListProps> = ({
                       color={colors.orange}
                     />
                   </Pressable>
-                  <Pressable
-                    style={styles.iconButton}
-                    onPress={() => handleOpenSource(paper)}
-                    accessibilityRole="button"
+                  <ExternalLinkIconButton
+                    url={paper.source_url}
                     accessibilityLabel={`Open original source for ${paper.title}`}
-                    hitSlop={6}
-                  >
-                    <Ionicons name="globe-outline" size={20} color={colors.orange} />
-                  </Pressable>
+                  />
                 </View>
               </View>
             ))}
@@ -337,23 +301,23 @@ const StudiesList: React.FC<StudiesListProps> = ({
       )}
 
       <Modal
-        visible={activePaper !== null}
+        visible={activeInfoModalItem !== null}
         transparent
         animationType="fade"
-        onRequestClose={() => setActivePaper(null)}
+        onRequestClose={() => setActiveInfoModalItem(null)}
       >
-        <Pressable style={styles.modalBackdrop} onPress={() => setActivePaper(null)}>
+        <Pressable style={styles.modalBackdrop} onPress={() => setActiveInfoModalItem(null)}>
           {/* Swallow taps inside the card so they don't bubble to the
               backdrop Pressable and close the modal while reading it. */}
           <Pressable style={styles.modalCard} onPress={(event) => event.stopPropagation()}>
-            {activePaper && (
+            {activeInfoModalItem && (
               <>
                 <View style={styles.modalHeaderRow}>
                   <Text style={styles.modalTitle} numberOfLines={4}>
-                    {activePaper.title}
+                    {activeInfoModalItem.title}
                   </Text>
                   <Pressable
-                    onPress={() => setActivePaper(null)}
+                    onPress={() => setActiveInfoModalItem(null)}
                     accessibilityRole="button"
                     accessibilityLabel="Close"
                     hitSlop={8}
@@ -362,19 +326,37 @@ const StudiesList: React.FC<StudiesListProps> = ({
                   </Pressable>
                 </View>
 
+                {/* "Authors, publication date, journal" — this app has no
+                    dedicated `journal` column on ResearchPaper (never
+                    persisted at ingestion time), so `source_domain` is
+                    shown as the closest available stand-in rather than
+                    fabricating a journal name. */}
                 <Text style={styles.modalMeta}>
                   {formatMetaLine(
-                    activePaper.authors,
-                    activePaper.publication_date,
-                    activePaper.source_domain
+                    activeInfoModalItem.authors,
+                    activeInfoModalItem.publication_date,
+                    activeInfoModalItem.source_domain
                   ) || 'No metadata available.'}
                 </Text>
 
-                {activePaper.keywords.length > 0 && (
+                {/* "Sample size" — not a raw persisted field; the closest
+                    available data is the rubric evaluation's own
+                    sample_info free-text description, shown here only
+                    when that grading has actually happened. */}
+                {activeInfoModalItem.rubric_evaluation?.sample_info && (
+                  <View style={styles.metaFieldBlock}>
+                    <Text style={styles.metaFieldLabel}>Sample</Text>
+                    <Text style={styles.metaFieldValue}>
+                      {activeInfoModalItem.rubric_evaluation.sample_info}
+                    </Text>
+                  </View>
+                )}
+
+                {activeInfoModalItem.keywords.length > 0 && (
                   <View style={styles.keywordSection}>
                     <Text style={styles.keywordSectionLabel}>Matched Keywords</Text>
                     <View style={styles.keywordPillRow}>
-                      {activePaper.keywords.map((keyword) => (
+                      {activeInfoModalItem.keywords.map((keyword) => (
                         <View key={keyword} style={styles.keywordPill}>
                           <Text style={styles.keywordPillText}>{keyword}</Text>
                         </View>
@@ -385,13 +367,13 @@ const StudiesList: React.FC<StudiesListProps> = ({
 
                 <ScrollView style={styles.modalAbstractScroll}>
                   <Text style={styles.modalAbstract}>
-                    {activePaper.abstract ?? 'No abstract available.'}
+                    {activeInfoModalItem.abstract ?? 'No abstract available.'}
                   </Text>
                 </ScrollView>
 
                 <Pressable
                   style={styles.modalLinkButton}
-                  onPress={() => handleOpenSource(activePaper)}
+                  onPress={() => handleOpenSource(activeInfoModalItem)}
                   accessibilityRole="button"
                   accessibilityLabel="Open original source"
                 >
@@ -405,23 +387,23 @@ const StudiesList: React.FC<StudiesListProps> = ({
       </Modal>
 
       <Modal
-        visible={activeRubricPaper !== null}
+        visible={activeRubricModalItem !== null}
         transparent
         animationType="fade"
-        onRequestClose={() => setActiveRubricPaper(null)}
+        onRequestClose={() => setActiveRubricModalItem(null)}
       >
-        <Pressable style={styles.modalBackdrop} onPress={() => setActiveRubricPaper(null)}>
+        <Pressable style={styles.modalBackdrop} onPress={() => setActiveRubricModalItem(null)}>
           <Pressable style={styles.modalCard} onPress={(event) => event.stopPropagation()}>
-            {activeRubricPaper &&
-              isPaperGrade(activeRubricPaper.grade) &&
-              activeRubricPaper.rubric_evaluation && (
+            {activeRubricModalItem &&
+              isPaperGrade(activeRubricModalItem.grade) &&
+              activeRubricModalItem.rubric_evaluation && (
                 <>
                   <View style={styles.modalHeaderRow}>
                     <Text style={styles.modalTitle} numberOfLines={3}>
-                      {activeRubricPaper.title}
+                      {activeRubricModalItem.title}
                     </Text>
                     <Pressable
-                      onPress={() => setActiveRubricPaper(null)}
+                      onPress={() => setActiveRubricModalItem(null)}
                       accessibilityRole="button"
                       accessibilityLabel="Close"
                       hitSlop={8}
@@ -431,54 +413,55 @@ const StudiesList: React.FC<StudiesListProps> = ({
                   </View>
 
                   <View style={styles.rubricScoreRow}>
-                    <PaperGradeBadge grade={activeRubricPaper.grade} large />
+                    <GradeCircleBadge grade={activeRubricModalItem.grade} large />
                     <Text style={styles.rubricTotalScore}>
-                      {activeRubricPaper.rubric_evaluation.total_score} / 100
+                      {activeRubricModalItem.rubric_evaluation.total_score} / 100
                     </Text>
                   </View>
 
                   <ScrollView style={styles.modalAbstractScroll}>
                     <View style={styles.rubricSection}>
                       <Text style={styles.rubricSectionLabel}>
-                        Study Design ({activeRubricPaper.rubric_evaluation.study_type_score} pts)
+                        Study Design ({activeRubricModalItem.rubric_evaluation.study_type_score} pts)
                       </Text>
                       <Text style={styles.rubricSectionValue}>
-                        {activeRubricPaper.rubric_evaluation.study_type}
+                        {activeRubricModalItem.rubric_evaluation.study_type}
                       </Text>
                     </View>
 
                     <View style={styles.rubricSection}>
                       <Text style={styles.rubricSectionLabel}>
-                        Journal Rigor ({activeRubricPaper.rubric_evaluation.journal_score} pts)
+                        Journal Rigor ({activeRubricModalItem.rubric_evaluation.journal_score} pts)
                       </Text>
                       <Text style={styles.rubricSectionValue}>
-                        {activeRubricPaper.rubric_evaluation.journal_reputation}
+                        {activeRubricModalItem.rubric_evaluation.journal_reputation}
                       </Text>
                     </View>
 
                     <View style={styles.rubricSection}>
                       <Text style={styles.rubricSectionLabel}>
-                        Methodology &amp; Sample ({activeRubricPaper.rubric_evaluation.sample_score}{' '}
+                        Methodology &amp; Sample (
+                        {activeRubricModalItem.rubric_evaluation.sample_score} pts)
+                      </Text>
+                      <Text style={styles.rubricSectionValue}>
+                        {activeRubricModalItem.rubric_evaluation.sample_info}
+                      </Text>
+                    </View>
+
+                    <View style={styles.rubricSection}>
+                      <Text style={styles.rubricSectionLabel}>
+                        Funding &amp; Bias ({activeRubricModalItem.rubric_evaluation.funding_score}{' '}
                         pts)
                       </Text>
                       <Text style={styles.rubricSectionValue}>
-                        {activeRubricPaper.rubric_evaluation.sample_info}
-                      </Text>
-                    </View>
-
-                    <View style={styles.rubricSection}>
-                      <Text style={styles.rubricSectionLabel}>
-                        Funding &amp; Bias ({activeRubricPaper.rubric_evaluation.funding_score} pts)
-                      </Text>
-                      <Text style={styles.rubricSectionValue}>
-                        {activeRubricPaper.rubric_evaluation.funding_status}
+                        {activeRubricModalItem.rubric_evaluation.funding_status}
                       </Text>
                     </View>
 
                     <View style={[styles.rubricSection, styles.rubricSectionLast]}>
                       <Text style={styles.rubricSectionLabel}>AI Summary Note</Text>
                       <Text style={[styles.rubricSectionValue, styles.rubricSummaryText]}>
-                        {activeRubricPaper.rubric_evaluation.summary_notes}
+                        {activeRubricModalItem.rubric_evaluation.summary_notes}
                       </Text>
                     </View>
                   </ScrollView>
@@ -487,24 +470,11 @@ const StudiesList: React.FC<StudiesListProps> = ({
           </Pressable>
         </Pressable>
       </Modal>
-    </View>
+    </CollapsibleSection>
   );
 };
 
 const styles = StyleSheet.create({
-  container: {
-    backgroundColor: `${colors.olive}18`,
-    borderRadius: 8,
-    padding: spacing.md,
-    gap: spacing.sm,
-  },
-  header: {
-    fontSize: typography.resultCardLabel,
-    fontWeight: '700',
-    color: colors.orange,
-    textAlign: 'center',
-    letterSpacing: 0.5,
-  },
   statusText: {
     fontSize: typography.resultCardLabel,
     fontStyle: 'italic',
@@ -524,9 +494,8 @@ const styles = StyleSheet.create({
     borderStyle: 'dashed',
     borderBottomWidth: 1,
     // Palette orange rather than a neutral gray — this component only
-    // ever renders inside an expanded card (see the docstring above), so
-    // every visible line/border here follows the same "orange, not
-    // green" rule as the text/icons.
+    // ever renders inside an expanded card, so every visible line/border
+    // here follows the same "orange, not green" rule as the text/icons.
     borderColor: colors.orange,
   },
   rowLast: {
@@ -545,36 +514,22 @@ const styles = StyleSheet.create({
   iconButton: {
     padding: spacing.xs,
   },
-  // --- Round letter-grade badge (per-row + Rubric Breakdown header) ---
+  // Ungraded/loading badge — matches GradeCircleBadge's own footprint
+  // exactly (same GRADE_CIRCLE_SIZE) so the row doesn't reflow when a
+  // paper transitions between the two states.
   gradeBadge: {
-    width: 26,
-    height: 26,
-    borderRadius: 13,
+    width: GRADE_CIRCLE_SIZE,
+    height: GRADE_CIRCLE_SIZE,
+    borderRadius: GRADE_CIRCLE_SIZE / 2,
     alignItems: 'center',
     justifyContent: 'center',
-    // Border stays the active-theme orange regardless of the badge's own
-    // grade color — the fill is what carries the grade signal, the
-    // border is what ties it visually to the rest of the expanded
-    // card's orange chrome (icons, dividers, pagination), per spec.
     borderWidth: 1.5,
     borderColor: colors.orange,
-  },
-  gradeBadgeLarge: {
-    width: 44,
-    height: 44,
-    borderRadius: 22,
-    borderWidth: 2,
   },
   gradeBadgeText: {
     fontSize: 12,
     fontWeight: '700',
-    // White reads with sufficient contrast against all five grade
-    // colors (they're all fairly saturated/mid-to-dark) without needing
-    // a per-grade text color lookup.
     color: '#FFFFFF',
-  },
-  gradeBadgeTextLarge: {
-    fontSize: 18,
   },
   // Gray fill for an ungraded paper's tappable "(-)" badge — same
   // circular shape/orange border as a lettered badge (per spec: "Maintain
@@ -626,6 +581,19 @@ const styles = StyleSheet.create({
     fontStyle: 'italic',
     color: `${colors.orange}CC`,
   },
+  metaFieldBlock: {
+    gap: 2,
+  },
+  metaFieldLabel: {
+    fontSize: typography.resultCardLabel,
+    fontWeight: '700',
+    color: colors.orange,
+  },
+  metaFieldValue: {
+    fontSize: typography.resultCardLabel,
+    color: colors.orange,
+    lineHeight: 19,
+  },
   // --- "Matched Keywords" pills (info modal) ---
   keywordSection: {
     gap: spacing.xs,
@@ -661,7 +629,7 @@ const styles = StyleSheet.create({
     color: colors.orange,
     lineHeight: 19,
   },
-  // --- Rubric Breakdown modal ---
+  // --- Rubric & Comments modal ---
   rubricScoreRow: {
     flexDirection: 'row',
     alignItems: 'center',
