@@ -15,7 +15,7 @@ import { Ionicons } from '@expo/vector-icons';
 import { colors, spacing, typography } from '../theme';
 import { gradePaper } from '../services/api';
 import type { ResearchPaper } from '../services/api';
-import { getGradeRank, isPaperGrade } from '../utils/grades';
+import { isPaperGrade, sortByGradeThenScore } from '../utils/grades';
 import Pagination from './Pagination';
 import CollapsibleSection from './CollapsibleSection';
 import GradeCircleBadge, { GRADE_CIRCLE_SIZE } from './GradeCircleBadge';
@@ -30,43 +30,6 @@ const UNGRADED_BADGE_COLOR = '#6C757D';
 /** Max rows shown per page — "Maximum 5 items per page across all
  * lists" (Scientific Information redesign spec). */
 const PAGE_SIZE = 5;
-
-/**
- * Sorts papers by grade rank (A -> E, ungraded last). Papers sharing the
- * same letter grade are tie-broken by `grade_score` descending; ungraded
- * papers (which share UNGRADED_RANK and have no score to break ties
- * with) keep their original relative order instead.
- *
- * Pure and side-effect-free — returns a new array, never mutates
- * `papers` — so it's safe to call from a `useMemo` on every render
- * without needing to guard against re-sorting an already-sorted array
- * differently. Explicitly threads each paper's original index through
- * as the final tie-break (rather than relying on `Array.prototype.sort`
- * being stable, which is guaranteed by the JS spec since ES2019 / on
- * Hermes but easy to get wrong if this function is ever ported or the
- * comparator refactored) so "preserve original retrieval order" for
- * ungraded papers holds unambiguously.
- */
-function sortPapersByGrade(papers: readonly ResearchPaper[]): ResearchPaper[] {
-  return papers
-    .map((paper, index) => ({ paper, index }))
-    .sort((a, b) => {
-      const rankDiff = getGradeRank(a.paper.grade) - getGradeRank(b.paper.grade);
-      if (rankDiff !== 0) {
-        return rankDiff;
-      }
-      if (isPaperGrade(a.paper.grade)) {
-        // Both share a real letter grade (same rank) — higher score first.
-        const scoreDiff = (b.paper.grade_score ?? 0) - (a.paper.grade_score ?? 0);
-        if (scoreDiff !== 0) {
-          return scoreDiff;
-        }
-      }
-      // Equal score, or both ungraded: preserve original order.
-      return a.index - b.index;
-    })
-    .map(({ paper }) => paper);
-}
 
 export interface StudiesListProps {
   /** Every stored ResearchPaper for this ingredient (unpaginated) — see
@@ -159,13 +122,16 @@ const StudiesList: React.FC<StudiesListProps> = ({
   const [gradingPaperId, setGradingPaperId] = useState<number | null>(null);
 
   // Sorted (grade rank, then score, then original order — see
-  // sortPapersByGrade) once per `papers` change, *before* pagination
-  // chunking below, per spec. Every downstream computation (page count,
-  // page slicing, empty-state check) reads from this, not the raw
-  // `papers` prop, so a re-sort (e.g. after grading one paper on demand)
-  // is immediately reflected in which page a given paper lands on.
+  // utils/grades.ts::sortByGradeThenScore) once per `papers` change,
+  // *before* pagination chunking below, per spec. Every downstream
+  // computation (page count, page slicing, empty-state check) reads from
+  // this, not the raw `papers` prop, so a re-sort (e.g. after grading one
+  // paper on demand) is immediately reflected in which page a given
+  // paper lands on.
   const sortedPapers = useMemo<ResearchPaper[] | undefined>(() => {
-    return papers ? sortPapersByGrade(papers) : undefined;
+    return papers
+      ? sortByGradeThenScore(papers, (paper) => paper.grade, (paper) => paper.grade_score)
+      : undefined;
   }, [papers]);
 
   const totalPages = sortedPapers
@@ -370,6 +336,30 @@ const StudiesList: React.FC<StudiesListProps> = ({
                     {activeInfoModalItem.abstract ?? 'No abstract available.'}
                   </Text>
                 </ScrollView>
+
+                {/* Phase 19 — 2-4 short, factual findings extracted by
+                    the same Gemini call that grades this paper (see
+                    ResearchPaper.extracted_conclusions's docstring in
+                    backend/app/models/research.py). Null/empty renders an
+                    honest fallback rather than hiding the section, so the
+                    frontend never silently implies extraction ran when it
+                    hasn't. */}
+                <View style={styles.extractedConclusionsSection}>
+                  <Text style={styles.extractedConclusionsLabel}>Extracted Conclusions</Text>
+                  {activeInfoModalItem.extracted_conclusions &&
+                  activeInfoModalItem.extracted_conclusions.length > 0 ? (
+                    activeInfoModalItem.extracted_conclusions.map((conclusion, index) => (
+                      <View key={index} style={styles.extractedConclusionRow}>
+                        <Text style={styles.extractedConclusionBullet}>{'•'}</Text>
+                        <Text style={styles.extractedConclusionText}>{conclusion}</Text>
+                      </View>
+                    ))
+                  ) : (
+                    <Text style={styles.extractedConclusionsEmpty}>
+                      No specific conclusions extracted for this source yet.
+                    </Text>
+                  )}
+                </View>
 
                 <Pressable
                   style={styles.modalLinkButton}
@@ -628,6 +618,34 @@ const styles = StyleSheet.create({
     fontSize: typography.resultCardLabel,
     color: colors.orange,
     lineHeight: 19,
+  },
+  // --- "Extracted Conclusions" (info modal, Phase 19) ---
+  extractedConclusionsSection: {
+    gap: spacing.xs,
+  },
+  extractedConclusionsLabel: {
+    fontSize: typography.resultCardLabel,
+    fontWeight: '700',
+    color: colors.orange,
+  },
+  extractedConclusionRow: {
+    flexDirection: 'row',
+    gap: 6,
+  },
+  extractedConclusionBullet: {
+    fontSize: typography.resultCardLabel,
+    color: colors.orange,
+  },
+  extractedConclusionText: {
+    flex: 1,
+    fontSize: typography.resultCardLabel,
+    color: colors.orange,
+    lineHeight: 19,
+  },
+  extractedConclusionsEmpty: {
+    fontSize: typography.resultCardLabel,
+    fontStyle: 'italic',
+    color: `${colors.orange}99`,
   },
   // --- Rubric & Comments modal ---
   rubricScoreRow: {

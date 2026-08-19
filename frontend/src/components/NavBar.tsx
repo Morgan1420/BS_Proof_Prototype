@@ -19,6 +19,29 @@ import { resetDatabase } from '../services/api';
  * in src/App.tsx so it stays mounted across every screen. Uses the
  * imperative `navigateTo` helper (see navigation/navigationRef.ts) since
  * it lives outside the navigator's own screen tree.
+ *
+ * **Always visible — no hide-on-scroll.** A Phase 12 pass previously
+ * added scroll-driven show/hide behavior here (a `scrollDirection.ts`
+ * pub/sub module, an `Animated.Value`-driven translateY/height
+ * collapse); that has been fully reverted per an explicit follow-up
+ * request. This component now has no scroll listeners, no scroll
+ * direction state, and no animated transforms — it renders unconditionally
+ * at the top of the screen on every render, same as before Phase 12.
+ *
+ * The revert request describes this in web CSS terms (`position:
+ * 'sticky'`, `top: 0`, `zIndex: 1000`) — those don't map onto this
+ * component 1:1 since it isn't a DOM element inside a scrolling parent:
+ * it's rendered once in `App.tsx` as a sibling *above* `<Stack.Navigator>`
+ * (not inside any screen's own `ScrollView`/`FlatList`), so it was never
+ * capable of scrolling out of view in the first place — no `position`
+ * trick is needed to keep it "always visible" on the default (non-Home)
+ * variant below, since normal document flow above a separately-scrolling
+ * sibling already guarantees that. The one variant that *does* use
+ * positioning is `safeAreaHome` (unchanged from before Phase 12):
+ * `position: 'absolute'` + `zIndex: 100` so the bar floats, permanently
+ * visible, over HomeScreen's full-bleed video Hero instead of pushing it
+ * down — the closest RN equivalent of the requested `zIndex: 1000` /
+ * always-on-top behavior.
  */
 const NavBar: React.FC = () => {
   const [isResetting, setIsResetting] = useState(false);
@@ -132,16 +155,17 @@ const NavBar: React.FC = () => {
 };
 
 const styles = StyleSheet.create({
-  // Default (non-Home): a normal, in-flow, opaque bar — unchanged from
-  // before. Background lives here (not on `container`) so the Home
-  // overlay variant below can override it in one place.
+  // Default (non-Home): a normal, in-flow, opaque bar — always rendered,
+  // never animated/hidden. Background lives here (not on `container`) so
+  // the Home overlay variant below can override it in one place.
   safeArea: {
     backgroundColor: colors.darkGreen,
   },
   // Home-only: floats over the top of the Hero instead of pushing it
   // down. Removing NavBar from normal flow (position: 'absolute') is
   // what lets the Hero occupy the full viewport height behind it — no
-  // change needed on HomeScreen's own layout for this to work.
+  // change needed on HomeScreen's own layout for this to work. zIndex/
+  // elevation keep it permanently on top of the video, never hidden.
   safeAreaHome: {
     position: 'absolute',
     top: 0,

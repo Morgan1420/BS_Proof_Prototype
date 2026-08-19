@@ -72,15 +72,23 @@ def _enable_sqlite_foreign_keys(dbapi_connection, connection_record) -> None:  #
 # handling beyond create_all(). Each tuple is (column name, SQLite column
 # DDL fragment including a DEFAULT, since SQLite requires one when adding
 # a NOT NULL column to a non-empty table).
+#
+# `summary_description` (multi-source ingredient summary synthesis —
+# app/services/conclusion_grader.py::synthesize_ingredient_summary) was
+# added here after `is_graded`/`grade_badge_text` — nullable, so no
+# DEFAULT is needed, same reasoning as ResearchPaper's own nullable
+# `keywords`/`grade`/`grade_score` columns.
 _INGREDIENT_GRADING_COLUMNS: tuple[tuple[str, str], ...] = (
     ("is_graded", "BOOLEAN DEFAULT 0 NOT NULL"),
     ("grade_badge_text", "VARCHAR"),
+    ("summary_description", "TEXT"),
 )
 
 
 def _migrate_ingredient_grading_columns() -> None:
-    """Additive, idempotent migration: adds `is_graded`/`grade_badge_text`
-    to an existing `ingredients` table if they're missing.
+    """Additive, idempotent migration: adds `is_graded`/`grade_badge_text`/
+    `summary_description` to an existing `ingredients` table if they're
+    missing.
 
     `SQLModel.metadata.create_all()` (called just before this, in
     init_db()) only creates tables that don't exist *by name* yet — it
@@ -91,7 +99,8 @@ def _migrate_ingredient_grading_columns() -> None:
     those databases schema-stale: every query touching `Ingredient`
     (e.g. GET /api/v1/supplements/search) fails with `sqlite3.
     OperationalError: no such column: ingredients.is_graded` even though
-    the code expects the column to be there.
+    the code expects the column to be there. `summary_description` needed
+    the same treatment when it was added later.
 
     This patches exactly that gap via `ALTER TABLE ... ADD COLUMN`,
     without needing a full `reset_database()` (which deletes the entire
@@ -142,6 +151,9 @@ _RESEARCH_PAPER_COLUMNS: tuple[tuple[str, str], ...] = (
     ("grade_score", "INTEGER"),
     ("rubric_evaluation", "JSON"),
     ("status", "VARCHAR DEFAULT 'ACTIVE' NOT NULL"),
+    # Phase 19 — app/services/paper_grader.py::grade_paper. Nullable, no
+    # DEFAULT needed (same reasoning as the other nullable columns above).
+    ("extracted_conclusions", "JSON"),
 )
 
 
@@ -177,23 +189,29 @@ def _migrate_research_paper_columns() -> None:
 
 # Columns added to `VerifiedResource` (app/models/research.py) after
 # `verified_resources` already existed in deployed (Phase 7) databases —
-# Phase 8 automated resource grading (app/services/resource_grader.py).
-# Unlike `verified_resources` itself (a brand-new table when it was
-# introduced, needing no migration — see that model's docstring), these
-# three columns need the same additive-`ALTER TABLE` treatment as
-# ResearchPaper's `grade`/`grade_score`/`rubric_evaluation`. All three are
-# nullable, so no DEFAULT is needed (same reasoning as those columns).
+# Phase 8 automated resource grading (app/services/resource_grader.py),
+# now joined by Phase 17's `extracted_data` (Two-Stage Extraction
+# Pipeline — app/services/resource_extractor.py). Unlike
+# `verified_resources` itself (a brand-new table when it was introduced,
+# needing no migration — see that model's docstring), these columns need
+# the same additive-`ALTER TABLE` treatment as ResearchPaper's `grade`/
+# `grade_score`/`rubric_evaluation`. All five are nullable, so no DEFAULT
+# is needed (same reasoning as those columns).
 _VERIFIED_RESOURCE_COLUMNS: tuple[tuple[str, str], ...] = (
     ("grade", "VARCHAR"),
     ("score", "INTEGER"),
     ("reasoning_summary", "TEXT"),
+    ("extracted_data", "JSON"),
+    # Phase 19 — app/services/resource_extractor.py::extract_claims_from_resource.
+    ("extracted_conclusions", "JSON"),
 )
 
 
 def _migrate_verified_resource_columns() -> None:
     """Additive, idempotent migration: adds whichever of `grade`,
-    `score`, `reasoning_summary` are missing from an existing
-    `verified_resources` table — same reasoning and pattern as
+    `score`, `reasoning_summary`, `extracted_data`, `extracted_conclusions`
+    are missing from an existing `verified_resources` table — same
+    reasoning and pattern as
     _migrate_research_paper_columns() above. Safe to run on every
     startup; a no-op once every column exists, including on a
     freshly-created database where create_all() already included all of

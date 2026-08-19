@@ -81,6 +81,65 @@ export interface AverageGradeResult {
   averageGrade: PaperGrade | null;
 }
 
+/**
+ * Sorts any list of graded items (ResearchPaper, PaperConclusion, or
+ * VerifiedResource all fit — see the generic accessor functions) in
+ * descending order of grade quality: A -> B -> C -> D -> E, ungraded
+ * items last. Items sharing the same letter grade are tie-broken by
+ * their numeric score, highest first (100 -> 0); items with no
+ * recognized grade (or, among ungraded items, no way to break a tie by
+ * score) keep their original relative order.
+ *
+ * Factored out of StudiesList.tsx's original (paper-only)
+ * `sortPapersByGrade` so RecommendedUsesList.tsx and
+ * VerifiedResourcesList.tsx can apply the exact same "grade rank, then
+ * score, then original order" logic to PaperConclusion/VerifiedResource
+ * respectively, ahead of pagination, instead of three near-identical
+ * hand-copied sort comparators that could drift out of sync over time —
+ * see the Scientific Information section's "sort before paginating"
+ * requirement (all three lists) in docs/Architecture.md.
+ *
+ * Pure and side-effect-free (returns a new array, never mutates
+ * `items`), so it's safe to call from a `useMemo` on every render.
+ * Explicitly threads each item's original index through as the final
+ * tie-break — rather than relying on `Array.prototype.sort` being
+ * stable (guaranteed since ES2019 / on Hermes, but easy to get wrong if
+ * this is ever ported or the comparator refactored) — so "preserve
+ * original order" for a tie holds unambiguously.
+ *
+ * @param items The list to sort.
+ * @param getGrade Reads an item's letter-grade field (e.g. `(p) =>
+ *   p.grade` for ResearchPaper, `(c) => c.confidence_grade` for
+ *   PaperConclusion, `(r) => r.grade` for VerifiedResource).
+ * @param getScore Reads an item's numeric score field, used only as a
+ *   same-grade tie-break (e.g. `(p) => p.grade_score`, `(c) =>
+ *   c.confidence_score`, `(r) => r.score`).
+ */
+export function sortByGradeThenScore<T>(
+  items: readonly T[],
+  getGrade: (item: T) => string | null | undefined,
+  getScore: (item: T) => number | null | undefined
+): T[] {
+  return items
+    .map((item, index) => ({ item, index }))
+    .sort((a, b) => {
+      const rankDiff = getGradeRank(getGrade(a.item)) - getGradeRank(getGrade(b.item));
+      if (rankDiff !== 0) {
+        return rankDiff;
+      }
+      if (isPaperGrade(getGrade(a.item))) {
+        // Both share a real letter grade (same rank) — higher score first.
+        const scoreDiff = (getScore(b.item) ?? 0) - (getScore(a.item) ?? 0);
+        if (scoreDiff !== 0) {
+          return scoreDiff;
+        }
+      }
+      // Equal score, or both ungraded: preserve original order.
+      return a.index - b.index;
+    })
+    .map(({ item }) => item);
+}
+
 /** Averages `grade_score`-shaped fields across any list of graded items
  * (ResearchPaper, PaperConclusion, or VerifiedResource all fit — see the
  * generic constraint) — used by IngredientCard.tsx to build the

@@ -1138,13 +1138,30 @@ def fetch_verified_resources_for_ingredient(
     all_records = asyncio.run(
         _search_all_records_async(ingredient_name, max_results_per_source)
     )
-    if not all_records:
-        return []
 
+    # Queried unconditionally (even when `all_records` below turns out
+    # empty) so the debug log at the bottom of this function always
+    # reports an accurate total — including the "found nothing new this
+    # call, but N were already there from an earlier run" case, which the
+    # old early-return (before this row was moved up) would have skipped
+    # silently.
     existing = session.exec(
         select(VerifiedResource).where(VerifiedResource.ingredient_id == ingredient_id)
     ).all()
     existing_urls = {resource.url for resource in existing}
+
+    if not all_records:
+        logger.info(
+            "%s Ingredient id=%s (%r) now has %d verified resource(s) total "
+            "(%d existing + 0 newly found this call — no source returned "
+            "any new results).",
+            _LOG_PREFIX,
+            ingredient_id,
+            ingredient_name,
+            len(existing),
+            len(existing),
+        )
+        return []
 
     new_resources: List[VerifiedResource] = []
     seen_this_batch: set = set()
@@ -1196,5 +1213,25 @@ def fetch_verified_resources_for_ingredient(
 
     if new_resources:
         session.flush()  # assigns ids without committing — see docstring
+
+    # Debug visibility for the downstream data-flow audit described in
+    # app/services/conclusion_grader.py::synthesize_ingredient_summary's
+    # own debug lines: confirms, right at the source, how many
+    # VerifiedResource rows this ingredient now has in total (existing +
+    # newly found this call) — since that function queries VerifiedResource
+    # fresh from the DB rather than trusting a possibly-stale in-memory
+    # collection, this total is exactly what it will see once this
+    # session's flush/commit lands (see this function's own docstring for
+    # why this flushes rather than commits).
+    logger.info(
+        "%s Ingredient id=%s (%r) now has %d verified resource(s) total "
+        "(%d existing + %d newly found this call).",
+        _LOG_PREFIX,
+        ingredient_id,
+        ingredient_name,
+        len(existing) + len(new_resources),
+        len(existing),
+        len(new_resources),
+    )
 
     return new_resources

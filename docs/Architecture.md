@@ -25,12 +25,12 @@ backend/
     │   ├── supplement.py   # Ingredient, SupplementAnalysis — Pydantic I/O models (Gemini + API response)
     │   ├── search.py       # FilterType, ResultType, SearchResultItem (now with nested ingredients), SearchResponse, SuggestResponse
     │   ├── dev.py           # MockDataResetResponse
-    │   ├── research.py      # RubricEvaluationResponse (Phase 3), ResearchPaperResponse (now with status — Phase 6), PaperConclusionResponse (Phase 5), VerifiedResourceResponse (Phase 7; now with grade/score/reasoning_summary — Phase 8), IngredientDetailResponse (now with conclusions + verified_resources), GradeIngredientResponse (Phase 2), GradePaperResponse (Phase 4)
+    │   ├── research.py      # RubricEvaluationResponse (Phase 3), ResearchPaperResponse (now with status — Phase 6), PaperConclusionResponse (Phase 5), VerifiedResourceResponse (Phase 7; now with grade/score/reasoning_summary — Phase 8), IngredientDetailResponse (now with conclusions + verified_resources + summary_description — Phase 11), GradeIngredientResponse (Phase 2), GradePaperResponse (Phase 4)
     │   └── (supplement.py adds LinkedIngredientResponse, ProductDetailResponse)
     ├── models/
     │   ├── schemas.py      # ScanResponse (superseded by schemas/supplement.py; unused)
-    │   ├── supplement.py   # Product, Ingredient (now with is_graded/grade_badge_text/papers), ProductIngredientLink — SQLModel ORM tables (M2M)
-    │   └── research.py     # ResearchPaper — SQLModel ORM table (Phase 2; now with keywords + grade/grade_score/rubric_evaluation from Phase 3, status from Phase 6), FK'd to Ingredient. Also: serialize_keywords()/parse_keywords(), PAPER_STATUS_ACTIVE/PAPER_STATUS_DISCARDED_IRRELEVANT (Phase 6). PaperConclusion (Phase 5) — one row per synthesized cross-paper claim, FK'd to Ingredient (no ORM relationship — queried directly, see search.py). VerifiedResource (Phase 7; now with grade/score/reasoning_summary — Phase 8) — one row per official government/regulatory reference link, FK'd to Ingredient (same no-relationship convention as PaperConclusion)
+    │   ├── supplement.py   # Product, Ingredient (now with is_graded/grade_badge_text/papers/summary_description — Phase 11; now with verified_resources relationship — Phase 16), ProductIngredientLink — SQLModel ORM tables (M2M)
+    │   └── research.py     # ResearchPaper — SQLModel ORM table (Phase 2; now with keywords + grade/grade_score/rubric_evaluation from Phase 3, status from Phase 6), FK'd to Ingredient. Also: serialize_keywords()/parse_keywords(), PAPER_STATUS_ACTIVE/PAPER_STATUS_DISCARDED_IRRELEVANT (Phase 6). PaperConclusion (Phase 5) — one row per synthesized cross-paper claim, FK'd to Ingredient (no ORM relationship — queried directly, see search.py). VerifiedResource (Phase 7; now with grade/score/reasoning_summary — Phase 8, extracted_data — Phase 17) — one row per official government/regulatory reference link, FK'd to Ingredient; now has an `ingredient` ORM relationship back to Ingredient.verified_resources for parity with ResearchPaper (Phase 16 — still queried directly by every actual read path, see conclusion_grader.py)
     └── services/
         ├── vision.py       # Gemini API calls for label parsing
         ├── storage.py      # save_scan() (M2M find-or-create), delete_all_data(), delete_mock_data() (legacy, unused by the route)
@@ -38,10 +38,12 @@ backend/
         ├── research_keywords.py  # Gemini: generate_ingredient_keywords() (Phase 2)
         ├── paper_search.py       # Europe PMC/PubMed/Semantic Scholar/OpenAlex (async, concurrent): search_papers_for_ingredient() (Phase 2; search-only as of Phase 5 — grading moved to paper_analysis_pipeline.py)
         ├── paper_grader.py       # Gemini: grade_paper() — evaluates one paper against docs/paper_grading_rubric.json AND relevance-checks it against its target ingredient in the same call (Phase 3 grading, Phase 6 relevance); grade_single_paper() — on-demand/idempotent DB-aware wrapper for one already-stored paper, also sets ResearchPaper.status (Phase 4; also the per-paper grading step of the Phase 5 pipeline)
-        ├── conclusion_grader.py  # Gemini: process_paper_conclusions() — extracts one graded paper's findings and merges/creates PaperConclusion rows against docs/conclusion_grading_rubric.json (Phase 5); defensively gates on paper.status != DISCARDED_IRRELEVANT (Phase 6)
-        ├── paper_analysis_pipeline.py  # analyze_ingredient_papers() — sequential per-paper grade + relevance-check + conclusion-synthesis loop with per-paper error isolation (Phase 5); discards/skips conclusion synthesis for DISCARDED_IRRELEVANT papers (Phase 6)
+        ├── conclusion_grader.py  # Gemini: process_paper_conclusions() — extracts one graded paper's findings and merges/creates PaperConclusion rows against docs/conclusion_grading_rubric.json (Phase 5); defensively gates on paper.status != DISCARDED_IRRELEVANT (Phase 6). Also: synthesize_ingredient_summary() — one ingredient-level call combining every graded paper AND every VerifiedResource into a single summary_description/main_consensus/recommended_uses (Phase 11)
+        ├── paper_analysis_pipeline.py  # analyze_ingredient_papers() — sequential per-paper grade + relevance-check + conclusion-synthesis loop with per-paper error isolation (Phase 5); discards/skips conclusion synthesis for DISCARDED_IRRELEVANT papers (Phase 6); after the loop, calls synthesize_ingredient_summary() once and persists summary_description onto Ingredient (Phase 11)
         ├── resource_fetcher.py   # Plain HTTP: fetch_verified_resources_for_ingredient() queries docs/verified_resource_apis.json's official gov/regulatory APIs by ingredient name, strictly domain-filters results, persists VerifiedResource rows (Phase 7); also grades each new one via resource_grader.py, sequentially (Phase 8)
         ├── resource_grader.py    # Gemini: grade_resource() — evaluates one already-fetched, already-domain-verified resource against docs/resource_grading_rubric.json (Phase 8); pure, no DB — called directly by resource_fetcher.py, no separate on-demand endpoint/pipeline module (unlike papers)
+        ├── resource_extractor.py # Gemini: extract_claims_from_resource() — Two-Stage Extraction Pipeline Stage 1 (Phase 17); distills one VerifiedResource's title/publisher/summary into structured {official_stance, recommended_dose, upper_limit_warning, key_takeaways}; pure, no DB — called per-resource from paper_analysis_pipeline.py, persisted onto VerifiedResource.extracted_data; Gemini call paced/retried via gemini_rate_limit.py (Phase 18)
+        ├── gemini_rate_limit.py  # Shared: throttle_gemini_call() (process-wide ~4.5s inter-call pacing) + call_gemini_with_retry() (exponential backoff on 429/RESOURCE_EXHAUSTED) — used by paper_grader.py and resource_extractor.py (Phase 18)
         └── grading.py             # Orchestrates keyword-gen + paper-search + verified-resource lookup/grading + the Phase 5/6 grade/relevance/conclusion-synthesis pipeline + debug grade assignment: grade_ingredient() (Phase 2, updated Phase 5/6/7/8)
 ```
 
@@ -1775,6 +1777,955 @@ passes.
 - `.org`'s breadth (point 5) remains a known, accepted tradeoff, not an
   oversight — see that point for the narrowing option if ever revisited.
 
+## Multi-Source Ingredient Summary Synthesis (Phase 11)
+
+Every prior synthesis step (Phase 5's `PaperConclusion`s) only ever
+considered peer-reviewed papers. Phase 11 adds one additional,
+ingredient-level Gemini call that considers BOTH graded `ResearchPaper`
+findings AND official `VerifiedResource` guidance (NIH/USDA/EFSA/Health
+Canada/etc. — Phase 7/8) together, producing a single synthesized
+`summary_description` — the sentence rendered directly under the
+"Scientific Information" section title on a standalone `IngredientCard`
+(see "Scientific Information Redesign (Phase 9)" above for where that
+title/summary slot came from).
+
+**1. Data model — `app/models/supplement.py` / `app/db.py`.** `Ingredient`
+gained a nullable `summary_description: Optional[str]` column. Additive/
+migrated the same way `is_graded`/`grade_badge_text` were —
+`_migrate_ingredient_grading_columns()` (app/db.py) now also adds
+`summary_description` to a pre-Phase-11 `ingredients` table via
+`ALTER TABLE`, same idempotent "check `PRAGMA table_info` first" pattern
+as every other additive column in this app.
+
+**2. Synthesis service — `app/services/conclusion_grader.py::
+synthesize_ingredient_summary()`.** A *different kind* of operation from
+that same file's `process_paper_conclusions()` (Phase 5): where that
+function runs once per newly-graded paper and incrementally merges
+findings into the running `PaperConclusion` set,
+`synthesize_ingredient_summary()` runs once per grade request (called by
+`paper_analysis_pipeline.py` after the per-paper loop finishes, not
+inside it) and makes exactly one additional Gemini call for the whole
+ingredient. Being ingredient-level rather than per-paper, this doesn't
+reintroduce the "one huge batched call" problem the per-paper design
+deliberately avoids (see that module's docstring) — it's still one
+small call, just added once per grade request instead of once per paper.
+
+- **Evidence gathering.** Queries every `ResearchPaper` for the
+  ingredient that is both non-discarded
+  (`status != PAPER_STATUS_DISCARDED_IRRELEVANT`, Phase 6) and graded
+  (`grade IS NOT NULL`) — an ungraded paper has no grade/score to
+  usefully include — plus every `VerifiedResource` for the ingredient
+  regardless of grade (an ungraded resource is still real official
+  guidance worth citing, same "null grade ≠ excluded" convention as
+  `VerifiedResourcesList.tsx`). Each paper's "key extracted
+  conclusions" (per the task spec) are pulled from the *existing*
+  active `PaperConclusion` rows that list it in
+  `supporting_paper_ids`/`contradicting_paper_ids` — reusing Phase 5's
+  already-synthesized findings rather than re-deriving them from the raw
+  abstract a second time.
+- **Prompt — `_build_summary_prompt()`.** Follows the task's
+  `PROMPT_TEMPLATE` structure: an "EVIDENCE SOURCES PROVIDED" section
+  listing papers (title, grade/score, study design from
+  `rubric_evaluation.study_type`, and linked conclusions — see
+  `_format_papers_for_prompt`) and resources (publisher, title,
+  authority grade/score, summary — see `_format_resources_for_prompt`),
+  followed by explicit instructions to synthesize a consensus spanning
+  both evidence types, note points of agreement/conflict, and produce
+  `summary_description`/`main_consensus`/`recommended_uses`.
+- **Structured output — `_IngredientSummarySchema`/
+  `_RecommendedUseSchema`.** Mirrors the task's JSON schema field-for-
+  field: `summary_description: str`, `main_consensus: str`,
+  `recommended_uses: [{claim, confidence_grade (A-E, `Literal`-
+  constrained), supporting_study_count, supporting_resource_count,
+  notes}]`. `supporting_study_count`/`supporting_resource_count` are
+  clamped to `>= 0` server-side (never trusted raw from Gemini, same
+  "derive/clamp, don't trust" philosophy as every other rubric-based
+  grader in this app) — a negative count from a model hallucination
+  becomes `0`, not a validation error.
+- **Strict zero-evidence handling (per spec).** If there are ZERO
+  qualifying papers AND ZERO verified resources, `synthesize_ingredient_summary`
+  makes **no Gemini call at all** and returns `None` — there's nothing
+  to synthesize, and calling Gemini with two empty evidence sections
+  would just invite a fabricated answer. If exactly one collection is
+  empty, synthesis still runs (one real evidence source is enough for a
+  genuine summary), but the prompt includes an explicit note telling
+  Gemini which evidence type is unavailable and instructing it to say so
+  plainly rather than inventing the missing source type (study findings
+  it never saw, or regulatory guidance that was never fetched).
+- **Persistence:** deliberately none, inside this function — it's pure
+  (query + one Gemini call + validate/clamp the response), returning an
+  `IngredientSummaryResult` for the caller to act on. Only
+  `summary_description` is currently written to the DB (see point 3);
+  `main_consensus`/`recommended_uses` are returned for observability/
+  future use but not persisted anywhere yet — per spec, only
+  `summary_description` needed a DB column and API exposure this pass.
+
+**3. Pipeline wiring — `app/services/paper_analysis_pipeline.py::
+analyze_ingredient_papers`.** After the existing per-paper grade/
+relevance-check/conclusion-synthesis loop finishes, this function now:
+fetches the `Ingredient` row (`session.get`), calls
+`synthesize_ingredient_summary()` once, and — if it returned a result —
+sets `ingredient.summary_description` and commits, all wrapped in the
+same "log and skip, never fail the whole grade request" error handling
+every other step in this pipeline already uses (`ConclusionGradingError`
+is caught, not re-raised). `PipelineResult` gained an
+`ingredient_summary_generated: bool` field for observability (mirrors
+`papers_conclusions_attempted`/`_failed`).
+
+**4. API exposure — `app/schemas/research.py` / `app/services/search.py`.**
+`IngredientDetailResponse` gained `summary_description: Optional[str]`,
+populated in `get_ingredient_detail()` straight from the `Ingredient`
+row. Not added to `GradeIngredientResponse` — same "frontend re-fetches
+ingredient detail to see it" convention `conclusions`/`verified_resources`
+already follow, since the Phase 11 step (like Phase 5's conclusion
+synthesis and Phase 7's resource lookup) can run as a side effect of a
+grade request without that response itself needing to carry the result.
+
+**5. Frontend — `src/components/IngredientCard.tsx`.** The
+`scientificSummary` sentence (already rendered under the "Scientific
+Information" title as of Phase 9) now has a priority order: (1) the
+backend's `summaryDescription` state (seeded from
+`ingredient.summary_description`, refreshed by both the initial
+`fetchIngredientDetail()` effect and the post-grade follow-up fetch in
+`handleGradeRequest`) whenever it's a non-empty string — preferred
+since it's strictly richer than anything computed client-side; (2) the
+pre-Phase-11 client-computed heuristic ("average grade + top
+conclusion") as a fallback whenever the backend hasn't produced one yet
+(no grade request has run, the pipeline had zero papers/resources to
+synthesize from, or the Phase 11 Gemini call failed). This keeps the
+summary sentence from ever going blank while the richer multi-source
+version isn't available. `frontend/src/services/api.ts`'s
+`IngredientDetailResponse` gained the matching
+`summary_description?: string | null` field.
+
+**Verification.** Since this sandbox has no installed `google-genai`/
+`pydantic`/`sqlmodel`, correctness was verified with the same offline
+stub-module approach used for the Phase 10 resource-fetcher work:
+lightweight stand-ins for those packages plus minimal plain-Python
+model classes let the *real* `conclusion_grader.py`/
+`paper_analysis_pipeline.py` be imported and exercised directly. Checks
+covered: prompt-formatting helpers against synthetic paper/resource
+data (including the empty-papers/empty-resources text and the
+one-collection-empty prompt note); the zero-evidence early return
+(asserted no Gemini client is even constructed); a full non-empty
+synthesis path with a mocked Gemini response, including
+negative-count clamping; an empty `summary_description` from Gemini
+correctly raising `ConclusionGradingError`; and the pipeline's tail
+wiring — `summary_description` gets persisted onto the `Ingredient` row
+and `ingredient_summary_generated` gets set when synthesis succeeds,
+both stay untouched when synthesis returns `None`, and a raised
+`ConclusionGradingError` is swallowed without propagating. All checks
+passed. `python3 -m py_compile` and `tsc --noEmit` both pass on every
+changed file.
+
+**Known gaps:**
+- `main_consensus`/`recommended_uses` are computed and returned by
+  `synthesize_ingredient_summary()` but not persisted or exposed via the
+  API yet — only `summary_description` is, per spec. A future pass could
+  add DB columns/API fields for these if the frontend wants to render
+  them directly (e.g. a richer "Regulatory vs. Literature Consensus"
+  panel) rather than folding everything into one sentence.
+- `recommended_uses`' `supporting_resource_count` dimension has no
+  equivalent on the existing per-claim `PaperConclusion` table — the two
+  "recommended uses" concepts (this Gemini call's coarser, ephemeral
+  list vs. `PaperConclusion`'s persisted, incrementally-merged one) are
+  intentionally not unified this pass.
+- Same unauthenticated-endpoint and best-effort-Gemini-call caveats as
+  every other synthesis/grading step in this app.
+
+## Global Layout Refactor & Section Standardization (Phase 12)
+
+> **Reverted in part by Phase 13** (see that section below): item 1
+> below (hide-on-scroll NavBar, `src/utils/scrollDirection.ts`) was
+> fully undone at the requester's follow-up instruction — NavBar is
+> always visible again, `scrollDirection.ts` was deleted, and every
+> screen's `onScroll`/`reportScrollOffset` wiring was removed. Items 2-5
+> below (Footer/flex audit, ResultsScreen's header-scrolls-with-content
+> fix, grade-based list sorting, StandaloneInfoSection) were **not**
+> reverted and remain exactly as described here — Phase 13 only refined
+> item 3's padding, not its ListHeaderComponent structure. This section
+> is left intact as a historical record of what Phase 12 built and why;
+> read it alongside Phase 13 for the current state.
+
+A frontend-only pass covering three things: a hide-on-scroll NavBar,
+confirming/finishing the Footer's already-flex-based bottom-pinning, a
+`ResultsScreen` header that scrolls with its content instead of sitting
+permanently above it, grade-based sorting on all three Scientific
+Information lists, and a shared bordered/collapsible card treatment for
+`IngredientCard`'s four top-level standalone sections (including a
+rebuilt "Related Products").
+
+**Adapting a web spec to React Native.** The request that drove this
+phase was written in web CSS terms — `transform: translateY(-100%)` on a
+`position: fixed` NavBar, `position: sticky` headers to remove. This
+app is React Native (Expo, react-native-web on web — see the Tech Stack
+section), not a DOM app, so those instructions don't translate literally
+in every case; each one below notes where and why the implementation
+deliberately diverges from the literal CSS instruction while still
+delivering the same visual/interactive outcome.
+
+**1. Hide-on-scroll NavBar (`src/utils/scrollDirection.ts` +
+`src/components/NavBar.tsx`).** `scrollDirection.ts` is a small
+module-level pub/sub store — modeled on `navigation/navigationRef.ts`'s
+existing "imperative module, not React Context" convention, for the
+same reason that file exists: `NavBar` is rendered once in `App.tsx`
+*above* the Stack Navigator, as a sibling to it rather than a descendant
+of any one screen, so there's no React tree connecting a screen's own
+scroll container down to `NavBar` for Context to flow through. Every
+screen's scrollable container (`HomeScreen`/`LibraryScreen`/
+`ScanScreen`'s `ScrollView`s, `ResultsScreen`'s `FlatList`) calls
+`reportScrollOffset(offsetY)` from its own `onScroll` (throttled to
+`scrollEventThrottle={16}`, ~60fps). The module tracks direction with a
+small dead-zone (`DIRECTION_CHANGE_THRESHOLD`, 4px) to avoid flicker
+from sub-pixel jitter, and always reports "up" (shown) below
+`offsetY < 20` regardless of recent direction, matching the spec's "at
+the top of the page" rule. `resetScrollDirection()` is called on every
+navigation route change (from `NavBar`'s existing route-tracking effect)
+so a freshly-opened screen always starts with the bar shown rather than
+inheriting whatever scrolled-down state the previous screen left it in.
+
+`NavBar` subscribes and drives one shared `Animated.Value`
+(`shownProgress`, 1 = shown, 0 = hidden) via `Animated.timing`
+(300ms, `Easing.inOut(Easing.ease)` — matching the spec's `transition:
+transform 0.3s ease-in-out`). Two different visual treatments apply
+depending on which of NavBar's two existing variants (see Phase pre-9's
+"Make NavBar a transparent overlay on Home only") is active:
+
+- **HomeScreen** (`safeAreaHome` — already `position: 'absolute'`,
+  floating over the Hero, reserving no layout space): animates
+  `transform: translateY` from `0` to `-(measuredHeight + 24)`, paired
+  with an opacity fade. This is the one variant where the spec's literal
+  `translateY(-100%)` technique is actually correct, since the bar
+  doesn't push anything else's layout around.
+- **Every other screen** (`safeArea` — normal document flow, pushing
+  screen content down by its own height, same as before this phase):
+  animates the wrapping `Animated.View`'s own `height` (0 to its
+  measured natural height) instead of `translateY`. Translating an
+  in-flow element off-screen without shrinking the space it reserves
+  would leave a blank gap where it used to be, not the smooth
+  "content slides up to fill the space" effect the spec is going for —
+  animating height is RN's correct equivalent for an in-flow element,
+  without requiring every non-Home screen to switch to
+  `position: absolute` and carry a matching top-inset padding (a much
+  larger, riskier structural change this phase deliberately avoided).
+  `overflow: 'hidden'` on that wrapper is what makes the shrinking
+  height actually clip content instead of squashing it.
+
+Both variants' height/measurement come from an `onLayout` callback on
+the bar's own content (`onBarLayout`), seeded with a reasonable
+`ESTIMATED_BAR_HEIGHT` (64) for the one frame before the real
+measurement lands, so there's no visible "jump". The whole animation is
+`useNativeDriver: false` — deliberate, not an oversight: the same
+`shownProgress` value also drives `height` on non-Home screens, and
+`height` is a layout property the native driver can't animate; splitting
+drivers per-variant on one shared value risks a native/JS desync, so
+everything stays JS-driven.
+
+**2. Footer / flex-column layout (`src/components/Footer.tsx`,
+`src/App.tsx`, every screen).** Audited against the spec's "remove
+fixed/sticky positioning, wrap the app in a flex column, main content
+`flex: 1`" requirement — this was already the case going into this
+phase (see Phase pre-9's "LibraryScreen: footer pinning" and
+"ScanScreen: center empty state" work): `Footer.tsx` has never used
+`position: fixed`/`sticky`/`absolute`; `App.tsx`'s root `View` is
+already `flex: 1`; and `HomeScreen`/`LibraryScreen`/`ScanScreen` each
+already give their main content container `flexGrow: 1` (paired with
+`justifyContent: 'space-between'` or an inner `flex: 1` body) so Footer
+naturally lands at the bottom of the viewport on short content and
+scrolls normally below it on tall content. One real gap this phase did
+fix: `ResultsScreen`'s `FlatList` had no `style` of its own (only a
+`contentContainerStyle`), so it wasn't actually claiming the screen's
+remaining flex space — added `style={styles.flatList}` (`flex: 1`) so
+Footer pins to the bottom there too, matching the other three screens.
+
+**3. `ResultsScreen` header — no longer effectively sticky
+(`src/screens/ResultsScreen.tsx`).** The spec asked to remove
+`position: sticky`/`top: 0` from the "All Ingredients"/"All Products"
+header bars — this codebase has no `pages/IngredientsPage.tsx` or
+`pages/ProductsPage.tsx` (this is a Stack-Navigator screens app, not a
+multi-page site); `ResultsScreen.tsx` is the one screen that renders
+both of those headers, via `getHeaderText()`'s `filterType` branch (see
+that function). It never used literal `position: sticky` CSS, but its
+back-button/title/filter row *was* a sibling rendered above the
+`FlatList` rather than inside it — meaning it never scrolled away with
+list content, which is the same practical effect as a sticky header
+even without that CSS property. Fixed by moving that whole block into
+the `FlatList`'s own `ListHeaderComponent` (`listHeader`, computed once
+per render and reused across the loading/error/list branches) so it's
+now genuine list content that scrolls with everything else, per the
+"headers scroll naturally with page content" requirement.
+
+**4. Grade-based sorting, all three Scientific Information lists
+(`src/utils/grades.ts::sortByGradeThenScore`, `StudiesList.tsx`,
+`RecommendedUsesList.tsx`, `VerifiedResourcesList.tsx`).**
+`StudiesList.tsx` already had a local, paper-only `sortPapersByGrade`
+(Phase pre-9's "grade-based sort + tie-break") — generalized into
+`grades.ts::sortByGradeThenScore<T>(items, getGrade, getScore)`, a
+generic A-to-E-then-score-descending-then-original-order sort usable
+across `ResearchPaper` (`grade`/`grade_score`), `PaperConclusion`
+(`confidence_grade`/`confidence_score`), and `VerifiedResource`
+(`grade`/`score`) via small accessor callbacks, rather than three
+near-identical hand-copied comparators. All three lists now call it
+immediately before paginating — `RecommendedUsesList` sorts right after
+its existing "confidence_grade C or better" filter;
+`VerifiedResourcesList` (which has no such filter — every stored
+`VerifiedResource` already cleared the domain allow-list at fetch time)
+sorts its full list, ungraded resources simply falling to the end via
+`UNGRADED_RANK`; `StudiesList` is functionally unchanged, just now
+calling the shared helper instead of its own local copy.
+
+**5. Section visual standardization
+(`src/components/StandaloneInfoSection.tsx`,
+`IngredientCard.tsx`).** New shared component,
+`StandaloneInfoSection` — a bordered/collapsible card (`1px solid
+#E85D04`, 12px radius, 16px padding, 16px bottom margin; centered bold
+20px title; tap-anywhere-on-the-header chevron toggle, `▼`/`▲`) — is
+deliberately a *different* component from the pre-existing
+`CollapsibleSection.tsx`, not a reskin of it: `CollapsibleSection` is
+the smaller, subtler wrapper for the three individual list panels
+*inside* Scientific Information (`#E0E0E0` border, left-aligned label,
+Ionicons chevron); `StandaloneInfoSection` is the bolder, section-level
+chrome those lists — and the other three standalone blocks — all sit
+inside. `IngredientCard.tsx`'s standalone body now wraps all four
+top-level sections in it: "General Information" and "Grade Info" (still
+placeholder body copy, per docs/Architecture.md's pre-existing
+"Expandable cards" follow-up — only their outer chrome changed here),
+"Scientific Information" (previously its own one-off bordered `View`
+with a non-collapsible title — now genuinely collapsible like the other
+three, wrapping the same summary sentence + `RecommendedUsesList` +
+`VerifiedResourcesList` + `StudiesList` as before), and a rebuilt
+"Related Products".
+
+**Related Products rebuild.** Per spec: a summary line ("This ingredient
+appears in N products.", using the existing `Ingredient.productCount`
+field), and a bordered (`#E0E0E0`, 8px radius) box containing a
+5-per-page paginated (`Pagination.tsx`, same component every other list
+uses) row list — each row: thumbnail (when available) + name + brand on
+the left, a magnifying-glass (`Ionicons name="search"`) placeholder
+action button on the right, per spec. **Known gap, stated honestly
+rather than faked:** no backend endpoint currently returns *which*
+products an ingredient appears in — `GET /api/v1/ingredients/{id}`
+exposes only the bare `productCount` number (Ingredient is canonical/
+shared M2M data; see the "Many-to-Many refactor" section above), not a
+product list. A new `RelatedProduct` type
+(`{ id, name, brand?, thumbnailUrl? }`) and an optional
+`Ingredient.relatedProducts?: RelatedProduct[]` field were added so the
+full pagination/row-layout UI is real and ready to receive data, but
+every current caller leaves it `undefined` — the box renders an honest
+"Product list not available yet." empty state in that case (distinct
+from an empty *array*, which would mean "confirmed zero products" once
+a real data source exists) rather than fabricating rows. Wiring an
+actual `GET /api/v1/ingredients/{id}/products`-shaped endpoint is
+tracked as follow-up work, not attempted in this pass (this phase's
+scope was frontend components only — see the section's own
+constraints).
+
+**Verification.** `npx tsc --noEmit` passes cleanly across every changed
+file (`NavBar.tsx`, `Footer.tsx` — unchanged, `App.tsx` — unchanged,
+`HomeScreen.tsx`, `LibraryScreen.tsx`, `ScanScreen.tsx`,
+`ResultsScreen.tsx`, `StudiesList.tsx`, `RecommendedUsesList.tsx`,
+`VerifiedResourcesList.tsx`, `IngredientCard.tsx`, plus the three new/
+extended files: `scrollDirection.ts`, `StandaloneInfoSection.tsx`,
+`grades.ts`). No backend files were touched this phase.
+
+## NavBar Revert & Header/List Alignment Fix (Phase 13)
+
+A follow-up correction pass, driven by an explicit request to undo part
+of Phase 12 and fix a padding regression it left behind.
+
+**1. NavBar hide-on-scroll — fully reverted
+(`src/components/NavBar.tsx`).** Removed everything Phase 12 added: the
+`scrollDirection.ts` subscription, the `shownProgress` `Animated.Value`
+and its `animateTo`/interpolated `homeTranslateY`/`flowHeight` styles,
+`onBarLayout`/`measuredHeight` measurement, and the conditional
+`Animated.View` wrapper branching on `isHomeScreen`. `NavBar` now
+renders unconditionally — no scroll listeners, no scroll-direction
+state, no animated transforms — the same shape it had before Phase 12,
+with the `safeArea`/`safeAreaHome` variant styling (unchanged since
+before Phase 9's "Make NavBar a transparent overlay on Home only")
+being the only thing that varies it by route. `src/utils/scrollDirection.ts`
+itself was deleted outright (nothing else in the app used it), and the
+`onScroll={(event) => reportScrollOffset(...)}` /
+`scrollEventThrottle={16}` wiring was removed from every screen that had
+it — `HomeScreen.tsx`, `LibraryScreen.tsx`, `ScanScreen.tsx`'s
+`ScrollView`s, and `ResultsScreen.tsx`'s `FlatList`.
+
+The revert request again described the desired end state in web CSS
+terms (`position: 'sticky'`, `top: 0`, `zIndex: 1000`). Those don't map
+onto this component literally: `NavBar` is rendered once in `App.tsx` as
+a sibling *above* `<Stack.Navigator>`, never inside any screen's own
+scrolling container, so it was never capable of scrolling out of view on
+its default (non-Home) variant in the first place — "always visible" on
+that variant falls out of normal document flow alone, no `position`
+trick needed. The Home variant already used (and still uses)
+`position: 'absolute'` + `zIndex: 100`/`elevation: 100` to float,
+permanently, over the Hero video — the closest RN equivalent of the
+requested `zIndex: 1000` always-on-top behavior — and this phase left
+that variant's positioning untouched, only removing its (now former)
+scroll-driven animation.
+
+**2. Footer / flex-column layout — audited, no changes needed
+(`src/components/Footer.tsx`, `src/App.tsx`).** Re-checked against the
+same "outer container flex column + `minHeight: 100vh`, main content
+`flex: 1`, footer in normal document flow" requirement Phase 12 already
+satisfied (see that section's item 2): `App.tsx`'s root `View` is
+`flex: 1` with a `flex: 1` `stackWrapper` around the Stack Navigator;
+`Footer.tsx` has never used `position: fixed`/`sticky`/`absolute`; every
+screen's main scrollable content already claims `flex: 1`/`flexGrow: 1`
+so Footer naturally sits at the bottom of short content and scrolls
+normally below tall content. Nothing was changed here — Phase 12's prior
+audit (and the `ResultsScreen` `FlatList` `flex: 1` fix that came out of
+it) already covers this; this pass just re-verified it rather than
+re-doing it.
+
+**3. `ResultsScreen` header/list padding alignment
+(`src/screens/ResultsScreen.tsx`).** This app has no
+`pages/IngredientsPage.tsx`/`pages/ProductsPage.tsx` — same mapping
+noted in Phase 12 — `ResultsScreen.tsx` is the one screen rendering both
+the "All Ingredients" and "All Products" views (see `getHeaderText()`),
+so its header is what this fix targets. The misalignment: `body` (the
+header container, wrapping the back button and title/filter row) and
+`listContent` (the FlatList's `contentContainerStyle`, wrapping the
+card grid) both already read the exact same
+`layout.screenHorizontalPadding` token (20%) for their horizontal inset
+— that part was already correctly shared, not duplicated/hardcoded. The
+actual bug was one level deeper: `backButton`'s style carried its own
+extra `padding: spacing.xs` (4px) left over from this screen's very
+first version, which shifted the back arrow's rendered glyph 4px to the
+right of `body`'s own inset — 4px inward of where a card's left border
+lines up directly below it. The filter icon (a bare `Ionicons`, no
+wrapping padding) had no such offset and was already flush on the
+right. Fix: removed `backButton`'s `padding`, keeping `hitSlop={8}` to
+preserve a comfortable tap target without shifting the button's visual
+position. Left and right edges of the header now line up exactly with
+the card grid's edges.
+
+This codebase doesn't use a pixel `maxWidth` cap (e.g. the requested
+`1200px`) anywhere — every screen's horizontal inset is the same
+percentage-based `layout.screenHorizontalPadding` token (`theme.ts`),
+responsive to any viewport width by design (see that file's own
+docstring). Introducing a one-off pixel `maxWidth` here would have
+diverged from that existing, consistent responsive-layout convention
+rather than fixed the actual bug, which was the stray 4px padding above,
+not a missing width cap — the header and the list already share the
+same responsive width source.
+
+**Verification.** `npx tsc --noEmit` passes cleanly across every changed
+file (`NavBar.tsx`, `HomeScreen.tsx`, `LibraryScreen.tsx`,
+`ScanScreen.tsx`, `ResultsScreen.tsx`) and the deletion of
+`scrollDirection.ts`. No backend files were touched this phase.
+
+## ResultsScreen Header/Footer Layout Fix (Phase 14)
+
+A follow-up bugfix pass — Phase 13's `ListHeaderComponent` restructure
+(see that section) fixed the "header doesn't scroll with content" issue
+but introduced two new, purely visual regressions of its own, both
+reported from a rendered screenshot: the header rendering as a narrow,
+centered box next to full-width cards, and the Footer overlapping/
+cutting off the last card instead of appearing after it.
+
+**Root cause 1 — double horizontal padding on the header.** Before
+Phase 13, `body` (the back-arrow/title/filter row) was a sibling
+rendered directly in `screen`'s own flex column, so its own
+`paddingHorizontal: layout.screenHorizontalPadding` was the *only*
+horizontal inset applied to it. Phase 13 moved that same `body` View to
+be the FlatList's `ListHeaderComponent` — which made it a *child* of
+`contentContainerStyle` (`listContent`), a container that *also* had
+`paddingHorizontal: layout.screenHorizontalPadding` applied for the
+cards. The header ended up padded twice (once by its own style, once
+again by its new parent), effectively insetting it by double the
+intended margin on each side — exactly the "narrow, centered box"
+regression. The cards (rendered via `renderItem`, siblings of
+`ListHeaderComponent` within the same content container) only ever had
+the one, correct level of padding, so they stayed full width relative
+to the header.
+
+**Fix 1.** Moved `paddingHorizontal` off `listContent`
+(`contentContainerStyle`) entirely and onto a new per-item wrapper,
+`itemWrapper`, applied inside `renderItem` around each `ProductCard`/
+`IngredientCard`. `body` keeps its own `paddingHorizontal` unchanged —
+now the *only* source of inset for the header, same single-source
+guarantee `itemWrapper` gives each card. Both read the exact same
+`layout.screenHorizontalPadding` token, so the header's back
+arrow/filter icon and every card's left/right border land on identical
+pixel edges, with no hardcoded `maxWidth` needed to keep two separately-
+maintained widths in sync.
+
+**Root cause 2 — Footer overlapping the last card.** Before this pass,
+`<Footer />` was rendered as a plain sibling *after* the FlatList inside
+`screen`'s flex column, with the FlatList itself given `style={{ flex: 1
+}}` (added in Phase 12 to make Footer pin to the viewport bottom on
+short result lists). That combination — a `flex: 1` FlatList sitting
+next to a separate, non-flex Footer sibling — creates two independently-
+sized layout regions: the FlatList becomes its own bounded scrolling
+viewport (sized to whatever's left after Footer's natural height is
+subtracted), scrolling its row content *inside* that bounded box, while
+Footer sits fixed immediately after it in the outer flex column. Rather
+than behaving like a normal trailing element in one continuous page
+scroll, this let Footer end up visually anchored at the bottom of the
+screen's remaining space regardless of how far the list itself had been
+scrolled — overlapping or crowding out the last card instead of only
+appearing once the user scrolls past it.
+
+**Fix 2.** `<Footer />` is now rendered as the FlatList's own
+`ListFooterComponent` — genuine list content, the same content-container
+child every card already is, rather than a sibling with its own
+independent flex sizing. This guarantees Footer is always the true last
+row of the *one* scrollable region containing the header, every card,
+and Footer together — it becomes visible if and only if the user has
+actually scrolled past everything above it, with no separate bounded
+viewport for it to get pinned against. The `flex: 1`/`contentContainerStyle`
+`flexGrow: 1` combination from Phase 12 is kept (now describing the
+FlatList's own single scroll region, not a Footer-pinning trick) so a
+short results list still stretches to fill the screen and Footer still
+visually anchors at the bottom in that case, exactly as before — only
+the tall-list, "scroll past the last card to see it" case actually
+needed fixing.
+
+Making Footer a child of `contentContainerStyle` reintroduces the
+question Fix 1 already resolved: wouldn't it now also inherit
+`listContent`'s horizontal padding, breaking its established full-bleed
+(edge-to-edge) width — the same rule NavBar/Footer follow on every other
+screen (see `theme.ts`'s `layout.screenHorizontalPadding` docstring)?
+This is exactly why Fix 1 moved padding off `listContent` and onto
+`itemWrapper`/`body` individually instead of leaving it on the shared
+container — with `listContent` itself unpadded, `Footer` (now a direct,
+unwrapped child of it) renders full width automatically, no negative-
+margin cancellation trick required. The two fixes are deliberately the
+same change (stop padding the shared container, pad each piece that
+actually needs it) applied for two different reasons.
+
+The loading and error branches (no `FlatList` rendered in either case)
+keep `<Footer />` as a plain trailing sibling after their centered
+spinner/error message — there's no competing `flex: 1` element in those
+branches, so the original overlap bug never applied to them; each
+branch now renders its own `<Footer />` rather than sharing one
+common one after the whole loading/error/list conditional, since that
+shared position no longer exists now that the list branch's Footer
+lives inside the FlatList instead.
+
+**Verification.** `npx tsc --noEmit` passes cleanly. No backend files
+were touched this phase.
+
+## Collapsible Section Header Chevron Fix (Phase 15)
+
+Small follow-up bugfix: in the four `StandaloneInfoSection`-wrapped
+headers ("General Information", "Grade Info", "Scientific Information",
+"Related Products" — see Phase 12), the `▼`/`▲` chevron was rendering on
+its own line *below* the centered title instead of beside it. Root
+cause: `StandaloneInfoSection.tsx`'s `headerRow` style set `alignItems`
+and `gap` but never set `flexDirection: 'row'` — and unlike web
+Flexbox, React Native's own default `flexDirection` is `'column'`, not
+`'row'`. The title `Text` and the chevron `Text` were therefore stacking
+vertically as two rows, not sitting side by side as one.
+
+Fixed in `StandaloneInfoSection.tsx` (not `IngredientCard.tsx` itself —
+that file only *uses* this shared component, the header markup and
+styling live here) by adding `flexDirection: 'row'` and
+`justifyContent: 'center'` to `headerRow`. `justifyContent: 'center'`
+(rather than `space-between`) keeps the title itself centered per the
+original spec, with the chevron sitting immediately to its right as
+part of the same centered (title + chevron) unit, rather than snapping
+to the container's far edge.
+
+The three inner list headers this request also named — "Recommended
+Uses List", "Verified Online Resources List", "List of Studies" — use
+the separate `CollapsibleSection.tsx` wrapper (see Phase 9), whose
+`headerRow` already had `flexDirection: 'row'` (paired with
+`justifyContent: 'space-between'`, title left-aligned/`flex: 1`, chevron
+pinned right) — those were never affected by this bug and needed no
+change.
+
+**Verification.** `npx tsc --noEmit` passes cleanly. No backend files
+were touched this phase.
+
+## Verified-Resource Data-Flow Audit (Phase 16)
+
+Triggered by a report that ingredient summaries/recommendations were
+"ignoring Verified Online Resources." Audited the three files named in
+the request — `paper_analysis_pipeline.py`, `conclusion_grader.py`,
+`resource_fetcher.py` — plus their call site, `grading.py`.
+
+**Finding: the described bug does not reproduce in the current code.**
+`grading.py::grade_ingredient` already runs
+`fetch_verified_resources_for_ingredient` and commits *before* calling
+`analyze_ingredient_papers` (which is what eventually calls
+`synthesize_ingredient_summary`) — so by the time that synthesis query
+runs, any newly-fetched `VerifiedResource` rows are already durably
+committed, not just sitting in an uncommitted, possibly-stale in-memory
+collection. `conclusion_grader.py`'s prompt builder
+(`_build_summary_prompt`) already formats `resources` into readable
+title/publisher/summary blocks and includes them in the Gemini prompt
+alongside the papers. Execution order and prompt payload were both
+already correct.
+
+**Concrete fixes made anyway, since they're real, valuable gaps
+independent of whether the reported bug reproduces:**
+
+1. **ORM relationship parity (`app/models/supplement.py`,
+   `app/models/research.py`).** `Ingredient` had a `papers` relationship
+   to `ResearchPaper` but no equivalent relationship to
+   `VerifiedResource` — the only way to reach a `VerifiedResource` row
+   from code was a manual `select(...).where(ingredient_id == ...)`
+   query. Added `Ingredient.verified_resources` (back-populated by a new
+   `VerifiedResource.ingredient`), mirroring the existing `papers`
+   relationship. Deliberately **not** `lazy="selectin"` — every actual
+   read path in this codebase (`synthesize_ingredient_summary`,
+   `search.py::get_ingredient_resources`) already queries
+   `VerifiedResource` directly rather than via ORM lazy-loading, by
+   design (see those functions' own docstrings: a direct query in the
+   same session always sees rows already `flush()`ed earlier in that
+   request, with no stale-collection risk) — this relationship is
+   additive/for-parity, not something existing code needed to start
+   using.
+2. **Debug logging (`conclusion_grader.py`, `resource_fetcher.py`,
+   `paper_analysis_pipeline.py`).** None of the three files had any
+   logging around the papers/resources counts actually reaching
+   synthesis. Added `logger.info` lines (not `logger.debug` — this
+   process's default config may not surface DEBUG records, and the
+   whole point is visibility without a logging-config change first;
+   not bare `print()` — matches this codebase's established
+   `logging`-module convention) at three points: inside
+   `resource_fetcher.py`, reporting each ingredient's total verified
+   resource count after every fetch; inside
+   `paper_analysis_pipeline.py::analyze_ingredient_papers`, immediately
+   before the `synthesize_ingredient_summary` call, reporting exactly
+   how many papers and resources are about to feed into it; inside
+   `conclusion_grader.py::synthesize_ingredient_summary` itself,
+   reporting papers count, resources count, and the fully-formatted
+   resources payload being sent to Gemini. Together these make it
+   possible to confirm from server logs alone, at every hop, that
+   `VerifiedResource` rows are actually flowing through — rather than
+   needing to re-read code to check.
+3. **Strengthened prompt instruction (`conclusion_grader.py`).** Added
+   an explicit instruction as the first bullet of
+   `_build_summary_prompt`'s INSTRUCTIONS section: Gemini **must** cite
+   and incorporate the VERIFIED ONLINE RESOURCES section alongside the
+   papers, not synthesize from papers alone when resources are present,
+   and must reflect official agency guidance (NIH/EFSA/USDA/Health
+   Canada) directly in `main_consensus`/`recommended_uses` when present
+   among the resources. This doesn't change what data reaches the
+   prompt (it was already there) but makes the model less likely to
+   underweight it.
+
+**Real gap identified, NOT fixed this phase — flagged for a scope
+decision.** The frontend's "Recommended Uses List"
+(`RecommendedUsesList.tsx`) is sourced entirely from the `PaperConclusion`
+table (`process_paper_conclusions`, Phase 5) — a paper-only pipeline that
+never reads `VerifiedResource` at all. Meanwhile,
+`synthesize_ingredient_summary()`'s richer `main_consensus` and
+`recommended_uses` fields — the ones actually built from both papers
+*and* resources together — are computed but never persisted anywhere
+(only `summary_description`, a short prose sentence, is saved onto
+`Ingredient`). This mismatch is the most likely real source of "ignoring
+Verified Online Resources": not a broken data pipeline, but a
+recommendations UI that was never wired to the multi-source synthesis
+output in the first place. Fixing it would require a DB migration (new
+columns to persist `main_consensus`/`recommended_uses`), an API schema
+change, and a frontend change to either add a new section or replace
+`RecommendedUsesList`'s data source — outside the three files this task
+authorized, so left as a follow-up rather than silently expanded into.
+
+**Verification.** `python3 -m py_compile` on all five touched files
+(`models/research.py`, `models/supplement.py`,
+`services/conclusion_grader.py`, `services/resource_fetcher.py`,
+`services/paper_analysis_pipeline.py`) passes cleanly. No frontend files
+touched this phase.
+
+## Two-Stage Resource Extraction Pipeline (Phase 17)
+
+Follow-up to the Phase 16 audit. That audit found the reported bug (
+"synthesis ignores Verified Online Resources") didn't reproduce
+mechanically — execution order and prompt payload were already correct
+— but didn't explain why resources still felt under-represented in
+practice. This phase addresses the actual root cause: a
+**lost-in-the-middle effect**. Mixing dense, information-rich paper
+abstracts and short, thin web-resource snippets into one single
+synthesis prompt caused Gemini to consistently over-weight the papers,
+not because resource text was missing from the prompt, but because it
+was out-matched, evidence-density-wise, by the papers sitting next to
+it.
+
+**The fix: split synthesis into two stages.**
+
+- **Stage 1 — per-resource extraction (new:
+  `backend/app/services/resource_extractor.py`).** A new, focused Gemini
+  service, `extract_claims_from_resource(resource_title, publisher,
+  snippet_or_text)`, mirrors `resource_grader.py`'s existing
+  structured-output pattern (cached client, `response_schema`, `.parsed`
+  with raw-text fallback) and distills one resource's own
+  title/publisher/summary into `{official_stance, recommended_dose,
+  upper_limit_warning, key_takeaways}`. **Short-snippet guard:** if the
+  resource's summary is under 20 characters (or missing — many source
+  APIs don't provide one at all), no Gemini call is made; a real,
+  non-`None` result with every field empty is returned instead, logged
+  at `info` — calling Gemini on a handful of words risks it fabricating
+  a plausible-sounding dose the source never actually stated, which is
+  worse than honestly recording "nothing extractable."
+  **Deliberate deviation from the task's literal `async def` signature:**
+  implemented as a synchronous function instead, matching every other
+  Gemini-calling service in this codebase (`paper_grader.py`,
+  `resource_grader.py`, `conclusion_grader.py`) — its caller is itself a
+  plain sync function always run inside a `run_in_threadpool` worker
+  thread, so an `async def` here would wrap a call that's never actually
+  awaited; see that module's own docstring for the full reasoning.
+- **Stage 2 — unified synthesis (`conclusion_grader.py`, existing
+  function, prompt rewritten).** `synthesize_ingredient_summary()`'s
+  Gemini call is unchanged in cadence/output shape (still one call per
+  grade request, still the same `_IngredientSummarySchema`), but its
+  prompt now presents two clearly-labeled, comparably-dense blocks —
+  `--- SOURCE 1: OFFICIAL REGULATORY & HEALTH AGENCY STANDS ---`
+  (resources, rendered from each one's Stage 1 `extracted_data` — falls
+  back to the old raw-summary rendering only for a resource Stage 1
+  hasn't reached yet) followed by `--- SOURCE 2: PEER-REVIEWED
+  SCIENTIFIC PAPERS ---` — rather than one continuous, uneven-density
+  wall of text. Resources are deliberately listed first: with Stage 1
+  now making both blocks comparably compact, order shouldn't matter much
+  on its own, but leading with the previously-crowded-out source is a
+  small additional nudge.
+
+**Orchestration (`paper_analysis_pipeline.py`).** Stage 1 runs inside
+`analyze_ingredient_papers()`, after the per-paper grade/conclusion loop
+and immediately before the Stage 2 synthesis call: every `VerifiedResource`
+currently stored for the ingredient is queried, and any one still
+missing `extracted_data` gets `extract_claims_from_resource()` called
+and its result persisted directly onto that row, committed once as a
+batch. Because this queries *every* stored resource (not just ones found
+by this specific grade request), a resource fetched before this feature
+existed gets backfilled automatically the next time its ingredient is
+re-graded — no separate migration/backfill script needed. A resource
+that already has `extracted_data` is skipped (never re-extracted, same
+"doesn't change once assigned" convention as `grade`/`score`). A Stage 1
+failure for one resource is logged and skipped — that resource's
+`extracted_data` stays `None` and Stage 2 falls back to its raw summary
+for that one entry, never blocking Stage 2 from running with whatever
+IS available.
+
+**Schema (`models/research.py` / `db.py`).** `VerifiedResource` gained
+`extracted_data: Optional[dict]` (native JSON column, same pattern as
+`ResearchPaper.rubric_evaluation`) — additive on a table that already
+existed in deployed (Phase 7/8) databases, so `db.py::
+_migrate_verified_resource_columns` gained a fourth column
+(`extracted_data JSON`) alongside `grade`/`score`/`reasoning_summary`.
+`None` is a normal, expected state for two distinct reasons a caller
+must not conflate: not yet extraction-attempted, or extraction attempted
+but genuinely nothing to report — the second case is stored as a real
+dict with every field null/empty, not a bare `None`, so it's
+distinguishable if that ever matters.
+
+**Verification.** `python3 -m py_compile` on all five touched/new files
+(`models/research.py`, `db.py`, `services/resource_extractor.py`,
+`services/paper_analysis_pipeline.py`, `services/conclusion_grader.py`)
+passes cleanly. No frontend files touched this phase.
+
+## Gemini Rate Limiting & Execution Reordering (Phase 18)
+
+Follow-up to a reported `429 ResourceExhausted` problem during paper
+grading: under sustained traffic, a burst of newly-found papers graded
+back-to-back with no spacing could all land in the same one-minute quota
+window and start failing together, effectively starving the later steps
+(Stage 1 resource extraction, Stage 2 synthesis) of any remaining quota.
+
+**Corrected exception type — a real bug in the task's own reference
+code.** The task's reference implementation imports
+`google.api_core.exceptions.ResourceExhausted`. This backend's Gemini
+dependency is `google-genai` (`from google import genai` —
+`backend/requirements.txt`: `google-genai>=1.0,<2.0`), the newer unified
+Gen AI SDK — not `google-generativeai`/Vertex AI, which are what
+actually raise `ResourceExhausted`. Verified against the `google-genai`
+SDK's own source/issue tracker: a 429 quota error there surfaces as
+`google.genai.errors.ClientError` (a subclass of `APIError`, carrying a
+`.code: int` and `.status: Optional[str] == "RESOURCE_EXHAUSTED"`).
+Using the task's literal import would have silently defeated the whole
+feature — that `except` clause would never match anything `google-genai`
+actually raises, and every 429 would fall straight through unretried.
+`backend/app/services/gemini_rate_limit.py` (new) checks for the correct
+type.
+
+**New shared module: `backend/app/services/gemini_rate_limit.py`.**
+Deliberately factored out as its own small module — not duplicated
+inside both `paper_grader.py` and `resource_extractor.py` (the two files
+this task named for the change) — since retry/backoff pacing logic is
+pure infrastructure, identical no matter which Gemini call it wraps,
+unlike this codebase's established "small graders may duplicate their
+own rubric-loading logic until a third one shows up" convention (see
+`conclusion_grader.py`'s docstring), which is about domain-specific
+scoring logic, not generic retry plumbing. Two functions:
+
+- **`throttle_gemini_call()`** — called immediately before every
+  `client.models.generate_content(...)` in `paper_grader.py` and
+  `resource_extractor.py`. Enforces a minimum ~4.5s gap since the *last*
+  Gemini call made anywhere in this process, via one lock-guarded,
+  process-wide timestamp — not a per-loop local sleep. This is stricter
+  (and more correct) than the task's literal "sleep 4.5s in this one
+  loop": a per-loop sleep does nothing to stop two concurrent grade
+  requests from each independently pacing to 13 RPM while jointly still
+  exceeding the actual account-wide limit; a single shared timestamp
+  bounds the real aggregate rate regardless of how many requests are in
+  flight (same "fine for a single-process dev/prototype app, revisit
+  under real concurrent load" caveat as `app/db.py`'s SQLite locking
+  discussion).
+- **`call_gemini_with_retry(prompt_func, max_retries=4, label=...)`** —
+  wraps one Gemini call with exponential backoff (5s/10s/20s/40s)
+  specifically on a 429/`RESOURCE_EXHAUSTED` response; every other
+  exception propagates immediately, unretried. Small refinement over the
+  task's literal reference: does NOT sleep again after a final,
+  still-failing attempt — sleeping 40s only to immediately give up
+  afterward would be pure wasted latency.
+
+**Deliberate deviation: synchronous, not `async def`.** Same reasoning
+already applied to `resource_extractor.py` in Phase 17 — every
+Gemini-calling service in this codebase makes a blocking, synchronous
+call from a plain sync function always run inside a `run_in_threadpool`
+worker thread, never from an `async def` caller; an async retry wrapper
+around a call that's never actually awaited would be a false-async
+signature. `time.sleep()` blocks the worker thread the same way
+`await asyncio.sleep()` would block an event-loop task.
+
+**Execution reordering (`paper_analysis_pipeline.py`).** Stage 1
+resource-claims extraction now runs **before** the per-paper grading
+loop (previously ran after it). Verified-resource *fetching* itself
+(`resource_fetcher.py`, including its own Phase 8 `grade_resource()`
+calls) already ran before `analyze_ingredient_papers()` even started —
+see the Phase 16 audit — but Stage 1 *extraction* (Phase 17, inside this
+function) was still sequenced after paper grading, meaning a quota
+exhausted by a large batch of papers left nothing for it. Reordering
+gives Stage 1 first claim on whatever quota is available each run.
+
+**`MAX_PAPERS_PER_GRADED_INGREDIENT = 6`.** Caps how many papers one
+`analyze_ingredient_papers()` run actually grades/processes, regardless
+of how many are stored. Papers are ranked by `_paper_relevance_sort_key`
+before the cap applies — a two-tier heuristic: already-graded papers
+first (ordered by real `grade_score`, since re-processing them costs no
+Gemini call), then ungraded papers ordered by how many distinct
+Gemini-generated search keywords matched them (a rough pre-grading
+relevance proxy — no per-paper relevance score exists before grading
+happens). **Known, documented trade-off:** since the same top-ranked
+papers win every run, a lower-ranked paper can in principle never get
+processed if 6+ higher-ranked ones persist for the same ingredient —
+accepted as a deliberate simplicity trade-off for this debug-stage
+feature, not silently overlooked.
+
+**Known gap, out of scope this phase.** `conclusion_grader.py`'s own two
+Gemini calls (`process_paper_conclusions`, `synthesize_ingredient_summary`)
+are NOT wired through `gemini_rate_limit.py` — that file wasn't part of
+this task's authorized 3-file scope (`paper_analysis_pipeline.py`,
+`paper_grader.py`, `resource_extractor.py`). A rate-limit hit there still
+surfaces as an ordinary, unretried `ConclusionGradingError`, caught and
+logged exactly as before — never a hard crash, but also never
+retried/backed-off.
+
+**Verification.** `python3 -m py_compile` on all four touched/new files
+(`services/gemini_rate_limit.py`, `services/paper_grader.py`,
+`services/resource_extractor.py`, `services/paper_analysis_pipeline.py`)
+passes cleanly. No frontend files touched this phase.
+
+## Extracted Conclusions for Papers & Verified Resources (Phase 19)
+
+Adds a short, factual `extracted_conclusions: List[str]` (2-4 items) to
+both `ResearchPaper` and `VerifiedResource`, rendered under a new
+"Extracted Conclusions" heading in each item's "(i)" info modal.
+
+**Where the info modals actually live.** The task's own description
+pointed at `src/components/IngredientCard.tsx` for this UI. That file is
+a pure passthrough — it hands `papers`/`verified_resources` straight to
+`StudiesList`/`VerifiedResourcesList` and owns no `Modal` markup of its
+own (confirmed by grep: zero matches for `Modal`/`infoModal` in that
+file). The two actual `activeInfoModalItem` `Modal` implementations live
+in `StudiesList.tsx` (papers) and `VerifiedResourcesList.tsx` (verified
+resources) — this is where the new section was actually added.
+`IngredientCard.tsx` itself only got a doc-comment clarifying this, since
+the new field flows through its existing prop passthrough with no
+transformation code needed.
+
+**Deliberate deviation: one Gemini call per item, not two.** The task's
+reference prompt template sketched `extracted_conclusions` as its own
+dedicated Gemini call, separate from existing extraction/grading. Both
+`paper_grader.py::grade_paper()` and
+`resource_extractor.py::extract_claims_from_resource()` instead fold it
+into their SAME existing structured-output call (one extra
+`extracted_conclusions: List[str]` field on each call's response schema,
+one extra prompt paragraph) rather than issuing a second Gemini request
+per paper/resource. Doubling Gemini calls here would work directly
+against Phase 18's rate-limiting pass (`gemini_rate_limit.py`), which
+exists specifically to reduce how many Gemini requests this pipeline
+makes per grade run. Both cap the model's own list length server-side
+(`extracted_conclusions[:4]`) rather than trusting Gemini to honor the
+stated "2 to 4" bound — same philosophy as every rubric score clamp and
+`key_takeaways[:3]` elsewhere in this codebase.
+
+**Source-specific extraction (`resource_extractor.py`).** Every entry in
+`docs/verified_resource_apis.json` already had a populated
+`extraction_instructions` string (no config changes needed this phase).
+A new `_find_extraction_instructions(domain)` helper matches a
+`VerifiedResource.domain` against each config entry's `domain` by suffix
+(same convention as `resource_fetcher.py::_is_verified_domain`, since a
+resource's real host can be a subdomain of the configured one, e.g.
+`connect.medlineplus.gov` vs. `medlineplus.gov`) and folds the matched
+provider's instructions into `_build_prompt()`, so Gemini extracts
+conclusions following that specific provider's own guidance (e.g.
+PubChem's "focus on biological role... and documented toxicity/safety
+baseline" vs. DailyMed's "focus on INDICATIONS & USAGE/DOSAGE AND
+ADMINISTRATION/WARNINGS"). The config file is read fresh on every call
+via a new, non-`@lru_cache`d `_load_resource_api_configs()` — matching
+`resource_fetcher.py`'s own established "config edits take effect
+without a restart" convention for this same file — rather than reusing
+`resource_fetcher.py`'s private loader, since this JSON is shared config,
+not owned by either module.
+
+**`extracted_data` vs. `extracted_conclusions` on `VerifiedResource`.**
+Both come out of the same Stage 1 Gemini call but are stored in two
+separate columns. `extracted_data` keeps its pre-existing four-field
+shape (`official_stance`/`recommended_dose`/`upper_limit_warning`/
+`key_takeaways`) unchanged, since Stage 2 synthesis
+(`conclusion_grader.py::_format_resources_for_prompt`) reads those four
+keys directly and would need reshaping if a fifth, list-shaped key were
+merged in. `extracted_conclusions` is a separate, flat, display-only list
+purpose-built for the frontend info modal — `paper_analysis_pipeline.py`
+splits the single dict `extract_claims_from_resource()` returns into
+`resource.extracted_data` (the original four fields) and
+`resource.extracted_conclusions` (the new list) before committing.
+
+**Paper grading (`paper_grader.py`).** `grade_paper()`'s existing
+structured-output call (already producing `grade`/`grade_score`/
+`rubric_evaluation`/relevance) now also returns `extracted_conclusions` —
+2-4 short findings the paper's own title/abstract actually states (a
+measured effect size, a tolerability/safety finding, a studied dosage),
+explicitly instructed to return an empty list rather than fabricate
+anything when the abstract is missing or too sparse. Persisted onto
+`ResearchPaper.extracted_conclusions` by `grade_single_paper()`.
+
+**API exposure.** `extracted_conclusions: Optional[List[str]] = None`
+added to both `ResearchPaperResponse` and `VerifiedResourceResponse`
+(`backend/app/schemas/research.py`); `search.py`'s
+`to_research_paper_response()` and `get_ingredient_resources()` both pass
+the ORM column straight through with no reshaping.
+
+**Frontend.** `ResearchPaper`/`VerifiedResource` (`src/services/api.ts`)
+each gained an `extracted_conclusions?: string[] | null` field.
+`StudiesList.tsx`'s paper info modal gained an "Extracted Conclusions"
+section (bulleted, between the abstract and the "View Source" button);
+`VerifiedResourcesList.tsx`'s resource info modal gained the same section
+as its new last `modalSection` (after Summary). Both render the required
+"No specific conclusions extracted for this source yet." fallback text
+when the field is null/empty, rather than hiding the section — an honest
+signal that extraction/grading hasn't produced a result yet, not an
+error state.
+
+**Migrations.** `extracted_conclusions` (`JSON`, nullable) added to both
+`_RESEARCH_PAPER_COLUMNS` and `_VERIFIED_RESOURCE_COLUMNS` in
+`backend/app/db.py`, applied via the existing idempotent
+`ALTER TABLE ... ADD COLUMN` migration helpers — no new migration
+mechanism needed.
+
+**Verification.** `python3 -m py_compile` on every touched backend file
+(`models/research.py`, `db.py`, `services/paper_grader.py`,
+`services/resource_extractor.py`, `services/paper_analysis_pipeline.py`,
+`schemas/research.py`, `services/search.py`) and `npx tsc --noEmit` on
+the frontend (`services/api.ts`, `components/StudiesList.tsx`,
+`components/VerifiedResourcesList.tsx`, `components/IngredientCard.tsx`)
+both pass cleanly.
+
 ## Frontend Structure
 
 ```
@@ -1793,17 +2744,18 @@ frontend/
     │   ├── types.ts             # RootStackParamList (Home/Scan/Library/ResultsScreen), FilterType
     │   └── navigationRef.ts     # Imperative nav ref, used by NavBar (which renders outside the Stack tree)
     ├── components/
-    │   ├── NavBar.tsx            # Persistent top bar: "BSProof" logo (-> Home), Scan / Library links, debug Reset DB
-    │   ├── Footer.tsx             # Persistent footer, reused on every screen
+    │   ├── NavBar.tsx            # Persistent top bar: "BSProof" logo (-> Home), Scan / Library links, debug Reset DB; always visible, no scroll-driven show/hide (Phase 12 added hide-on-scroll, reverted Phase 13)
+    │   ├── Footer.tsx             # Persistent footer, reused on every screen — normal document flow (never fixed/sticky), pinned to viewport bottom via each screen's own flex layout (Phase 12)
     │   ├── ImageUploader.tsx     # Upload button + image preview (styled to palette)
     │   ├── ProductCard.tsx       # Expandable product card (metadata + nested Ingredient accordion + grade badge + orange-on-expand text)
-    │   ├── IngredientCard.tsx    # Accordion card, two variants: 'nested' (dosage/%DV/research) and 'standalone' (grade badge + 3 placeholder info blocks + bordered "Scientific Information" section with centered title + summary sentence + orange-on-expand text)
+    │   ├── IngredientCard.tsx    # Accordion card, two variants: 'nested' (dosage/%DV/research) and 'standalone' (grade badge + General Information/Grade Info/Scientific Information/Related Products, each its own collapsible StandaloneInfoSection card — Phase 12)
+    │   ├── StandaloneInfoSection.tsx  # Shared bordered/collapsible card wrapper (#E85D04 border, centered bold title, chevron toggle) for IngredientCard's four top-level standalone sections (Phase 12)
     │   ├── CollapsibleSection.tsx     # Shared collapsible/bordered list wrapper (chevron toggle, #E0E0E0 border) used by StudiesList/RecommendedUsesList/VerifiedResourcesList (Phase 9)
     │   ├── GradeCircleBadge.tsx       # Shared round A-E letter-grade badge (row + modal-header variants) used by all three lists (Phase 9)
     │   ├── ExternalLinkIconButton.tsx # Shared "🌐" open-in-new-tab row action used by StudiesList/VerifiedResourcesList (Phase 9)
     │   ├── StudiesList.tsx       # Paginated (5/page) "List of Studies (Total: N)" panel — ResearchPaper rows, rubric + info modals, external-link button (Phase 2, unified Phase 9)
-    │   ├── RecommendedUsesList.tsx    # "Recommended Uses List" — paginated (5/page) PaperConclusion list, graded C+, rubric + info modals (Phase 5, unified Phase 9)
-    │   ├── VerifiedResourcesList.tsx  # "Verified Online Resources" — official government/regulatory reference links (Phase 7), grade/score badges (Phase 8), paginated (5/page) with rubric + info modals (Phase 9)
+    │   ├── RecommendedUsesList.tsx    # "Recommended Uses List" — paginated (5/page) PaperConclusion list, graded C+, sorted A->E then score before paginating (Phase 12), rubric + info modals (Phase 5, unified Phase 9)
+    │   ├── VerifiedResourcesList.tsx  # "Verified Online Resources" — official government/regulatory reference links (Phase 7), grade/score badges (Phase 8), sorted A->E then score before paginating (Phase 12), paginated (5/page) with rubric + info modals (Phase 9)
     │   ├── StudiesAnalysisBar.tsx     # UNUSED as of Phase 9 (no longer imported by IngredientCard.tsx) — its total-count/average-grade metrics moved into StudiesList's title bar and IngredientCard's summary sentence, respectively; left in place, not deleted
     │   ├── Pagination.tsx        # Shared prev/next + page indicator, used by all three Scientific Information lists
     │   └── GradeBadge.tsx        # Shared top-right grade pill/button (graded vs. ungraded), used by ProductCard + standalone IngredientCard
@@ -1811,12 +2763,12 @@ frontend/
     │   ├── HomeScreen.tsx        # Marketing hero (full-width, looping video background via expo-video) + "Why BSProof?" info section (20% inset) + Footer
     │   ├── ScanScreen.tsx        # ImageUploader + Analyze button + raw-JSON Results section + Footer
     │   ├── LibraryScreen.tsx     # Search (live suggestions) + Explore (Products/Ingredients cards) + Footer
-    │   └── ResultsScreen.tsx     # Back button + title/filter row, ProductCard/IngredientCard list, + Footer
+    │   └── ResultsScreen.tsx     # Back button + title/filter row is the FlatList's own ListHeaderComponent (scrolls with content, not sticky — Phase 12); header's horizontal inset shares `layout.screenHorizontalPadding` with the card list below it, flush left/right (Phase 13), ProductCard/IngredientCard list, + Footer
     ├── services/
     │   └── api.ts                # API_BASE_URL, uploadSupplementImage(), fetchSuggestions(), searchSupplements(), fetchProductDetail(), fetchIngredientDetail(), gradeIngredient(), resetDatabase()
     └── utils/
         ├── animations.ts          # animateCardToggle() — shared LayoutAnimation helper for accordion cards
-        └── grades.ts               # GRADE_COLORS, GRADE_RANK, getGradeRank(), isPaperGrade() — shared grade-letter helpers (Phase 5)
+        └── grades.ts               # GRADE_COLORS, GRADE_RANK, getGradeRank(), isPaperGrade(), sortByGradeThenScore() (Phase 12) — shared grade-letter helpers (Phase 5)
 ```
 
 ### Navigation

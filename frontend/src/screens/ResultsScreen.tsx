@@ -214,81 +214,130 @@ const ResultsScreen: React.FC = () => {
     }
   };
 
+  // Rendered as the FlatList's own ListHeaderComponent (below) rather
+  // than a sibling View above it — see that prop's usage for why: a
+  // sibling would sit permanently pinned above the scrollable area
+  // (effectively acting sticky even without any explicit `position:
+  // sticky`/`fixed` styling), whereas a ListHeaderComponent is genuinely
+  // part of the list's own scrollable content and scrolls away with
+  // everything else, per the "page headers scroll naturally with
+  // content" layout requirement.
+  const listHeader = (
+    <View style={styles.body}>
+      <Pressable
+        style={styles.backButton}
+        onPress={handleGoBack}
+        accessibilityRole="button"
+        accessibilityLabel="Go back"
+        hitSlop={8}
+      >
+        <Ionicons name="arrow-back" size={22} color={colors.brown} />
+      </Pressable>
+
+      <View style={styles.titleRow}>
+        <Text style={styles.headerTitle}>{headerText}</Text>
+        {/* Visual placeholder only — not wired to any filtering
+            behavior yet. */}
+        <Ionicons
+          name="filter"
+          size={20}
+          color={colors.brown}
+          accessibilityLabel="Filter (coming soon)"
+        />
+      </View>
+    </View>
+  );
+
   return (
     <View style={styles.screen}>
-      <View style={styles.body}>
-        <Pressable
-          style={styles.backButton}
-          onPress={handleGoBack}
-          accessibilityRole="button"
-          accessibilityLabel="Go back"
-          hitSlop={8}
-        >
-          <Ionicons name="arrow-back" size={22} color={colors.brown} />
-        </Pressable>
-
-        <View style={styles.titleRow}>
-          <Text style={styles.headerTitle}>{headerText}</Text>
-          {/* Visual placeholder only — not wired to any filtering
-              behavior yet. */}
-          <Ionicons
-            name="filter"
-            size={20}
-            color={colors.brown}
-            accessibilityLabel="Filter (coming soon)"
-          />
-        </View>
-      </View>
-
       {isLoading ? (
-        <View style={styles.centered}>
-          <ActivityIndicator size="large" color={colors.orange} />
-        </View>
+        <>
+          {listHeader}
+          <View style={styles.centered}>
+            <ActivityIndicator size="large" color={colors.orange} />
+          </View>
+          <Footer />
+        </>
       ) : errorMessage ? (
-        <View style={styles.centered}>
-          <Text style={styles.errorText}>{errorMessage}</Text>
-        </View>
+        <>
+          {listHeader}
+          <View style={styles.centered}>
+            <Text style={styles.errorText}>{errorMessage}</Text>
+          </View>
+          <Footer />
+        </>
       ) : (
         <FlatList
           ref={flatListRef}
+          // `flex: 1` lets this list claim the remaining vertical space
+          // in `screen`'s flex column; paired with `contentContainerStyle`'s
+          // `flexGrow: 1` below, a short results list still stretches to
+          // fill that space so Footer (now `ListFooterComponent`, genuine
+          // list content — see below) anchors at the viewport bottom
+          // instead of floating right under a couple of cards. On a tall
+          // results list this has no effect beyond the normal scrollable
+          // behavior — Footer simply becomes visible once the user
+          // scrolls past the last card, same as every other screen.
+          style={styles.flatList}
           data={results}
           keyExtractor={(item) => `${item.type}-${item.id}`}
+          ListHeaderComponent={listHeader}
+          // Footer is rendered as genuine list content here — not as a
+          // sibling next to the FlatList — specifically so it can never
+          // end up in a separate, independently-sized flex box from the
+          // cards above it (which is what let it visually overlap/cut
+          // off the last card before this fix: a `flex: 1` FlatList
+          // sitting next to a `flex: 1` Footer.tsx creates a second,
+          // FlatList-bounded scroll region distinct from the page's own
+          // flow, so Footer — a normal-height sibling right after it —
+          // could end up pinned at the bottom of that bounded region
+          // regardless of whether the user had actually scrolled the
+          // list to its end). As `ListFooterComponent`, Footer is simply
+          // the last row in the one true scrollable list, guaranteed to
+          // render immediately after the last card with no independent
+          // sizing of its own — it becomes visible if and only if the
+          // user has scrolled past everything above it. See `listContent`
+          // below for why this doesn't compromise Footer's usual
+          // full-bleed (edge-to-edge, unpadded) width.
+          ListFooterComponent={<Footer />}
           contentContainerStyle={styles.listContent}
-          renderItem={({ item, index }) =>
-            item.type === 'product' ? (
-              <ProductCard
-                product={toProduct(item)}
-                isExpanded={expandedProductId === item.id}
-                onToggle={() => {
-                  animateCardToggle();
-                  setExpandedProductId((current) => {
-                    const next = current === item.id ? null : item.id;
-                    if (next !== null) {
-                      scrollToItemIndex(index);
-                    }
-                    return next;
-                  });
-                }}
-                onNestedIngredientExpand={() => scrollToItemIndex(index)}
-              />
-            ) : (
-              <IngredientCard
-                ingredient={toIngredient(item)}
-                variant="standalone"
-                isExpanded={expandedIngredientId === item.id}
-                onToggle={() => {
-                  animateCardToggle();
-                  setExpandedIngredientId((current) => {
-                    const next = current === item.id ? null : item.id;
-                    if (next !== null) {
-                      scrollToItemIndex(index);
-                    }
-                    return next;
-                  });
-                }}
-              />
-            )
-          }
+          renderItem={({ item, index }) => (
+            <View style={styles.itemWrapper}>
+              {item.type === 'product' ? (
+                <ProductCard
+                  product={toProduct(item)}
+                  isExpanded={expandedProductId === item.id}
+                  onToggle={() => {
+                    animateCardToggle();
+                    setExpandedProductId((current) => {
+                      const next = current === item.id ? null : item.id;
+                      if (next !== null) {
+                        scrollToItemIndex(index);
+                      }
+                      return next;
+                    });
+                  }}
+                  onNestedIngredientExpand={() => scrollToItemIndex(index)}
+                />
+              ) : (
+                <IngredientCard
+                  ingredient={toIngredient(item)}
+                  variant="standalone"
+                  isExpanded={expandedIngredientId === item.id}
+                  onToggle={() => {
+                    animateCardToggle();
+                    setExpandedIngredientId((current) => {
+                      const next = current === item.id ? null : item.id;
+                      if (next !== null) {
+                        scrollToItemIndex(index);
+                      }
+                      return next;
+                    });
+                  }}
+                />
+              )}
+            </View>
+          )}
           // scrollToIndex needs the target row already measured; this is
           // a defensive fallback (item not yet laid out) rather than the
           // expected path — the tapped card is always already on screen.
@@ -308,8 +357,6 @@ const ResultsScreen: React.FC = () => {
           }
         />
       )}
-
-      <Footer />
     </View>
   );
 };
@@ -319,14 +366,40 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: colors.offWhite,
   },
+  // See the inline comment where this is applied — lets the list claim
+  // remaining vertical space so Footer pins to the bottom of the
+  // viewport rather than riding up under a short results list.
+  flatList: {
+    flex: 1,
+  },
+  // The screen's *only* source of horizontal inset for the header —
+  // `listContent` below deliberately does NOT also set
+  // `paddingHorizontal` (a previous pass had it on both, which double-
+  // padded the header: once here, once again from `listContent`, since
+  // this whole `body` View is rendered as the FlatList's
+  // `ListHeaderComponent` and therefore a child of that padded
+  // container — that's what made the header render as a narrow,
+  // centered box next to full-width cards). `itemWrapper` below applies
+  // this exact same `layout.screenHorizontalPadding` token to each card
+  // instead, so the header and every card share one single, unduplicated
+  // inset — guaranteed identical left/right edges without a hardcoded
+  // `maxWidth` to keep in sync between the two.
   body: {
     paddingVertical: spacing.xl,
     paddingHorizontal: layout.screenHorizontalPadding,
     gap: spacing.md,
   },
+  // No `padding` here (previously `padding: spacing.xs`, inherited from
+  // this screen's very first version) — that extra padding shifted the
+  // back arrow's actual visual edge inward by 4px past `body`'s own
+  // horizontal inset, so it sat slightly to the right of where a card's
+  // left border lines up below it. `hitSlop` alone still gives the
+  // button a comfortable tap target, without moving its rendered
+  // position — so the arrow's icon glyph now sits flush with the card
+  // grid's left edge, matching the filter icon (bare `Ionicons`, no
+  // padding of its own) on the right, which was already flush.
   backButton: {
     alignSelf: 'flex-start',
-    padding: spacing.xs,
   },
   titleRow: {
     flexDirection: 'row',
@@ -356,11 +429,27 @@ const styles = StyleSheet.create({
     color: colors.brown,
     textAlign: 'center',
   },
+  // No `paddingHorizontal` here — see `body`'s own comment above for
+  // why: this is the FlatList's `contentContainerStyle`, the shared
+  // parent of the header, every card (via `itemWrapper` below), AND now
+  // `Footer` (as `ListFooterComponent`). Padding it here would inset all
+  // three uniformly, including Footer — which is supposed to stay
+  // full-bleed edge-to-edge, same as it is on every other screen (see
+  // theme.ts's `layout.screenHorizontalPadding` docstring: "deliberately
+  // NOT applied to NavBar, Footer, ..."). `gap` still applies (a flex
+  // `gap` is independent of horizontal padding) — it's what puts a
+  // little breathing room between the header, each card, and Footer.
   listContent: {
     flexGrow: 1,
-    paddingHorizontal: layout.screenHorizontalPadding,
-    paddingBottom: spacing.xl,
     gap: spacing.md,
+  },
+  // Applied per-card (not on `listContent`, which stays unpadded so
+  // Footer can render full-bleed — see that style's comment) — the same
+  // `layout.screenHorizontalPadding` token `body` uses for the header,
+  // so every card lines up with the header's back arrow/filter icon
+  // exactly, from one single inset source.
+  itemWrapper: {
+    paddingHorizontal: layout.screenHorizontalPadding,
   },
 });
 

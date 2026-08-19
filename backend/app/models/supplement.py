@@ -113,6 +113,31 @@ class Ingredient(SQLModel, table=True):
     is_graded: bool = Field(default=False)
     grade_badge_text: Optional[str] = Field(default=None)
 
+    # --- Multi-source ingredient summary synthesis
+    # (app/services/conclusion_grader.py::synthesize_ingredient_summary) ---
+    # A single Gemini-synthesized 1-2 sentence overview combining BOTH
+    # graded ResearchPaper findings and VerifiedResource official
+    # guidance (NIH/USDA/EFSA/Health Canada/...) for this ingredient —
+    # e.g. "Analyzed 12 studies and 4 official resources. Average score:
+    # B (78/100). Primary consensus confirms efficacy for X with strong
+    # support from NIH/EFSA guidelines." Rendered directly beneath the
+    # "Scientific Information" section title on the frontend (see
+    # src/components/IngredientCard.tsx). None until
+    # app/services/paper_analysis_pipeline.py::analyze_ingredient_papers
+    # successfully generates one (best-effort — a Gemini failure here is
+    # logged and skipped, same "leave it null, don't fail the whole
+    # grade request" convention as ResearchPaper.grade/
+    # VerifiedResource.grade), and also None if the ingredient had zero
+    # graded papers AND zero verified resources to synthesize from at
+    # generation time (see that function's docstring) — the frontend
+    # falls back to a client-computed heuristic sentence in that case
+    # rather than showing nothing (see IngredientCard.tsx's
+    # `scientificSummary`). Nullable/added after `ingredients` already
+    # existed in deployed databases — same additive-migration story as
+    # `is_graded`/`grade_badge_text` above; see
+    # app/db.py::_migrate_ingredient_grading_columns.
+    summary_description: Optional[str] = Field(default=None)
+
     product_links: List["ProductIngredientLink"] = Relationship(
         back_populates="ingredient",
     )
@@ -124,6 +149,27 @@ class Ingredient(SQLModel, table=True):
     # imported anywhere (see app/db.py, which imports both modules at
     # startup specifically for this).
     papers: List["ResearchPaper"] = Relationship(back_populates="ingredient")
+    # Same forward-reference/circular-import reasoning as `papers` above,
+    # now mirrored for VerifiedResource (see app/models/research.py) —
+    # added so `Ingredient <-> VerifiedResource` has the same explicit,
+    # queryable ORM relationship `Ingredient <-> ResearchPaper` already
+    # has, rather than only being reachable via a manual `select(...)
+    # .where(VerifiedResource.ingredient_id == ...)` query. Every current
+    # read path (app/services/conclusion_grader.py::
+    # synthesize_ingredient_summary, app/services/search.py::
+    # get_ingredient_resources) already queries VerifiedResource directly
+    # rather than through this relationship — see synthesize_ingredient_summary's
+    # own docstring for why that's deliberate (a direct query in the same
+    # session always sees rows already `flush()`ed earlier in the same
+    # request, with no risk of a stale/cached relationship collection) —
+    # so this relationship is additive/for-parity rather than something
+    # existing code needs to start using. `lazy="selectin"` is intentionally
+    # NOT set here: this app's established convention (see `papers` above,
+    # and app/services/search.py's own docstring) is explicit per-request
+    # queries over ORM lazy-loading for anything an API response needs to
+    # serialize, to avoid N+1s and DetachedInstanceError surprises outside
+    # an active session.
+    verified_resources: List["VerifiedResource"] = Relationship(back_populates="ingredient")
 
 
 class ProductIngredientLink(SQLModel, table=True):

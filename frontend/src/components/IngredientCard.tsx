@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { View, Text, Pressable, StyleSheet, Alert } from 'react-native';
+import { View, Text, Pressable, StyleSheet, Alert, Image } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 
 import { colors, spacing, typography } from '../theme';
@@ -9,12 +9,38 @@ import GradeBadge, { PLACEHOLDER_GRADE_VALUE } from './GradeBadge';
 import StudiesList from './StudiesList';
 import RecommendedUsesList from './RecommendedUsesList';
 import VerifiedResourcesList from './VerifiedResourcesList';
+import StandaloneInfoSection from './StandaloneInfoSection';
+import Pagination from './Pagination';
 import {
   fetchIngredientDetail,
   gradeIngredient,
   PAPER_STATUS_DISCARDED_IRRELEVANT,
 } from '../services/api';
 import type { PaperConclusion, ResearchPaper, VerifiedResource } from '../services/api';
+
+/** Max related products shown per page — same "5 per list page" rule
+ * every other Scientific Information list panel uses (see
+ * StudiesList.tsx/RecommendedUsesList.tsx/VerifiedResourcesList.tsx's own
+ * PAGE_SIZE constants). */
+const RELATED_PRODUCTS_PAGE_SIZE = 5;
+
+/** One product this ingredient appears in, for the "Related Products"
+ * section below. No backend endpoint returns this list yet (Ingredient
+ * is canonical/shared data — see this file's own docs on the M2M schema
+ * — and the only thing GET /api/v1/ingredients/{id} currently exposes
+ * about an ingredient's products is the bare `productCount` number, not
+ * which products they are). Defined here, and wired all the way through
+ * `Ingredient.relatedProducts` below, so the moment a
+ * "GET /api/v1/ingredients/{id}/products"-shaped endpoint exists this
+ * section only needs a data source plugged in, not a UI rewrite — see
+ * the empty-state handling further down for how this gap is surfaced
+ * honestly in the meantime rather than fabricating rows. */
+export interface RelatedProduct {
+  id: number;
+  name: string;
+  brand?: string;
+  thumbnailUrl?: string;
+}
 
 /**
  * A single ingredient/nutrient row. This card is used in two different
@@ -62,6 +88,16 @@ export interface Ingredient {
    * populates this with a real value before a grade request has been
    * made, so it's effectively always `undefined` on initial load today. */
   grade_badge_text?: string;
+  /** Gemini-synthesized 1-2 sentence overview combining BOTH graded
+   * ResearchPaper findings and VerifiedResource official guidance
+   * (NIH/USDA/EFSA/Health Canada/...) — see backend/app/services/
+   * conclusion_grader.py::synthesize_ingredient_summary. Same
+   * "undefined = not loaded yet" convention as `papers`/`conclusions`/
+   * `verified_resources` below; also legitimately absent (not just
+   * unloaded) when the backend had no evidence to synthesize from yet —
+   * see `scientificSummary`'s fallback logic below for how that's
+   * handled. */
+  summary_description?: string;
   /** Every stored ResearchPaper for this ingredient (see
    * backend/app/models/research.py), rendered by StudiesList inside the
    * standalone variant's "Scientific information" section. `undefined`
@@ -83,22 +119,24 @@ export interface Ingredient {
    * "undefined = not loaded yet, lazily fetched on first expand"
    * convention as `papers`/`conclusions` above. */
   verified_resources?: VerifiedResource[];
-}
-
-/** Renders one generic placeholder info block (label + italic placeholder
- * body) — shared by the "before" and "after" halves of
- * STANDALONE_INFO_BLOCKS_BEFORE_SCIENCE/_AFTER_SCIENCE above, since the
- * "Scientific information" section between them is no longer part of
- * that same simple array/map. */
-function renderPlaceholderBlock(block: { label: string; placeholder: string }): React.ReactElement {
-  return (
-    <View key={block.label} style={styles.standaloneInfoBlock}>
-      <Text style={[styles.standaloneInfoLabel, styles.expandedTextColor]}>{block.label}</Text>
-      <Text style={[styles.standaloneInfoText, styles.expandedTextColor]}>
-        {block.placeholder}
-      </Text>
-    </View>
-  );
+  /** Phase 19 note: this component does NOT own any "(i)" info-modal
+   * markup itself — it is a pure passthrough that hands `papers`/
+   * `verified_resources` straight to StudiesList/VerifiedResourcesList
+   * below (see the JSX further down this file), and each of those two
+   * components independently implements its own `activeInfoModalItem`
+   * Modal. The `extracted_conclusions` field added to `ResearchPaper`/
+   * `VerifiedResource` (src/services/api.ts, Phase 19) therefore flows
+   * through to those modals automatically once the item objects carry
+   * it — no transformation logic was needed (or added) in this file. See
+   * StudiesList.tsx's and VerifiedResourcesList.tsx's own "Extracted
+   * Conclusions" modal sections for the actual rendering. */
+  /** Every product this ingredient appears in, for the "Related
+   * Products" section. `undefined` (the only value any current caller
+   * ever sets — see RelatedProduct's own docstring) means "no backend
+   * data source for this yet"; a real caller would use an empty array to
+   * mean "confirmed zero products" instead. Only meaningful for the
+   * `'standalone'` variant. */
+  relatedProducts?: RelatedProduct[];
 }
 
 export type IngredientCardVariant = 'nested' | 'standalone';
@@ -124,42 +162,17 @@ export interface IngredientCardProps {
   variant?: IngredientCardVariant;
 }
 
-/**
- * The stacked placeholder info blocks shown in the standalone layout's
- * expanded body. Content is still placeholder text per this pass's
- * wireframe. `'Science Info'` used to be one of these (swapped for
- * StudiesList) but is now its own fully custom "Scientific information"
- * composite section (header + overview text + RecommendedUsesList +
- * StudiesAnalysisBar + StudiesList — see the render logic below),
- * rendered explicitly between `'Grade Info'` and `'Related Products'`
- * rather than folded into this generic placeholder-block array. The
- * remaining three are tracked in docs/Architecture.md's "Expandable
- * cards" follow-up.
- */
-const STANDALONE_INFO_BLOCKS_BEFORE_SCIENCE: ReadonlyArray<{
-  label: string;
-  placeholder: string;
-}> = [
-  {
-    label: 'General Information',
-    placeholder: 'General ingredient summary and usage information placeholder...',
-  },
-  {
-    label: 'Grade Info',
-    placeholder:
-      'Detailed breakdown of safety, efficacy, and purity grade criteria placeholder...',
-  },
-];
-
-const STANDALONE_INFO_BLOCKS_AFTER_SCIENCE: ReadonlyArray<{
-  label: string;
-  placeholder: string;
-}> = [
-  {
-    label: 'Related Products',
-    placeholder: 'List of products containing this standalone ingredient placeholder...',
-  },
-];
+/** Placeholder body copy for the two still-placeholder standalone
+ * sections ("General Information"/"Grade Info" — real content tracked in
+ * docs/Architecture.md's "Expandable cards" follow-up). Each is now
+ * rendered as its own `StandaloneInfoSection` (see the render logic
+ * below) rather than a shared generic array/map — the section *title* is
+ * the `StandaloneInfoSection` prop, not part of this text, now that each
+ * one is independently collapsible with its own header. */
+const GENERAL_INFORMATION_PLACEHOLDER =
+  'General ingredient summary and usage information placeholder...';
+const GRADE_INFO_PLACEHOLDER =
+  'Detailed breakdown of safety, efficacy, and purity grade criteria placeholder...';
 
 /** Accordion card for a single ingredient. Expansion state is entirely
  * controlled by the parent — see IngredientCardProps.isExpanded/onToggle
@@ -239,6 +252,17 @@ const IngredientCard = React.forwardRef<View, IngredientCardProps>(
     const [verifiedResourcesLoading, setVerifiedResourcesLoading] = useState(false);
     const [verifiedResourcesError, setVerifiedResourcesError] = useState<string | null>(null);
 
+    // --- Backend-synthesized Scientific Information summary sentence
+    // (multi-source: papers + verified resources) — same undefined-until-
+    // fetched convention as the state above. `undefined` covers both
+    // "not fetched yet" and "fetched, but the backend had no evidence to
+    // synthesize from" — `scientificSummary` below can't tell those apart
+    // from this alone, so it also consults `papers`/`conclusions`
+    // (already-loaded-or-not) to pick the right fallback message.
+    const [summaryDescription, setSummaryDescription] = useState<string | undefined>(
+      ingredient.summary_description
+    );
+
     useEffect(() => {
       if (variant !== 'standalone' || !isExpanded || papersFetchAttemptedRef.current) {
         return;
@@ -258,6 +282,7 @@ const IngredientCard = React.forwardRef<View, IngredientCardProps>(
             setPapers(detail.papers);
             setConclusions(detail.conclusions);
             setVerifiedResources(detail.verified_resources);
+            setSummaryDescription(detail.summary_description ?? undefined);
           }
         })
         .catch((error) => {
@@ -300,14 +325,16 @@ const IngredientCard = React.forwardRef<View, IngredientCardProps>(
           papersFetchAttemptedRef.current = true;
 
           // Unlike `papers`, GradeIngredientResponse deliberately doesn't
-          // include `conclusions`/`verified_resources` (see
-          // backend/app/schemas/research.py) — the Phase 5 pipeline may
-          // have just synthesized new/updated conclusions, and the Phase 7
+          // include `conclusions`/`verified_resources`/`summary_description`
+          // (see backend/app/schemas/research.py) — the Phase 5 pipeline may
+          // have just synthesized new/updated conclusions, the Phase 7
           // resource lookup may have just found new official reference
-          // links, as part of this same grade request, so re-fetch
-          // ingredient detail once more to pick both up rather than
-          // leaving RecommendedUsesList/VerifiedResourcesList showing
-          // stale (or empty) data.
+          // links, and the Phase 11 ingredient-level synthesis may have
+          // just produced a fresh `summary_description` from all of the
+          // above, all as part of this same grade request — so re-fetch
+          // ingredient detail once more to pick all three up rather than
+          // leaving RecommendedUsesList/VerifiedResourcesList/the summary
+          // sentence showing stale (or empty) data.
           setConclusionsLoading(true);
           setConclusionsError(null);
           setVerifiedResourcesLoading(true);
@@ -316,6 +343,7 @@ const IngredientCard = React.forwardRef<View, IngredientCardProps>(
             .then((detail) => {
               setConclusions(detail.conclusions);
               setVerifiedResources(detail.verified_resources);
+              setSummaryDescription(detail.summary_description ?? undefined);
             })
             .catch(() => {
               // Best-effort supplementary fetch — the grade request itself
@@ -369,18 +397,37 @@ const IngredientCard = React.forwardRef<View, IngredientCardProps>(
 
     /** One-sentence synthesis shown directly under the "Scientific
      * Information" title (Scientific Information redesign spec) — e.g.
-     * "Analyzed 12 studies across databases. Average score: B (78/100).
-     * Primary consensus indicates: '...'" Entirely client-side/derived
-     * from data already fetched for StudiesList/RecommendedUsesList
-     * (no new backend endpoint) — the average-grade math is the same
-     * band table StudiesAnalysisBar.tsx used to compute before that
-     * standalone metrics block was removed per this redesign (see
-     * `computeAverageGrade` in utils/grades.ts, where that logic now
-     * lives). `conclusions[0]` is the top-confidence synthesized claim —
-     * `IngredientDetailResponse.conclusions` is documented as already
-     * sorted highest-confidence-first by the backend (see api.ts), so no
-     * re-sort is needed here. */
+     * "Analyzed 12 studies and 4 official resources. Average score: B
+     * (78/100). Primary consensus confirms efficacy for X with strong
+     * support from NIH/EFSA guidelines."
+     *
+     * **Priority order:**
+     * 1. `summaryDescription` — the backend's Phase 11 Gemini synthesis
+     *    (backend/app/services/conclusion_grader.py::
+     *    synthesize_ingredient_summary), which considers BOTH graded
+     *    papers AND verified official resources together. Preferred
+     *    whenever present, since it's strictly richer than what the
+     *    client can compute on its own.
+     * 2. A client-side heuristic fallback — the same "average grade +
+     *    top conclusion" sentence this component computed before Phase
+     *    11 existed (the average-grade math lives in
+     *    `computeAverageGrade`, utils/grades.ts) — used whenever the
+     *    backend hasn't produced a `summary_description` yet (no grade
+     *    request has run, the pipeline had zero papers/resources to
+     *    synthesize from, or the Phase 11 Gemini call failed — see that
+     *    function's docstring for when it returns nothing). This keeps
+     *    the section from ever showing blank just because the richer
+     *    synthesis isn't available yet. `conclusions[0]` is the
+     *    top-confidence synthesized claim — `IngredientDetailResponse.
+     *    conclusions` is documented as already sorted
+     *    highest-confidence-first by the backend (see api.ts), so no
+     *    re-sort is needed here.
+     */
     const scientificSummary = useMemo(() => {
+      if (summaryDescription) {
+        return summaryDescription;
+      }
+
       if (papers === undefined) {
         return 'Loading scientific analysis...';
       }
@@ -405,7 +452,23 @@ const IngredientCard = React.forwardRef<View, IngredientCardProps>(
       return `Analyzed ${studyCount} ${
         studyCount === 1 ? 'study' : 'studies'
       } across databases. ${scoreText} ${consensusText}`;
-    }, [papers, conclusions]);
+    }, [summaryDescription, papers, conclusions]);
+
+    // --- "Related Products" section pagination (standalone variant) ---
+    // `ingredient.relatedProducts` is `undefined` on every current
+    // caller (see RelatedProduct's own docstring for the backend gap) —
+    // paginating over `[]` in that case is harmless and keeps this logic
+    // identical to how it'll behave once a real data source exists.
+    const [relatedProductsPage, setRelatedProductsPage] = useState(0);
+    const relatedProducts = ingredient.relatedProducts ?? [];
+    const relatedProductsTotalPages = Math.max(
+      1,
+      Math.ceil(relatedProducts.length / RELATED_PRODUCTS_PAGE_SIZE)
+    );
+    const relatedProductsPageItems = relatedProducts.slice(
+      relatedProductsPage * RELATED_PRODUCTS_PAGE_SIZE,
+      relatedProductsPage * RELATED_PRODUCTS_PAGE_SIZE + RELATED_PRODUCTS_PAGE_SIZE
+    );
 
     return (
       <View ref={ref} style={[styles.card, isExpanded && styles.cardExpanded]}>
@@ -455,21 +518,35 @@ const IngredientCard = React.forwardRef<View, IngredientCardProps>(
 
         {isExpanded && variant === 'standalone' && (
           <View style={styles.expandedSection}>
-            {STANDALONE_INFO_BLOCKS_BEFORE_SCIENCE.map(renderPlaceholderBlock)}
+            {/* "General Information" / "Grade Info" — still placeholder
+                body copy (see GENERAL_INFORMATION_PLACEHOLDER/
+                GRADE_INFO_PLACEHOLDER above; real content tracked in
+                docs/Architecture.md's "Expandable cards" follow-up), now
+                each its own independently-collapsible bordered card
+                (StandaloneInfoSection) — the same outer chrome
+                "Scientific Information" and "Related Products" below
+                use, per the Section Visual Standardization spec. */}
+            <StandaloneInfoSection title="General Information">
+              <Text style={[styles.standaloneInfoText, styles.expandedTextColor]}>
+                {GENERAL_INFORMATION_PLACEHOLDER}
+              </Text>
+            </StandaloneInfoSection>
 
-            {/* "Scientific Information" — redesigned, unified section:
-                bordered outer card (#E85D04) with a centered title and a
-                synthesized one-sentence summary, wrapping the three
-                collapsible list panels (RecommendedUsesList,
-                VerifiedResourcesList, StudiesList — each now shares the
-                same CollapsibleSection border/toggle chrome). The old
-                standalone "Studies Analisis" metrics block
-                (StudiesAnalysisBar) has been removed entirely — its
-                total-studies count now lives in StudiesList's own title
-                bar ("List of Studies (Total: N)"), and its average-grade
-                math now feeds `scientificSummary` above instead. */}
-            <View style={styles.scienceSectionOuter}>
-              <Text style={styles.scienceSectionTitle}>Scientific Information</Text>
+            <StandaloneInfoSection title="Grade Info">
+              <Text style={[styles.standaloneInfoText, styles.expandedTextColor]}>
+                {GRADE_INFO_PLACEHOLDER}
+              </Text>
+            </StandaloneInfoSection>
+
+            {/* "Scientific Information" — a synthesized one-sentence
+                summary wrapping the three collapsible list panels
+                (RecommendedUsesList, VerifiedResourcesList, StudiesList —
+                each sorted worst-to-best... A-to-E by grade, then score,
+                before their own pagination — see each component's own
+                sortByGradeThenScore usage), now sharing the same
+                StandaloneInfoSection chrome as every other top-level
+                section here instead of its own one-off bordered View. */}
+            <StandaloneInfoSection title="Scientific Information">
               <Text style={styles.scienceSectionSummary}>{scientificSummary}</Text>
 
               <RecommendedUsesList
@@ -490,9 +567,83 @@ const IngredientCard = React.forwardRef<View, IngredientCardProps>(
                 errorMessage={papersError}
                 onPaperGraded={handlePaperGraded}
               />
-            </View>
+            </StandaloneInfoSection>
 
-            {STANDALONE_INFO_BLOCKS_AFTER_SCIENCE.map(renderPlaceholderBlock)}
+            {/* "Related Products" — summary sentence + a bordered,
+                paginated (5/page) list of every product this ingredient
+                appears in. No backend endpoint returns that product list
+                yet (see RelatedProduct's own docstring) — the box below
+                renders an honest "not available" empty state rather than
+                fabricating rows whenever `ingredient.relatedProducts` is
+                `undefined`, which is every current caller today. */}
+            <StandaloneInfoSection title="Related Products">
+              <Text style={[styles.relatedProductsSummary, styles.expandedTextColor]}>
+                This ingredient appears in {ingredient.productCount ?? 0}{' '}
+                {ingredient.productCount === 1 ? 'product' : 'products'}.
+              </Text>
+
+              <View style={styles.relatedProductsBox}>
+                {relatedProductsPageItems.length === 0 ? (
+                  <Text style={styles.statusText}>
+                    {ingredient.relatedProducts === undefined
+                      ? 'Product list not available yet.'
+                      : 'No products found for this ingredient.'}
+                  </Text>
+                ) : (
+                  <>
+                    <View style={styles.productList}>
+                      {relatedProductsPageItems.map((product, index) => (
+                        <View
+                          key={product.id}
+                          style={[
+                            styles.productRow,
+                            index === relatedProductsPageItems.length - 1 &&
+                              styles.productRowLast,
+                          ]}
+                        >
+                          <View style={styles.productRowLeft}>
+                            {product.thumbnailUrl && (
+                              <Image
+                                source={{ uri: product.thumbnailUrl }}
+                                style={styles.productThumb}
+                                accessibilityLabel={`${product.name} thumbnail`}
+                              />
+                            )}
+                            <View style={styles.productNameColumn}>
+                              <Text style={styles.productName} numberOfLines={1}>
+                                {product.name}
+                              </Text>
+                              {product.brand && (
+                                <Text style={styles.productBrand} numberOfLines={1}>
+                                  {product.brand}
+                                </Text>
+                              )}
+                            </View>
+                          </View>
+
+                          {/* Placeholder action only — not wired to any
+                              navigation/detail view yet. */}
+                          <Pressable
+                            style={styles.productViewButton}
+                            accessibilityRole="button"
+                            accessibilityLabel={`View ${product.name}`}
+                            hitSlop={6}
+                          >
+                            <Ionicons name="search" size={18} color={colors.orange} />
+                          </Pressable>
+                        </View>
+                      ))}
+                    </View>
+
+                    <Pagination
+                      page={relatedProductsPage}
+                      totalPages={relatedProductsTotalPages}
+                      onPageChange={setRelatedProductsPage}
+                    />
+                  </>
+                )}
+              </View>
+            </StandaloneInfoSection>
           </View>
         )}
 
@@ -623,32 +774,16 @@ const styles = StyleSheet.create({
     paddingBottom: spacing.lg,
     gap: spacing.md,
   },
-  // --- Standalone-variant expanded body (stacked info blocks +
-  // "Scientific Information" composite section) ---
-  // Outer bordered card wrapping the whole "Scientific Information"
-  // section (title + summary sentence + the three collapsible list
-  // panels) — per spec: `1px solid #E85D04` / `12px` radius / `16px`
-  // padding. Deliberately the only place in this section that uses the
-  // bold orange border; each list panel inside gets its own subtler
-  // `colors.neutralBorder` (#E0E0E0) via CollapsibleSection instead, so
-  // the two border colors read as "outer section" vs. "inner list" at a
-  // glance rather than competing.
-  scienceSectionOuter: {
-    borderWidth: 1,
-    borderColor: colors.orange,
-    borderRadius: 12,
-    padding: spacing.md,
-    gap: spacing.sm,
-  },
-  // Centered, enlarged section title — per spec.
-  scienceSectionTitle: {
-    textAlign: 'center',
-    fontSize: typography.sectionTitle,
-    fontWeight: 'bold',
-    color: colors.orange,
-  },
-  // Synthesized one-sentence summary directly under the title — see
-  // `scientificSummary` above for how this text is built.
+  // --- Standalone-variant expanded body ---
+  // Every top-level section (General Information/Grade Info/Scientific
+  // Information/Related Products) now shares one bordered/collapsible
+  // wrapper — see StandaloneInfoSection.tsx — instead of each hand-
+  // rolling its own outer card; only section-specific *inner* content
+  // styles remain here.
+  //
+  // Synthesized one-sentence summary directly under the Scientific
+  // Information title — see `scientificSummary` above for how this text
+  // is built.
   scienceSectionSummary: {
     textAlign: 'center',
     fontSize: typography.resultCardLabel,
@@ -656,22 +791,81 @@ const styles = StyleSheet.create({
     color: colors.orange,
     lineHeight: 18,
   },
-  standaloneInfoBlock: {
-    backgroundColor: `${colors.olive}18`,
-    borderRadius: 8,
-    padding: spacing.md,
-    gap: spacing.xs,
-  },
-  standaloneInfoLabel: {
-    fontSize: typography.resultCardLabel,
-    fontWeight: '700',
-    color: colors.darkGreen,
-  },
   standaloneInfoText: {
     fontSize: typography.resultCardLabel,
     color: `${colors.brown}AA`,
     fontStyle: 'italic',
     lineHeight: 18,
+  },
+  // --- "Related Products" section ---
+  relatedProductsSummary: {
+    fontSize: typography.resultCardLabel,
+    textAlign: 'center',
+  },
+  // Collapsible box wrapping the product rows + pagination — per spec:
+  // `1px solid #E0E0E0` / `8px` radius. Deliberately the same subtler
+  // neutral border CollapsibleSection.tsx uses for the Scientific
+  // Information list panels, distinct from StandaloneInfoSection's
+  // bolder orange outer border this box itself sits inside.
+  relatedProductsBox: {
+    borderWidth: 1,
+    borderColor: colors.neutralBorder,
+    borderRadius: 8,
+    padding: spacing.sm,
+  },
+  statusText: {
+    fontSize: typography.resultCardLabel,
+    fontStyle: 'italic',
+    color: `${colors.orange}AA`,
+    textAlign: 'center',
+    paddingVertical: spacing.sm,
+  },
+  productList: {
+    gap: 0,
+  },
+  productRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    gap: spacing.sm,
+    paddingVertical: spacing.sm,
+    borderStyle: 'dashed',
+    borderBottomWidth: 1,
+    borderColor: colors.orange,
+  },
+  productRowLast: {
+    borderBottomWidth: 0,
+  },
+  productRowLeft: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.sm,
+    minWidth: 0,
+  },
+  productThumb: {
+    width: 32,
+    height: 32,
+    borderRadius: 6,
+    backgroundColor: `${colors.olive}30`,
+  },
+  productNameColumn: {
+    flexShrink: 1,
+  },
+  productName: {
+    fontSize: typography.resultCardLabel,
+    fontWeight: '600',
+    color: colors.orange,
+  },
+  productBrand: {
+    fontSize: typography.resultCardLabel,
+    fontStyle: 'italic',
+    color: `${colors.orange}AA`,
+  },
+  // Magnifying-glass placeholder action button — per spec, not yet wired
+  // to any navigation/detail view.
+  productViewButton: {
+    padding: spacing.xs,
   },
   doseBlock: {
     backgroundColor: `${colors.olive}18`,

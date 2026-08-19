@@ -4,7 +4,7 @@ import { Ionicons } from '@expo/vector-icons';
 
 import { colors, spacing, typography } from '../theme';
 import type { VerifiedResource } from '../services/api';
-import { isPaperGrade } from '../utils/grades';
+import { isPaperGrade, sortByGradeThenScore } from '../utils/grades';
 import Pagination from './Pagination';
 import CollapsibleSection from './CollapsibleSection';
 import GradeCircleBadge from './GradeCircleBadge';
@@ -95,15 +95,32 @@ const VerifiedResourcesList: React.FC<VerifiedResourcesListProps> = ({
     null
   );
 
-  const totalPages = resources ? Math.max(1, Math.ceil(resources.length / PAGE_SIZE)) : 1;
+  // Sorted (grade rank, then score descending — see utils/grades.ts::
+  // sortByGradeThenScore) once per `resources` change, *before*
+  // pagination chunking below, per the Scientific Information section's
+  // "sort before paginating" requirement (same rule StudiesList/
+  // RecommendedUsesList apply). Unlike those two, this list has no
+  // grade-threshold filter — every stored VerifiedResource already
+  // cleared the domain allow-list server-side (see this file's own
+  // docstring), so nothing is excluded here, only reordered; an ungraded
+  // resource (UNGRADED_RANK) simply sorts after every graded one.
+  const sortedResources = useMemo<VerifiedResource[] | undefined>(() => {
+    return resources
+      ? sortByGradeThenScore(resources, (resource) => resource.grade, (resource) => resource.score)
+      : undefined;
+  }, [resources]);
+
+  const totalPages = sortedResources
+    ? Math.max(1, Math.ceil(sortedResources.length / PAGE_SIZE))
+    : 1;
 
   const pageItems = useMemo<VerifiedResource[]>(() => {
-    if (!resources) {
+    if (!sortedResources) {
       return [];
     }
     const start = page * PAGE_SIZE;
-    return resources.slice(start, start + PAGE_SIZE);
-  }, [resources, page]);
+    return sortedResources.slice(start, start + PAGE_SIZE);
+  }, [sortedResources, page]);
 
   // Clamp the current page if the resource list shrinks out from under
   // us (e.g. a fresh grade request replaces `resources` with a
@@ -112,7 +129,7 @@ const VerifiedResourcesList: React.FC<VerifiedResourcesListProps> = ({
     setPage((current) => Math.min(current, totalPages - 1));
   }, [totalPages]);
 
-  const totalCount = resources?.length ?? 0;
+  const totalCount = sortedResources?.length ?? 0;
 
   return (
     <CollapsibleSection
@@ -229,11 +246,35 @@ const VerifiedResourcesList: React.FC<VerifiedResourcesListProps> = ({
                     </Text>
                   </View>
 
-                  <View style={[styles.modalSection, styles.modalSectionLast]}>
+                  <View style={styles.modalSection}>
                     <Text style={styles.modalSectionLabel}>Summary</Text>
                     <Text style={styles.modalSectionValue}>
                       {activeInfoModalItem.summary ?? 'No summary available.'}
                     </Text>
+                  </View>
+
+                  {/* Phase 19 — 2-4 short, factual conclusions extracted
+                      using this provider's own extraction_instructions
+                      (docs/verified_resource_apis.json — see
+                      VerifiedResource.extracted_conclusions's docstring
+                      in backend/app/models/research.py). Null/empty
+                      renders an honest fallback rather than hiding the
+                      section. */}
+                  <View style={[styles.modalSection, styles.modalSectionLast]}>
+                    <Text style={styles.modalSectionLabel}>Extracted Conclusions</Text>
+                    {activeInfoModalItem.extracted_conclusions &&
+                    activeInfoModalItem.extracted_conclusions.length > 0 ? (
+                      activeInfoModalItem.extracted_conclusions.map((conclusion, index) => (
+                        <View key={index} style={styles.extractedConclusionRow}>
+                          <Text style={styles.extractedConclusionBullet}>{'•'}</Text>
+                          <Text style={styles.modalSectionValue}>{conclusion}</Text>
+                        </View>
+                      ))
+                    ) : (
+                      <Text style={styles.modalSectionValue}>
+                        No specific conclusions extracted for this source yet.
+                      </Text>
+                    )}
                   </View>
                 </ScrollView>
               </>
@@ -427,6 +468,15 @@ const styles = StyleSheet.create({
     fontSize: typography.resultCardLabel,
     color: colors.orange,
     lineHeight: 19,
+  },
+  // --- "Extracted Conclusions" bullets (info modal, Phase 19) ---
+  extractedConclusionRow: {
+    flexDirection: 'row',
+    gap: 6,
+  },
+  extractedConclusionBullet: {
+    fontSize: typography.resultCardLabel,
+    color: colors.orange,
   },
   modalSummaryText: {
     fontStyle: 'italic',

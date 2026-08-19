@@ -4,7 +4,7 @@ import { Ionicons } from '@expo/vector-icons';
 
 import { colors, spacing, typography } from '../theme';
 import type { PaperConclusion } from '../services/api';
-import { GRADE_RANK, getGradeRank, isPaperGrade } from '../utils/grades';
+import { GRADE_RANK, getGradeRank, isPaperGrade, sortByGradeThenScore } from '../utils/grades';
 import Pagination from './Pagination';
 import CollapsibleSection from './CollapsibleSection';
 import GradeCircleBadge from './GradeCircleBadge';
@@ -69,13 +69,23 @@ const RecommendedUsesList: React.FC<RecommendedUsesListProps> = ({
   // conclusion_grading_rubric.json's grade_bands use for its own "C"
   // band: min_score 50, same cutoff paper_grading_rubric.json uses).
   // Conclusions with no recognized confidence_grade (rank UNGRADED_RANK)
-  // are excluded, same as a D/E grade would be.
+  // are excluded, same as a D/E grade would be. Sorted (grade rank, then
+  // confidence_score descending — see utils/grades.ts::
+  // sortByGradeThenScore) immediately after filtering, *before*
+  // pagination chunking below, per the Scientific Information section's
+  // "sort before paginating" requirement (same rule StudiesList/
+  // VerifiedResourcesList apply to their own lists).
   const filteredConclusions = useMemo<PaperConclusion[] | undefined>(() => {
     if (!conclusions) {
       return undefined;
     }
-    return conclusions.filter(
+    const eligible = conclusions.filter(
       (conclusion) => getGradeRank(conclusion.confidence_grade) <= GRADE_RANK.C
+    );
+    return sortByGradeThenScore(
+      eligible,
+      (conclusion) => conclusion.confidence_grade,
+      (conclusion) => conclusion.confidence_score
     );
   }, [conclusions]);
 

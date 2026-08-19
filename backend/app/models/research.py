@@ -4,7 +4,14 @@ scraping/grading), PaperConclusion (one row per synthesized claim built
 up across those papers — Phase 5, see
 app/services/conclusion_grader.py), and VerifiedResource (one row per
 official government/regulatory reference link — Phase 7, see
-app/services/resource_fetcher.py).
+app/services/resource_fetcher.py). VerifiedResource also carries
+`extracted_data` (Phase 17 — see app/services/resource_extractor.py), a
+per-resource structured-claims JSON payload extracted independently of
+every other resource, specifically to stop dense peer-reviewed abstracts
+from crowding thin web snippets out of the final synthesis prompt — see
+that field's own docstring below, and
+app/services/conclusion_grader.py's module docstring for how Stage 2
+consumes it.
 
 ResearchPaper rows are populated by app/services/paper_search.py, which
 queries PubMed, Europe PMC, Semantic Scholar, and OpenAlex per
@@ -171,6 +178,31 @@ class ResearchPaper(SQLModel, table=True):
     # summary query in app/services/search.py excludes
     # DISCARDED_IRRELEVANT rows — see get_ingredient_papers.
     status: str = Field(default=PAPER_STATUS_ACTIVE)
+
+    # --- Phase 19: extracted conclusions
+    # (app/services/paper_grader.py::grade_paper) ---
+    # 2-4 short, factual, study-level findings Gemini extracts during the
+    # SAME grading call that produces `grade`/`grade_score`/
+    # `rubric_evaluation`/relevance (see grade_paper's `_RubricEvaluationSchema`)
+    # — deliberately folded into that one existing call rather than a
+    # second, separate Gemini request per paper: this codebase's grading
+    # pipeline already went through a rate-limiting pass (Phase 18,
+    # app/services/gemini_rate_limit.py) specifically to reduce Gemini
+    # call volume, so adding a second call per paper here would directly
+    # work against that. e.g. `["Demonstrated 18% reduction in
+    # inflammation markers", "Well-tolerated at 500mg daily"]`. Rendered
+    # under an "Extracted Conclusions" heading in the frontend's paper
+    # info modal (src/components/StudiesList.tsx) — None until this
+    # paper is graded (same "None until grade is None" convention as
+    # `rubric_evaluation` above), and the frontend renders a "No specific
+    # conclusions extracted for this source yet." fallback line for that
+    # case rather than an empty section. Stored as a native JSON column
+    # (list of strings) — same convention as
+    # PaperConclusion.supporting_paper_ids elsewhere in this module.
+    # Nullable/added after `research_papers` already existed in deployed
+    # databases — same additive-migration story as every other column on
+    # this table; see app/db.py::_migrate_research_paper_columns.
+    extracted_conclusions: Optional[List[str]] = Field(default=None, sa_column=Column(JSON))
 
     created_at: datetime = Field(default_factory=_utcnow, nullable=False)
 
@@ -355,4 +387,89 @@ class VerifiedResource(SQLModel, table=True):
     # used to compute `score` but aren't separately persisted.
     reasoning_summary: Optional[str] = Field(default=None)
 
+    # --- Phase 17: Two-Stage Extraction Pipeline
+    # (app/services/resource_extractor.py) ---
+    # Set once, right after a resource is first persisted by
+    # fetch_verified_resources_for_ingredient() (or, for resources
+    # already persisted before this feature existed, backfilled the next
+    # time the ingredient is re-graded — see
+    # app/services/paper_analysis_pipeline.py::analyze_ingredient_papers's
+    # Stage 1 step). Never re-extracted afterward once successfully
+    # populated — same "an evaluation doesn't change once assigned"
+    # convention as `grade`/`score`/`reasoning_summary` above.
+    #
+    # Why this exists: feeding Gemini one single prompt mixing dense,
+    # information-rich paper abstracts alongside short, thin web-resource
+    # snippets caused it to consistently favor the papers and effectively
+    # ignore the resources (a "lost-in-the-middle" context-dilution
+    # effect) — see app/services/conclusion_grader.py's module docstring.
+    # Extracting each resource's claims independently, *before* the final
+    # synthesis call, means Stage 2 receives a compact, uniformly-
+    # structured, already-distilled block per resource — comparable in
+    # information density to a paper's own extracted PaperConclusion
+    # rows, so the two source types compete on equal footing rather than
+    # the resource's raw, verbose (or, just as often, sparse) snippet
+    # text competing directly against a paper's dense abstract.
+    #
+    # Nullable and stays `None` in two distinct, both-normal cases a
+    # caller must NOT treat as an error: (1) this resource hasn't been
+    # through Stage 1 extraction yet (a freshly-fetched resource, before
+    # analyze_ingredient_papers's Stage 1 step runs), or (2) Stage 1 ran
+    # but found the resource's `summary` too short/absent to extract
+    # anything meaningful from (see resource_extractor.py's
+    # `_MIN_SNIPPET_LENGTH_FOR_EXTRACTION` guard) — in that second case
+    # the stored value is a real (non-None) dict with every field
+    # explicitly null/empty, not a bare `None`, so it's still
+    # distinguishable from "not attempted yet" if that distinction is
+    # ever needed.
+    #
+    # Stored as a native JSON column (SQLAlchemy's `JSON` type, same
+    # convention as ResearchPaper.rubric_evaluation above) with exactly
+    # four keys — `official_stance` (str | None), `recommended_dose`
+    # (str | None), `upper_limit_warning` (str | None), `key_takeaways`
+    # (list[str]) — mirroring resource_extractor.py's
+    # `ExtractedResourceClaims` TypedDict field-for-field. Additive
+    # column on a table that already existed in deployed (Phase 7/8)
+    # databases — needs the same `ALTER TABLE` migration treatment as
+    # `grade`/`score`/`reasoning_summary` above; see
+    # app/db.py::_migrate_verified_resource_columns.
+    extracted_data: Optional[dict] = Field(default=None, sa_column=Column(JSON))
+
+    # --- Phase 19: extracted conclusions
+    # (app/services/resource_extractor.py::extract_claims_from_resource) ---
+    # 2-4 short, factual conclusions extracted using this resource's own
+    # provider-specific `extraction_instructions`
+    # (docs/verified_resource_apis.json, looked up by `domain` — see
+    # resource_extractor.py's `_find_extraction_instructions`) —
+    # deliberately a SEPARATE column from `extracted_data` above, even
+    # though both come out of the same Stage 1 Gemini call: `extracted_data`
+    # is Stage 2 synthesis's internal input shape (four fixed fields —
+    # see conclusion_grader.py's `_format_resources_for_prompt`, which
+    # reads its own specific keys and would need reshaping if this list
+    # were nested inside it instead), while `extracted_conclusions` is a
+    # flat, display-oriented list purpose-built for the frontend's
+    # "Extracted Conclusions" info-modal section (same shape/consumer as
+    # ResearchPaper.extracted_conclusions above — see that field's
+    # docstring for the "why one combined call, not two" reasoning,
+    # which applies here too: this reuses extract_claims_from_resource's
+    # existing Gemini call rather than issuing a second one per
+    # resource). e.g. `["RDA is 90mg/day", "Reduces duration of cold
+    # symptoms when taken early"]`. None until Stage 1 extraction runs
+    # for this resource (same None-until-processed convention as
+    # `extracted_data`).
+    extracted_conclusions: Optional[List[str]] = Field(default=None, sa_column=Column(JSON))
+
     created_at: datetime = Field(default_factory=_utcnow, nullable=False)
+
+    # Added for parity with ResearchPaper.ingredient above (same
+    # back_populates pattern, matched by Ingredient.verified_resources in
+    # app/models/supplement.py) — this table previously had no
+    # Relationship() back to Ingredient at all, unlike ResearchPaper.
+    # Every current caller (conclusion_grader.py::
+    # synthesize_ingredient_summary, search.py::get_ingredient_resources)
+    # queries VerifiedResource directly by ingredient_id rather than via
+    # this relationship — see PaperConclusion's own docstring above for
+    # why this codebase generally prefers that — so this doesn't change
+    # any existing code path, it only makes `ingredient.verified_resources`
+    # a working, real relationship for any future/defensive use.
+    ingredient: Optional[Ingredient] = Relationship(back_populates="verified_resources")

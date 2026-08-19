@@ -109,6 +109,9 @@ def to_research_paper_response(paper: ResearchPaper) -> ResearchPaperResponse:
         # validates it straight through. None stays None.
         rubric_evaluation=paper.rubric_evaluation,
         status=paper.status,
+        # Phase 19 — paper.extracted_conclusions is already a plain
+        # list[str] (or None); passes straight through.
+        extracted_conclusions=paper.extracted_conclusions,
     )
 
 
@@ -202,6 +205,9 @@ def get_ingredient_resources(
             grade=resource.grade,
             score=resource.score,
             reasoning_summary=resource.reasoning_summary,
+            # Phase 19 — resource.extracted_conclusions is already a plain
+            # list[str] (or None); passes straight through.
+            extracted_conclusions=resource.extracted_conclusions,
         )
         for resource in session.exec(stmt).all()
     ]
@@ -227,6 +233,7 @@ def get_ingredient_detail(
         product_count=ingredient.product_count,
         is_graded=ingredient.is_graded,
         grade_badge_text=ingredient.grade_badge_text,
+        summary_description=ingredient.summary_description,
         papers=get_ingredient_papers(session, ingredient.id),
         conclusions=get_ingredient_conclusions(session, ingredient.id),
         verified_resources=get_ingredient_resources(session, ingredient.id),

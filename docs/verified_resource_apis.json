@@ -8,21 +8,21 @@
     "extra_params": {},
     "auth": "none",
     "access_type": "public_domain",
-    "description": "NIH chemical and bioactive database offering official compound descriptions, biological roles, safety summaries, and pharmacology reference links."
+    "extraction_instructions": "Look for 'Information' array in the response. Extract the 'Description' and 'Title' under 'Pharmacology and Biochemistry' or 'Biological Description'. Focus on biological role, physiological action, and documented toxicity/safety baseline."
   },
   {
     "id": "medlineplus_api",
-    "name": "MedlinePlus Web Service (NIH / NLM)",
+    "name": "MedlinePlus Connect Service (NIH / NLM)",
     "domain": "medlineplus.gov",
-    "endpoint": "https://wsearch.nlm.nih.gov/ws/query",
-    "query_param": "term",
+    "endpoint": "https://connect.medlineplus.gov/service",
+    "query_param": "mainSearchCriteria.v.c",
     "extra_params": {
-      "db": "healthTopics",
-      "retmax": 3
+      "knowledgeResponseType": "application/json",
+      "mainSearchCriteria.v.cs": "2.16.840.1.113883.6.103"
     },
     "auth": "none",
     "access_type": "public_domain",
-    "description": "Official US National Library of Medicine free-text health topic search — returns authoritative dietary supplement and vitamin summary pages under medlineplus.gov. Note: this endpoint returns XML, not JSON (the old connect.medlineplus.gov/service endpoint took standardized diagnosis/procedure codes, not free-text ingredient names, and could never actually resolve a plain ingredient name like \"Vitamin C\" — see resource_fetcher.py's _query_medlineplus)."
+    "extraction_instructions": "Parse the 'feed' -> 'entry' array. Locate the 'summary' HTML/text block. Extract statements regarding recommended usage, evidence-based health claims, interactions, and consumer safety notes."
   },
   {
     "id": "usda_fooddata",
@@ -36,7 +36,7 @@
     },
     "auth": "api_key_required",
     "access_type": "public_domain",
-    "description": "Official US Department of Agriculture database for exact nutrient compositions and standard intake baselines. `api_key` above is the checked-in fallback (rate-limited DEMO_KEY) — resource_fetcher.py's _query_usda overrides it at request time with the USDA_API_KEY environment variable when set."
+    "extraction_instructions": "Inspect 'foods' -> 'foodNutrients' list. Extract nutritional density per 100g, baseline daily intake reference values, primary natural dietary sources, and official serving recommendations."
   },
   {
     "id": "dailymed_api",
@@ -47,7 +47,7 @@
     "extra_params": {},
     "auth": "none",
     "access_type": "public_domain",
-    "description": "Official NLM repository for dietary supplement product labels, active ingredients, and manufacturer safety disclosures."
+    "extraction_instructions": "Parse the SPL JSON structure for 'data' entries. Focus on sections labeled 'INDICATIONS & USAGE', 'DOSAGE AND ADMINISTRATION', and 'WARNINGS/PRECAUTIONS'. Extract official regulatory usage limits and safety disclaimers."
   },
   {
     "id": "europe_pmc",
@@ -57,11 +57,11 @@
     "query_param": "query",
     "extra_params": {
       "format": "json",
-      "resultType": "core"
+      "resultType": "lite"
     },
     "auth": "none",
     "access_type": "open_access",
-    "description": "European Molecular Biology Laboratory repository providing open-access scientific monographs, systematic reviews, and regulatory papers. resource_fetcher.py's _query_europe_pmc builds the actual `query` value as \"{ingredient_name} AND (monograph OR review)\" rather than using the bare ingredient name from this config's query_param, and filters results to isOpenAccess == \"Y\" only. `resultType: core` (rather than `lite`) is needed to get `abstractText` back for the resource's summary."
+    "extraction_instructions": "Search 'resultList' -> 'result'. Extract the 'abstractText' and 'title'. Focus on extracting consensus findings from systematic reviews, regulatory assessments, and clinical efficacy conclusions."
   },
   {
     "id": "health_canada_lnhpd",
@@ -75,6 +75,6 @@
     },
     "auth": "none",
     "access_type": "public_domain",
-    "description": "Official Canadian government regulatory database containing safety monographs, approved health claims, and dosage limits."
+    "extraction_instructions": "Parse monograph details for 'purpose_name', 'approved_subclause', and 'dose'. Extract authorized health claims, maximum tolerable daily intake levels, and mandatory risk statements."
   }
 ]

@@ -84,6 +84,15 @@ class ResearchPaperResponse(BaseModel):
     # PAPER_STATUS_ACTIVE (not Optional) since every ResearchPaper row
     # always has a non-null `status` — see that column's own docstring.
     status: str = PAPER_STATUS_ACTIVE
+    # --- Phase 19: extracted conclusions
+    # (app/services/paper_grader.py::grade_paper) ---
+    # Mirrors ResearchPaper.extracted_conclusions directly — see that
+    # column's docstring in app/models/research.py. None until this paper
+    # is graded (same convention as grade/grade_score/rubric_evaluation
+    # above); the frontend's paper info modal
+    # (src/components/StudiesList.tsx) renders a "No specific conclusions
+    # extracted for this source yet." fallback for that case.
+    extracted_conclusions: Optional[List[str]] = None
 
 
 class PaperConclusionResponse(BaseModel):
@@ -148,6 +157,15 @@ class VerifiedResourceResponse(BaseModel):
     grade: Optional[str] = None
     score: Optional[int] = None
     reasoning_summary: Optional[str] = None
+    # --- Phase 19: extracted conclusions
+    # (app/services/resource_extractor.py::extract_claims_from_resource) ---
+    # Mirrors VerifiedResource.extracted_conclusions directly — see that
+    # column's docstring in app/models/research.py for why it's kept
+    # separate from extracted_data. None until Stage 1 extraction runs for
+    # this resource; the frontend's resource info modal
+    # (src/components/VerifiedResourcesList.tsx) renders a "No specific
+    # conclusions extracted for this source yet." fallback for that case.
+    extracted_conclusions: Optional[List[str]] = None
 
 
 class IngredientDetailResponse(BaseModel):
@@ -180,6 +198,13 @@ class IngredientDetailResponse(BaseModel):
     product_count: int = 0
     is_graded: bool = False
     grade_badge_text: Optional[str] = None
+    # Phase 11 — see app/models/supplement.py::Ingredient.summary_description
+    # and app/services/conclusion_grader.py::synthesize_ingredient_summary.
+    # None until a grade request has both evidence to synthesize from and
+    # a successful Gemini call — the frontend falls back to a
+    # client-computed heuristic sentence in that case (see
+    # src/components/IngredientCard.tsx's `scientificSummary`).
+    summary_description: Optional[str] = None
     papers: List[ResearchPaperResponse] = Field(default_factory=list)
     conclusions: List[PaperConclusionResponse] = Field(default_factory=list)
     verified_resources: List[VerifiedResourceResponse] = Field(default_factory=list)

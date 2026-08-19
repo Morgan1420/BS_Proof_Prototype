@@ -427,6 +427,14 @@ export interface ResearchPaper {
    * this field to remove a just-discarded paper from local state — see
    * handlePaperGraded in IngredientCard.tsx. */
   status: string;
+  /** 2-4 short, factual study-level findings extracted by the same
+   * Gemini call that produces `grade`/`rubric_evaluation` (Phase 19 —
+   * see backend/app/services/paper_grader.py). Null until this paper is
+   * graded (same "null iff grade is null" convention as grade_score/
+   * rubric_evaluation above) — StudiesList's paper info modal renders a
+   * "No specific conclusions extracted for this source yet." fallback
+   * for that case. */
+  extracted_conclusions?: string[] | null;
 }
 
 /**
@@ -520,6 +528,14 @@ export interface VerifiedResource {
   /** Concise 1-2 sentence rationale for the overall evaluation. Null iff
    * `grade` is null. */
   reasoning_summary?: string | null;
+  /** 2-4 short, factual conclusions extracted using this provider's own
+   * extraction_instructions (docs/verified_resource_apis.json) — Phase
+   * 19, see backend/app/services/resource_extractor.py. Null until Stage
+   * 1 extraction runs for this resource (independent of `grade` — this
+   * comes from the extraction pipeline, not the grading one).
+   * VerifiedResourcesList's info modal renders a "No specific
+   * conclusions extracted for this source yet." fallback when empty. */
+  extracted_conclusions?: string[] | null;
 }
 
 /** Shape of the JSON body returned by GET /api/v1/ingredients/{id}. */
@@ -531,6 +547,17 @@ export interface IngredientDetailResponse {
   product_count: number;
   is_graded: boolean;
   grade_badge_text?: string | null;
+  /** Gemini-synthesized 1-2 sentence overview combining BOTH graded
+   * ResearchPaper findings and VerifiedResource official guidance
+   * (NIH/USDA/EFSA/Health Canada/...) for this ingredient — see
+   * backend/app/services/conclusion_grader.py::synthesize_ingredient_summary.
+   * `null`/`undefined` until a grade request has both evidence to
+   * synthesize from and a successful Gemini call — IngredientCard.tsx
+   * falls back to a client-computed heuristic sentence in that case (see
+   * its `scientificSummary`). Not yet included in GradeIngredientResponse
+   * below — same "frontend re-fetches ingredient detail to see it" caveat
+   * as `conclusions`/`verified_resources`. */
+  summary_description?: string | null;
   papers: ResearchPaper[];
   /** Every *active* synthesized PaperConclusion for this ingredient,
    * highest-confidence first (see app/services/search.py::

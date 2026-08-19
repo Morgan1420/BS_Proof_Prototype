@@ -22,6 +22,32 @@ Gemini determines a paper isn't actually about its ingredient (e.g. a
 Vitamin D paper that turned up during a Vitamin C search) — the pipeline
 then skips conclusion synthesis for it and every paper-list/summary
 query in app/services/search.py excludes it going forward.
+
+**Rate limiting (Phase 18).** `grade_paper()`'s Gemini call is now
+paced and retried via `app/services/gemini_rate_limit.py` —
+`throttle_gemini_call()` right before the request (process-wide ~4.5s
+minimum spacing from the previous Gemini call made anywhere in this
+app), and `call_gemini_with_retry()` around it (exponential backoff
+specifically on a 429/`RESOURCE_EXHAUSTED` response, 5s/10s/20s/40s,
+before giving up). See that module's docstring for the full reasoning,
+including why it's synchronous rather than `async def` and why it checks
+for `google.genai.errors.ClientError`/`APIError` rather than
+`google.api_core.exceptions.ResourceExhausted`. A rate-limit failure
+that survives every retry attempt still surfaces as an ordinary
+`PaperGradingError` here (see below) — the existing per-paper
+try/except in `app/services/paper_analysis_pipeline.py::analyze_ingredient_papers`
+already logs and skips that one paper without aborting the run, unchanged
+by this phase.
+
+**Extracted conclusions (Phase 19).** `grade_paper()`'s single Gemini
+call now also returns `extracted_conclusions` — 2-4 short, factual
+study-level findings (see `_RubricEvaluationSchema.extracted_conclusions`
+below) — folded into the SAME structured-output call that already
+produces the rubric/relevance fields, rather than a second Gemini
+request per paper. Persisted onto `ResearchPaper.extracted_conclusions`
+by `grade_single_paper()` below; rendered under an "Extracted
+Conclusions" heading in the frontend's paper info modal
+(`src/components/StudiesList.tsx`).
 """
 
 from __future__ import annotations
@@ -44,6 +70,7 @@ from app.models.research import (
     ResearchPaper,
 )
 from app.models.supplement import Ingredient
+from app.services.gemini_rate_limit import call_gemini_with_retry, throttle_gemini_call
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +124,12 @@ class GradeResult(TypedDict):
     # surfaced in app/services/paper_analysis_pipeline.py's
     # "[Pipeline] Discarded Paper ID #..." warning log when False.
     relevance_reasoning: str
+    # --- Phase 19: extracted conclusions ---
+    # 2-4 short, factual study-level findings — see
+    # _RubricEvaluationSchema.extracted_conclusions below and this
+    # module's docstring for why this rides along on the same call
+    # rather than a second Gemini request per paper.
+    extracted_conclusions: List[str]
 
 
 class _RubricEvaluationSchema(BaseModel):
@@ -160,6 +193,20 @@ class _RubricEvaluationSchema(BaseModel):
     )
     total_score: int = Field(description="Sum of the four category scores above (funding_score may be negative), clamped to 0-100.")
     summary_notes: str = Field(description="A concise 2-sentence rationale for the overall evaluation.")
+    # --- Phase 19: extracted conclusions ---
+    extracted_conclusions: List[str] = Field(
+        default_factory=list,
+        description=(
+            "2 to 4 short, concise, factual conclusions/findings from "
+            "this specific paper regarding the target ingredient — e.g. "
+            "\"Demonstrated 18% reduction in inflammation markers\", "
+            "\"Well-tolerated at 500mg daily\". Extract ONLY what the "
+            "title/abstract actually states, not general knowledge about "
+            "the ingredient. Return an empty list if the abstract is "
+            "missing or too sparse to extract anything specific — do not "
+            "guess or fabricate a finding."
+        ),
+    )
 
 
 @lru_cache
@@ -310,6 +357,13 @@ def _build_prompt(
         "`study_type_score` must be a non-negative integer between 0 and "
         "40. `sample_score` must be a non-negative integer between 0 and "
         "40.\n\n"
+        "Also extract `extracted_conclusions`: 2 to 4 short, factual "
+        "findings this paper's title/abstract actually states about the "
+        "ingredient (e.g. a measured effect size, a tolerability/safety "
+        "finding, a dosage studied) — never general background knowledge "
+        "about the ingredient, and never a fabricated finding when the "
+        "abstract is missing or too sparse (return an empty list in that "
+        "case).\n\n"
         "Return your evaluation as the required JSON object. `total_score` "
         "must equal the sum of the four category scores (`funding_score` "
         "and `journal_score` may each be negative)."
@@ -334,8 +388,12 @@ def grade_paper(paper_metadata: Dict[str, Optional[str]], ingredient_name: str) 
 
     Returns:
         `{"grade": "A"-"E", "grade_score": 0-100, "rubric_evaluation": {...},
-        "is_relevant_to_ingredient": bool, "relevance_reasoning": str}`
-        — see RubricEvaluation above for the breakdown shape. Every
+        "is_relevant_to_ingredient": bool, "relevance_reasoning": str,
+        "extracted_conclusions": [...]}` — see RubricEvaluation above for
+        the breakdown shape. `extracted_conclusions` (Phase 19) is capped
+        at 4 entries server-side even if Gemini's raw output overshoots
+        that, same "don't trust the model's own bound-following"
+        philosophy as every category-score clamp below. Every
         category score is clamped to that category's `(min_score,
         max_score)` range — plain `0` to `max_score` for `study_type`
         (`0`-`40` as of v1.5) / `sample_methodology`, but `funding_bias`
@@ -361,14 +419,22 @@ def grade_paper(paper_metadata: Dict[str, Optional[str]], ingredient_name: str) 
 
     prompt = _build_prompt(paper_metadata, rubric, ingredient_name)
 
-    try:
-        response = client.models.generate_content(
+    paper_title = paper_metadata.get("title") or "Unknown title"
+
+    def _call_gemini():
+        throttle_gemini_call()
+        return client.models.generate_content(
             model=settings.gemini_model,
             contents=[prompt],
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
                 response_schema=_RubricEvaluationSchema,
             ),
+        )
+
+    try:
+        response = call_gemini_with_retry(
+            _call_gemini, label=f"grading paper {paper_title!r}"
         )
     except Exception as exc:  # noqa: BLE001 - surface as a clean service error
         raise PaperGradingError(f"Gemini request failed: {exc}") from exc
@@ -435,12 +501,19 @@ def grade_paper(paper_metadata: Dict[str, Optional[str]], ingredient_name: str) 
         "summary_notes": parsed.summary_notes,
     }
 
+    # Phase 19: cleaned/capped the same way resource_extractor.py caps
+    # key_takeaways — drop empty/whitespace-only entries, keep at most 4.
+    extracted_conclusions = [
+        item.strip() for item in parsed.extracted_conclusions if item and item.strip()
+    ][:4]
+
     return {
         "grade": grade,
         "grade_score": total_score,
         "rubric_evaluation": rubric_evaluation,
         "is_relevant_to_ingredient": parsed.is_relevant_to_ingredient,
         "relevance_reasoning": parsed.relevance_reasoning,
+        "extracted_conclusions": extracted_conclusions,
     }
 
 
@@ -512,6 +585,8 @@ def grade_single_paper(session: Session, paper: ResearchPaper) -> ResearchPaper:
     paper.grade = result["grade"]
     paper.grade_score = result["grade_score"]
     paper.rubric_evaluation = dict(result["rubric_evaluation"])
+    # Phase 19 — see module docstring's "Extracted conclusions" paragraph.
+    paper.extracted_conclusions = list(result["extracted_conclusions"])
     paper.status = (
         PAPER_STATUS_ACTIVE
         if result["is_relevant_to_ingredient"]
