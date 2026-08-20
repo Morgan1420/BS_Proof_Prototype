@@ -35,6 +35,7 @@ app/services/storage.py) to keep them straight.
 from datetime import datetime, timezone
 from typing import List, Optional
 
+from sqlalchemy import JSON, Column
 from sqlmodel import Field, Relationship, SQLModel
 
 
@@ -137,6 +138,129 @@ class Ingredient(SQLModel, table=True):
     # `is_graded`/`grade_badge_text` above; see
     # app/db.py::_migrate_ingredient_grading_columns.
     summary_description: Optional[str] = Field(default=None)
+
+    # --- Phase 23/24: Multi-Source Confidence Rubric scientific_conclusions
+    # (app/services/conclusion_grader.py::synthesize_ingredient_summary,
+    # docs/multi_source_confidence_rubric.json) ---
+    # The fully-scored `scientific_conclusions` array returned by that
+    # function — through Phase 22 this was computed but never persisted
+    # (returned for observability only, with a Gemini-picked
+    # `confidence_grade` and no real score breakdown); Phase 23 both
+    # server-derives real scores AND persists the result here. Phase 24
+    # renamed this column from `recommended_uses` to
+    # `scientific_conclusions` (see "Phase 24 rename" note below) and
+    # added a Python-level "Direct Injection Safety Net" — see
+    # synthesize_ingredient_summary's own docstring — that guarantees
+    # every VerifiedResource.extracted_conclusions string ends up
+    # represented somewhere in this array, either merged into a Gemini-
+    # synthesized claim or force-appended as its own standalone entry,
+    # rather than trusting Gemini to never silently drop one. One dict
+    # per claim, shaped:
+    #   {
+    #     "claim": str,
+    #     "confidence_grade": "A"|"B"|"C"|"D"|"E",   # server-derived, see below
+    #     "total_score": int,                         # 0-100, clamped sum of the four scores below
+    #     "score_breakdown": {
+    #       "paper_evidence_quality": int,             # 0-30
+    #       "official_authority_backing": int,         # 0-25
+    #       "multi_source_consensus": int,              # 0-25
+    #       "claim_specificity": int,                   # 0-20
+    #     },
+    #     "supporting_study_count": int,
+    #     "supporting_resource_count": int,
+    #     "sources_summary": list[str],                 # e.g. ["3 RCTs", "Health Canada Monograph"]
+    #     "grade_justification": str,
+    #   }
+    # `confidence_grade`/`total_score` are NEVER taken directly from
+    # Gemini — only the four category scores are Gemini-supplied (clamped
+    # to each category's max_score) for a Gemini-synthesized claim, or
+    # assigned a fixed, defensible default by the Phase 24 safety net for
+    # a directly-injected one — then summed/clamped/graded server-side
+    # via docs/multi_source_confidence_rubric.json's `grade_bands` either
+    # way, same "never trust Gemini's own bound-following" convention as
+    # ResearchPaper.grade/PaperConclusion.confidence_grade elsewhere in
+    # this app. Stored as a plain JSON array of dicts (same "loose dict,
+    # not a strict schema" convention as PaperConclusion.rubric_evaluation/
+    # VerifiedResource.aligned_conclusions elsewhere), not a stricter
+    # sub-model.
+    #
+    # `None` until a grade request successfully synthesizes at least once
+    # (same "None = not attempted yet" convention as
+    # `summary_description` above) — the frontend's Scientific
+    # Conclusions List panel treats a missing/empty list as "nothing
+    # synthesized yet," not an error. An empty list `[]` is a real, valid
+    # result (synthesis ran but the evidence didn't support any specific
+    # claim — see synthesize_ingredient_summary's own docstring).
+    # Nullable/added after `ingredients` already existed in deployed
+    # databases — same additive-migration story as `summary_description`
+    # above; see app/db.py::_migrate_ingredient_grading_columns.
+    #
+    # **Phase 24 rename, backward-compat.** This column was named
+    # `recommended_uses` through Phase 23 — renamed here (task: "Rename
+    # `recommended_uses` fields and models to `scientific_conclusions`
+    # ... database migration or backwards-compatible alias mapping").
+    # Rather than an in-place `ALTER TABLE ... RENAME COLUMN` (which
+    # SQLite supports but which this codebase's migration helper doesn't
+    # use anywhere else — every prior schema change here is an additive
+    # `ADD COLUMN`, never a rename/drop, so existing rows are never at
+    # risk of a botched in-place rewrite), `_migrate_ingredient_grading_columns()`
+    # ADDS this new `scientific_conclusions` column alongside the old
+    # (now-orphaned, no longer read/written by any Python code)
+    # `recommended_uses` one, and one-time backfills any pre-Phase-24 row
+    # that already had `recommended_uses` data into the new column. The
+    # old column is left in place in the SQLite file (not dropped —
+    # SQLite's `DROP COLUMN` support is version-dependent and dropping it
+    # buys nothing here) but is otherwise dead: no model field maps to it
+    # anymore, so it's invisible to every ORM query.
+    scientific_conclusions: Optional[List[dict]] = Field(default=None, sa_column=Column(JSON))
+
+    # --- Phase 33: General Information (Description + Daily Dosage) ---
+    # (app/services/general_info_extractor.py::extract_general_info,
+    # called from app/services/paper_analysis_pipeline.py after paper
+    # grading, Stage 2 synthesis, and resource alignment have all
+    # finished for a grade request.) Two structured fields, each following
+    # a strict Grade A/B-only source hierarchy — verified online resources
+    # first, peer-reviewed papers second, "unavailable" if neither has a
+    # Grade A or B source with the information:
+    #   {
+    #     "description": {
+    #       "text": Optional[str],
+    #       "source_name": Optional[str],      # e.g. "Health Canada Monograph" or "Smith et al. (2023)"
+    #       "source_type": Optional[str],       # "verified_resource" | "paper"
+    #       "source_grade": Optional[str],       # "A" | "B" — never C/D/E, see below
+    #       "is_available": bool
+    #     },
+    #     "daily_dosage": { ... same four fields ... }
+    #   }
+    # `is_available=False` (with every other field `None`) is a real,
+    # legitimate result — the frontend renders a fixed notice ("No
+    # high-grade (Grade A or B) source available containing this
+    # information.") in that case rather than treating it as an error or a
+    # "not loaded yet" state. Unlike `scientific_conclusions` above,
+    # `source_grade` is NEVER trusted from Gemini's own free-text output:
+    # `general_info_extractor.py` only ever builds its Gemini prompt from
+    # ResearchPaper/VerifiedResource rows already filtered to `grade in
+    # ("A", "B")` server-side — Gemini physically cannot see (let alone
+    # cite) a Grade C/D/E source, and every `source_name`/`source_type`/
+    # `source_grade` field is re-derived from the real DB row Gemini
+    # picked an index into, never from text Gemini generated itself — same
+    # "never trust the model's own bound-following" convention as
+    # `scientific_conclusions`'s `confidence_grade`/`total_score` above.
+    #
+    # `None` until a grade request successfully runs this extraction at
+    # least once (same "None = not attempted yet" convention as
+    # `summary_description`/`scientific_conclusions` above); once set, it's
+    # always the FULL two-field dict above (never a partial one — each of
+    # `description`/`daily_dosage` independently carries its own
+    # `is_available`), and it's safe/expected for this to be overwritten
+    # with a still-unavailable result on a later run (e.g. an ingredient
+    # whose evidence hasn't reached Grade A/B yet stays honestly
+    # "unavailable" across repeated grade requests, rather than silently
+    # keeping stale data). Nullable/added after `ingredients` already
+    # existed in deployed databases — same additive-migration story as
+    # `scientific_conclusions` above; see
+    # app/db.py::_migrate_ingredient_grading_columns.
+    general_info: Optional[dict] = Field(default=None, sa_column=Column(JSON))
 
     product_links: List["ProductIngredientLink"] = Relationship(
         back_populates="ingredient",

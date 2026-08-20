@@ -236,6 +236,16 @@ async def grade_ingredient(
     This can take several seconds (it makes multiple external network
     calls server-side, sequentially) — the frontend shows a loading
     spinner on the grade button for the duration.
+
+    **Phase 41:** this same route also serves the standalone
+    IngredientCard's "Grade Again" affordance (there is no separate
+    re-grade endpoint) — grade_ingredient() itself detects
+    `ingredient.is_graded` on entry and, if already true, purges every
+    prior ResearchPaper/PaperConclusion/VerifiedResource row for this
+    ingredient (plus resets its research-derived fields) before running
+    the exact same fresh-pipeline steps below, so a repeat grade is a
+    genuinely clean re-pull rather than an incremental top-up — see
+    app/services/grading.py::_purge_prior_research_data's own docstring.
     """
     ingredient = session.get(IngredientRow, ingredient_id)
     if ingredient is None:

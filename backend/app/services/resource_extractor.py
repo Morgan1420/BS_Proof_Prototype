@@ -1,7 +1,21 @@
-"""Gemini-backed per-resource structured claims extraction — Stage 1 of
-the Two-Stage Extraction Pipeline (Phase 17).
+"""**DEPRECATED as of Phase 21 — no longer imported or called anywhere
+in this codebase.** This module's Gemini-based extraction was replaced
+by `app/services/resource_parser.py`'s fast, deterministic, zero-LLM
+parser — called from `app/services/resource_fetcher.py` at fetch time
+instead of from a separate "Stage 1" pipeline step (which used to live
+in `app/services/paper_analysis_pipeline.py` and no longer exists — see
+that module's own docstring). Kept in place, unused, purely as
+historical reference for the reasoning below (rate-limit handling,
+provider-specific extraction instructions, the "one call not two"
+design) rather than deleted outright. Do not wire this back in without
+first re-reading `resource_parser.py`'s module docstring for why it was
+replaced (Gemini rate limits, latency, and hallucination risk that a
+rule-based parser structurally cannot have).
 
-**Why this exists.** Feeding Gemini one single prompt that mixed dense,
+Gemini-backed per-resource structured claims extraction — Stage 1 of
+the Two-Stage Extraction Pipeline (Phase 17), through Phase 20.
+
+**Why this existed.** Feeding Gemini one single prompt that mixed dense,
 information-rich peer-reviewed paper abstracts alongside short, thin
 verified-resource snippets caused a "lost-in-the-middle" effect: the
 model consistently favored the academic abstracts and effectively
@@ -102,6 +116,20 @@ short factual bullet lists — but serve different consumers:
 provider-instruction-driven, display-oriented list purpose-built for the
 frontend info modal. Being somewhat redundant in content is an accepted
 trade-off for not doubling API calls.
+
+**Explicit failure/empty-result reasons (Phase 20).** Every path that
+leaves `extracted_conclusions` empty now also reports *why*, via a short
+canned string — either returned directly in the result dict (short-
+snippet guard; a successful-but-empty Gemini result) or attached as
+`.reason` on a raised `ResourceExtractionError` (an actual request/parse
+failure). `app/services/paper_analysis_pipeline.py`'s Stage 1 loop
+persists whichever one applies onto
+`VerifiedResource.extraction_failure_reason`, so the frontend's info
+modal (`src/components/VerifiedResourcesList.tsx`) can show an honest,
+specific explanation instead of a generic "no conclusions yet" message.
+This module stays pure (no DB access) even for this — `.reason`/the
+dict's `extraction_failure_reason` key are just more data for the
+caller to persist, same as every other field here.
 """
 
 from __future__ import annotations
@@ -146,9 +174,43 @@ VERIFIED_RESOURCE_APIS_PATH = _REPO_ROOT / "docs" / "verified_resource_apis.json
 # extract_claims_from_resource()'s docstring.
 _MIN_SNIPPET_LENGTH_FOR_EXTRACTION = 20
 
+# --- Phase 20: canned extraction_failure_reason strings ---
+# Short, human-readable explanations for why extracted_conclusions came
+# back empty — set directly in the result dict for the two non-exception
+# paths below, or attached as ResourceExtractionError.reason for the two
+# exception paths. Kept as module-level constants (rather than inlined at
+# each call site) so the wording stays consistent between this module's
+# two docstring-documented examples and its actual behavior.
+_REASON_SHORT_SNIPPET = (
+    "The raw source text or API snippet was too short or missing."
+)
+_REASON_PARSE_FAILURE = (
+    "Gemini response parsing failed or returned invalid JSON."
+)
+_REASON_NO_CONCLUSIONS_FOUND = (
+    "No relevant health claims, RDAs, or safety statements were found in "
+    "the source text."
+)
+_REASON_RATE_LIMIT = "API rate limit was reached during processing."
+
 
 class ResourceExtractionError(RuntimeError):
-    """Raised when Gemini fails to return a usable claims extraction."""
+    """Raised when Gemini fails to return a usable claims extraction.
+
+    Carries an optional `.reason` (Phase 20) — one of this module's
+    canned `_REASON_*` strings, distinct from the exception's own
+    `str(self)` message (which stays detailed/technical, for logs — e.g.
+    including the original underlying exception text). The caller
+    (`app/services/paper_analysis_pipeline.py`) persists `.reason` onto
+    `VerifiedResource.extraction_failure_reason` when catching this,
+    falling back to `str(exc)` if `.reason` wasn't explicitly set (e.g.
+    an unanticipated failure mode this module didn't specifically
+    categorize) rather than leaving the column blank.
+    """
+
+    def __init__(self, message: str, *, reason: Optional[str] = None) -> None:
+        super().__init__(message)
+        self.reason = reason or message
 
 
 class ExtractedResourceClaims(TypedDict):
@@ -168,6 +230,13 @@ class ExtractedResourceClaims(TypedDict):
     # None, even when nothing could be extracted (mirrors key_takeaways's
     # own "empty list, not null" convention).
     extracted_conclusions: List[str]
+    # Phase 20 — see module docstring's "Explicit failure/empty-result
+    # reasons" paragraph. None whenever extracted_conclusions is
+    # non-empty; one of this module's canned _REASON_* strings whenever
+    # it's empty (short snippet, or a successful-but-nothing-found Gemini
+    # result) so the caller has something specific to persist onto
+    # VerifiedResource.extraction_failure_reason.
+    extraction_failure_reason: Optional[str]
 
 
 class _ExtractedClaimsSchema(BaseModel):
@@ -381,7 +450,9 @@ def extract_claims_from_resource(
             all. Callers should catch this the same "log and skip, leave
             extracted_data null" way every other best-effort Gemini call
             in this pipeline is handled (see
-            app/services/paper_analysis_pipeline.py's Stage 1 step).
+            app/services/paper_analysis_pipeline.py's Stage 1 step) —
+            and additionally (Phase 20) persist the exception's `.reason`
+            attribute onto VerifiedResource.extraction_failure_reason.
     """
     cleaned_snippet = (snippet_or_text or "").strip()
 
@@ -403,6 +474,7 @@ def extract_claims_from_resource(
             "upper_limit_warning": None,
             "key_takeaways": [],
             "extracted_conclusions": [],
+            "extraction_failure_reason": _REASON_SHORT_SNIPPET,
         }
 
     client = _get_client()
@@ -426,18 +498,32 @@ def extract_claims_from_resource(
             _call_gemini, label=f"extracting claims for resource {resource_title!r}"
         )
     except Exception as exc:  # noqa: BLE001 - surface as a clean service error
+        # Phase 20: call_gemini_with_retry() raises a plain RuntimeError
+        # (not a genai-specific type) once every retry attempt has been
+        # exhausted — see gemini_rate_limit.py::call_gemini_with_retry's
+        # own final `raise RuntimeError(...)`, whose message always
+        # contains "rate limit(s)". Matched on that substring rather than
+        # importing gemini_rate_limit's internals, since this is the only
+        # way that specific RuntimeError is ever raised from here.
+        if "rate limit" in str(exc).lower():
+            raise ResourceExtractionError(
+                f"Gemini request failed: {exc}", reason=_REASON_RATE_LIMIT
+            ) from exc
         raise ResourceExtractionError(f"Gemini request failed: {exc}") from exc
 
     parsed = getattr(response, "parsed", None)
     if not isinstance(parsed, _ExtractedClaimsSchema):
         raw_text = getattr(response, "text", None)
         if not raw_text:
-            raise ResourceExtractionError("Gemini returned an empty response.")
+            raise ResourceExtractionError(
+                "Gemini returned an empty response.", reason=_REASON_PARSE_FAILURE
+            )
         try:
             parsed = _ExtractedClaimsSchema.model_validate_json(raw_text)
         except Exception as exc:  # noqa: BLE001
             raise ResourceExtractionError(
-                f"Gemini response did not match the expected schema: {exc}"
+                f"Gemini response did not match the expected schema: {exc}",
+                reason=_REASON_PARSE_FAILURE,
             ) from exc
 
     official_stance = (parsed.official_stance or "").strip() or None
@@ -453,6 +539,12 @@ def extract_claims_from_resource(
     extracted_conclusions = [
         item.strip() for item in parsed.extracted_conclusions if item and item.strip()
     ][:4]
+    # Phase 20: a successful Gemini call can still legitimately come back
+    # with nothing to report (e.g. a summary that only covers food
+    # sources, with no health claims/RDA/safety statement at all) — this
+    # isn't an error, so no exception is raised, but it's still an empty
+    # result worth explaining rather than leaving unexplained.
+    extraction_failure_reason = None if extracted_conclusions else _REASON_NO_CONCLUSIONS_FOUND
 
     return {
         "official_stance": official_stance,
@@ -460,4 +552,5 @@ def extract_claims_from_resource(
         "upper_limit_warning": upper_limit_warning,
         "key_takeaways": key_takeaways,
         "extracted_conclusions": extracted_conclusions,
+        "extraction_failure_reason": extraction_failure_reason,
     }

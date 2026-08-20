@@ -1,5 +1,5 @@
 {
-  "version": "1.5",
+  "version": "1.6",
   "description": "Scientific paper quality rubric for the automated paper-grading pipeline. Gemini evaluates paper metadata against four weighted categories (summing to a maximum of 100 points, with negative penalties for funding bias and predatory journals) to produce a total score mapped to letter grades A-E.",
 
   "grade_bands": [
@@ -14,28 +14,28 @@
     {
       "id": "study_type",
       "label": "Study Design / Hierarchy",
-      "max_score": 40,
+      "max_score": 45,
       "description": "Where the study sits on the evidence hierarchy. Apply AMSTAR 2 risk-of-bias reasoning for systematic reviews and ROB2 reasoning for RCTs.",
       "score_tiers": [
-        { "range": "36-40", "example": "Systematic review or meta-analysis of human trials, low AMSTAR 2 risk of bias" },
-        { "range": "29-35", "example": "Double-blind, placebo-controlled human RCT, low-to-moderate ROB2 risk of bias" },
-        { "range": "20-28", "example": "Single-blind or open-label human RCT; or well-controlled prospective cohort study" },
-        { "range": "11-19", "example": "Observational/cross-sectional human study, or well-designed animal model" },
-        { "range": "0-10", "example": "In-vitro/cell study, single case report, or non-peer-reviewed preprint" }
+        { "range": "41-45", "example": "Systematic review or meta-analysis of human trials, low AMSTAR 2 risk of bias" },
+        { "range": "33-40", "example": "Double-blind, placebo-controlled human RCT, low-to-moderate ROB2 risk of bias" },
+        { "range": "23-32", "example": "Single-blind or open-label human RCT; or well-controlled prospective cohort study" },
+        { "range": "12-22", "example": "Observational/cross-sectional human study, or well-designed animal model" },
+        { "range": "0-11", "example": "In-vitro/cell study, single case report, or non-peer-reviewed preprint" }
       ]
     },
     {
       "id": "journal_reputation",
       "label": "Journal / Publisher Rigor",
-      "max_score": 15,
+      "max_score": 10,
       "min_score": -5,
-      "description": "Impact factor, peer-review rigor, and publisher reputation. Highly reputable journals earn up to +15 points; predatory publishers or known blacklisted journals penalize score down to -5.",
+      "description": "Impact factor, peer-review rigor, and publisher reputation. Reputable journals earn up to +10 points; predatory publishers or known blacklisted journals penalize score down to -5.",
       "score_tiers": [
-        { "range": "13 to 15", "example": "Top-tier journal (impact factor > 10), e.g. NEJM, JAMA, Nature, The Lancet" },
-        { "range": "9 to 12", "example": "High-quality specialty journal (impact factor 4-10)" },
-        { "range": "5 to 8", "example": "Reputable mid-tier peer-reviewed journal (impact factor 1-4)" },
-        { "range": "2 to 4", "example": "Low-impact or lesser-known peer-reviewed journal" },
-        { "range": "0 to 1", "example": "Neutral / unidentified publisher" },
+        { "range": "9 to 10", "example": "Top-tier journal (impact factor > 10), e.g. NEJM, JAMA, Nature, The Lancet" },
+        { "range": "6 to 8", "example": "High-quality specialty journal (impact factor 4-10)" },
+        { "range": "3 to 5", "example": "Reputable mid-tier peer-reviewed journal (impact factor 1-4)" },
+        { "range": "1 to 2", "example": "Low-impact or lesser-known peer-reviewed journal" },
+        { "range": "0", "example": "Neutral / unidentified publisher" },
         { "range": "-1 to -5", "example": "Predatory journal, vanity press, unvetted pay-to-publish outlet, or fake peer review" }
       ]
     },
@@ -57,9 +57,9 @@
       "label": "Funding & Commercial Bias",
       "max_score": 5,
       "min_score": -15,
-      "description": "Evaluates funding sources and commercial conflicts of interest. Independent funding earns up to +5 points; undisclosed funding defaults to a neutral +2; heavy industry influence penalizes score (down to -15).",
+      "description": "Evaluates funding sources and commercial conflicts of interest. Independent funding earns up to +5 points; if a validated metric (AMSTAR 2, ROB2, etc.) confirms low risk of bias, award full max score (+5). Undisclosed funding defaults to a neutral +2; heavy industry influence penalizes score (down to -15).",
       "score_tiers": [
-        { "range": "4 to 5", "example": "Fully independent funding (government/university grant), no conflicts of interest" },
+        { "range": "4 to 5", "example": "Fully independent funding (government/university grant), no conflicts of interest; OR validated low risk of bias via formal metrics (AMSTAR 2, ROB2)" },
         { "range": "3", "example": "Mixed funding (partial industry support), conflicts disclosed and transparently managed" },
         { "range": "2", "example": "Neutral / funding source undisclosed or not mentioned in available metadata" },
         { "range": "-1 to -7", "example": "Primarily industry-funded or manufacturer-funded with author affiliations" },

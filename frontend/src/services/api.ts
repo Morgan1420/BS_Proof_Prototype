@@ -211,6 +211,14 @@ export interface LinkedIngredient {
  * `ingredients` is populated for product results via an explicit
  * server-side join (see app/services/search.py::get_linked_ingredients) —
  * always `[]` for ingredient-type results.
+ *
+ * `is_graded`/`grade_badge_text` (Phase 38) mirror the same fields on
+ * `IngredientDetailResponse` — the real, persisted grading status for
+ * `type === 'ingredient'` results, `undefined`/`null` for products. Added
+ * because their absence here (this schema previously had no grading
+ * fields at all) was the actual root cause of graded ingredients
+ * appearing to "revert to ungraded" on every browse/reload — see
+ * ResultsScreen.tsx::toIngredient's doc-comment.
  */
 export interface SearchResultItem {
   id: number;
@@ -221,6 +229,8 @@ export interface SearchResultItem {
   recommended_daily_dosage?: string | null;
   scientific_data?: string | null;
   product_count?: number | null;
+  is_graded?: boolean | null;
+  grade_badge_text?: string | null;
 }
 
 /** Shape of the JSON body returned by GET /api/v1/products/{id}. */
@@ -536,9 +546,162 @@ export interface VerifiedResource {
    * VerifiedResourcesList's info modal renders a "No specific
    * conclusions extracted for this source yet." fallback when empty. */
   extracted_conclusions?: string[] | null;
+  /** Short, human-readable explanation for why `extracted_conclusions`
+   * came back empty (Phase 20 — see backend/app/models/research.py's
+   * VerifiedResource.extraction_failure_reason docstring for the full
+   * list of possible reasons, e.g. "The raw source text or API snippet
+   * was too short or missing."). `null` both when extraction hasn't run
+   * yet AND when it succeeded with real conclusions — VerifiedResourcesList
+   * only renders this when `extracted_conclusions` is itself empty/null,
+   * with its own generic fallback text if this is null too. */
+  extraction_failure_reason?: string | null;
+  /** One entry per string in `extracted_conclusions` above, in the same
+   * order, classifying how that specific conclusion relates to this
+   * ingredient's existing paper evidence — Phase 22, see
+   * backend/app/services/resource_aligner.py and
+   * backend/app/models/research.py's VerifiedResource.aligned_conclusions
+   * docstring for the full design (one batched Gemini call per
+   * ingredient, index-based mapping so `text`/`target_claim` are always
+   * the server's own original strings, deterministic DISTINCT_NEW
+   * short-circuit when the ingredient has no existing paper claims yet,
+   * DISTINCT_NEW-with-note fallback if classification itself fails).
+   * `null` until alignment has run at least once for this resource — a
+   * missing/unclassified conclusion is an honest "not yet classified"
+   * state, not an error. An empty array `[]` is a real, valid result
+   * (this resource had no `extracted_conclusions` to classify at all).
+   * VerifiedResourcesList's info modal renders a colored badge per entry
+   * (green Agrees / red Contradicts / blue Distinct-New). */
+  aligned_conclusions?: AlignedConclusion[] | null;
+}
+
+/** One classified entry from VerifiedResource.aligned_conclusions above
+ * — see that field's own doc-comment for the full design. */
+export interface AlignedConclusion {
+  /** Verbatim — always one of the strings already present in this
+   * resource's own `extracted_conclusions`, never regenerated/paraphrased
+   * by the model. */
+  text: string;
+  /** "AGREES" | "CONTRADICTS" | "DISTINCT_NEW" — typed loosely as
+   * `string` at this API boundary rather than a string-literal union,
+   * same reasoning as VerifiedResource.grade above (the backend's column
+   * isn't enforced beyond its Pydantic Literal by a DB constraint);
+   * VerifiedResourcesList validates against the known three values before
+   * choosing a badge color, falling back to a neutral badge for anything
+   * else. */
+  alignment: string;
+  /** The specific existing paper claim this AGREES or CONTRADICTS with.
+   * `null` for a DISTINCT_NEW entry (nothing to point at). */
+  target_claim?: string | null;
+  /** One short sentence explaining the classification. */
+  notes?: string | null;
 }
 
 /** Shape of the JSON body returned by GET /api/v1/ingredients/{id}. */
+/**
+ * Phase 23 — the four Multi-Source Confidence Rubric category scores
+ * backing one ScientificConclusion's `total_score`/`confidence_grade`
+ * — mirrors the backend's ScientificConclusionScoreBreakdown
+ * (app/schemas/research.py, renamed Phase 24 from
+ * RecommendedUseScoreBreakdown). See docs/multi_source_confidence_rubric.json
+ * for what each category actually measures.
+ */
+export interface ScientificConclusionScoreBreakdown {
+  paper_evidence_quality: number;
+  official_authority_backing: number;
+  multi_source_consensus: number;
+  claim_specificity: number;
+}
+
+/**
+ * One synthesized, rubric-scored scientific-conclusion claim (Phase 23,
+ * renamed from "recommended use" Phase 24) — mirrors the backend's
+ * ScientificConclusionResponse (app/schemas/research.py, renamed Phase 24
+ * from RecommendedUseResponse), which itself mirrors one entry of
+ * `Ingredient.scientific_conclusions` (app/models/supplement.py, renamed
+ * Phase 24 from `recommended_uses`).
+ *
+ * **Naming collision, read carefully.** This is NOT the same data as the
+ * existing `PaperConclusion` type/`RecommendedUsesList.tsx` component
+ * above — despite both involving similar phrasing, they come from two
+ * entirely different backend pipelines:
+ *   - `PaperConclusion` (Phase 5) — one row per synthesized cross-paper
+ *     claim, incrementally merged as papers are graded, rendered by the
+ *     existing `RecommendedUsesList.tsx` component (titled "Recommended
+ *     Uses List" in the UI — intentionally left untouched by the Phase 24
+ *     rename, since it names a different concept entirely).
+ *   - `ScientificConclusion` (this type, Phase 11/23, renamed Phase 24
+ *     from `MultiSourceRecommendedUse`) — the ingredient-level
+ *     `scientific_conclusions` array from `synthesize_ingredient_summary`'s
+ *     ONE combined papers+resources Gemini call, scored against the
+ *     four-category Multi-Source Confidence Rubric
+ *     (`docs/multi_source_confidence_rubric.json`), PLUS (Phase 24) any
+ *     VerifiedResource conclusion the Python Direct Injection Safety Net
+ *     force-appended because Gemini omitted it — rendered by the separate
+ *     `ScientificConclusionsList.tsx` component (renamed Phase 24 from
+ *     `MultiSourceUsesList.tsx` — see that file for why it's a distinct
+ *     component rather than folded into `RecommendedUsesList.tsx`).
+ * `confidence_grade`/`total_score` are always server-derived — see this
+ * type's own backend docstring (app/models/supplement.py) for the full
+ * scoring pipeline (identical derivation whether the entry came from
+ * Gemini or from the Phase 24 injection pass); never trust these as
+ * Gemini's own direct pick.
+ */
+export interface ScientificConclusion {
+  claim: string;
+  /** Loosely typed as `string` rather than `PaperGrade` at this API
+   * boundary, same reasoning as ResearchPaper.grade/PaperConclusion.
+   * confidence_grade above. */
+  confidence_grade: string;
+  /** 0-100, clamped sum of `score_breakdown`'s four category scores. */
+  total_score: number;
+  score_breakdown: ScientificConclusionScoreBreakdown;
+  supporting_study_count: number;
+  supporting_resource_count: number;
+  /** Short labels for the specific sources backing this claim, e.g.
+   * "3 RCTs", "Health Canada Monograph", "USDA FDC" — rendered as small
+   * badges by ScientificConclusionsList.tsx. */
+  sources_summary: string[];
+  grade_justification: string;
+}
+
+/**
+ * One resolved field (`description` or `daily_dosage`) of Phase 33's
+ * General Information feature — mirrors the backend's
+ * GeneralInfoFieldResponse (app/schemas/research.py).
+ *
+ * `is_available: false` (with every other field `null`) is a real,
+ * legitimate result, not an error or "not loaded yet" state — render the
+ * fixed notice "No high-grade (Grade A or B) source available containing
+ * this information." for that case (see IngredientCard.tsx's General
+ * Information cards). `source_grade` is always "A", "B", or `null` — the
+ * backend never includes a Grade C/D/E source in the extraction at all
+ * (see backend/app/services/general_info_extractor.py's module
+ * docstring), so the frontend doesn't need its own grade check here.
+ */
+export interface GeneralInfoField {
+  text?: string | null;
+  source_name?: string | null;
+  /** "verified_resource" | "paper" — typed loosely as `string` at this
+   * API boundary, same reasoning as VerifiedResource.grade elsewhere in
+   * this file. */
+  source_type?: string | null;
+  /** Loosely typed as `string` rather than `PaperGrade`, same reasoning
+   * as ResearchPaper.grade above — always "A"/"B"/null in practice. */
+  source_grade?: string | null;
+  is_available: boolean;
+}
+
+/**
+ * Phase 33 — mirrors the backend's GeneralInfoResponse
+ * (app/schemas/research.py), which itself mirrors
+ * `Ingredient.general_info` (app/models/supplement.py) directly: always
+ * both fields present, each independently resolved or unavailable.
+ */
+export interface GeneralInfo {
+  description: GeneralInfoField;
+  daily_dosage: GeneralInfoField;
+}
+
 export interface IngredientDetailResponse {
   id: number;
   name: string;
@@ -569,6 +732,29 @@ export interface IngredientDetailResponse {
    * Same "not yet included in GradeIngredientResponse" caveat as
    * `conclusions` above. */
   verified_resources: VerifiedResource[];
+  /** Phase 23, renamed Phase 24 from `recommended_uses` — see
+   * ScientificConclusion's own doc-comment above for why this is a
+   * DIFFERENT array from `conclusions` above despite the similar naming.
+   * Empty array both before any synthesis has run and after a synthesis
+   * that found no specific claim — ScientificConclusionsList.tsx renders
+   * the same empty-state message either way. Guaranteed (Phase 24 Direct
+   * Injection Safety Net, server-side) to include every
+   * VerifiedResource.extracted_conclusions entry in some form, even if
+   * Gemini itself omitted it from its synthesized claims. Same "not yet
+   * included in GradeIngredientResponse" caveat as
+   * `conclusions`/`verified_resources` above. */
+  scientific_conclusions: ScientificConclusion[];
+  /** Phase 33 — General Information (Description + Daily Dosage), each
+   * independently resolved under a strict Grade A/B-only source
+   * hierarchy (verified resources first, papers second, "unavailable"
+   * notice otherwise) — see GeneralInfo's own doc-comment above. `null`/
+   * `undefined` until a grade request has run this extraction at least
+   * once (same "not attempted yet" convention as `summary_description`
+   * above) — distinct from a present `general_info` whose fields are
+   * individually `is_available: false`. Same "not yet included in
+   * GradeIngredientResponse" caveat as `conclusions`/`verified_resources`/
+   * `scientific_conclusions` above. */
+  general_info?: GeneralInfo | null;
 }
 
 /** Shape of the JSON body returned by

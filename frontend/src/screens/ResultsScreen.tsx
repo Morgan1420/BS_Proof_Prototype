@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   View,
   Text,
@@ -17,11 +17,13 @@ import ProductCard from '../components/ProductCard';
 import type { Product } from '../components/ProductCard';
 import IngredientCard from '../components/IngredientCard';
 import type { Ingredient } from '../components/IngredientCard';
+import IngredientFilter from '../components/IngredientFilter';
 import { colors, layout, spacing, typography } from '../theme';
 import type { RootStackParamList } from '../navigation/types';
 import { searchSupplements } from '../services/api';
 import type { LinkedIngredient, SearchResultItem } from '../services/api';
 import { animateCardToggle } from '../utils/animations';
+import { matchesFilter, type FilterType } from '../utils/ingredientFilters';
 
 type ResultsScreenRouteProp = RouteProp<RootStackParamList, 'ResultsScreen'>;
 type ResultsScreenNavigationProp = NativeStackNavigationProp<
@@ -105,6 +107,19 @@ function toProduct(item: SearchResultItem): Product {
  * so this populates the canonical-metadata fields (recommendedDailyDosage/
  * scientificData/productCount) rather than amount/unit/dailyValue, which
  * IngredientCard falls back to displaying instead.
+ *
+ * **Phase 38 fix.** `is_graded`/`grade_badge_text` used to be hardcoded
+ * to `false`/absent here with a comment claiming "no real grading system
+ * on the backend yet" — stale as of Phase 2's grading pipeline
+ * (app/services/grading.py), which has set and durably persisted
+ * `is_graded=True` for a long time. The real gap was that
+ * `SearchResultItem` (backend/app/schemas/search.py) never included
+ * those fields at all, so there was nothing correct to read here even
+ * after that comment went stale. Now reads the real, persisted value the
+ * backend returns — see `is_graded`'s own doc-comment on the `Ingredient`
+ * interface in IngredientCard.tsx for why this (not `ingredient.is_graded`
+ * directly) only matters as the *initial* seed for that card's local
+ * `isGraded` state.
  */
 function toIngredient(item: SearchResultItem): Ingredient {
   return {
@@ -113,11 +128,8 @@ function toIngredient(item: SearchResultItem): Ingredient {
     recommendedDailyDosage: item.recommended_daily_dosage ?? undefined,
     scientificData: item.scientific_data ?? undefined,
     productCount: item.product_count ?? undefined,
-    // No real grading system on the backend yet — every standalone
-    // ingredient result starts ungraded; see IngredientCard.tsx's
-    // `handleGradeRequest` for the placeholder-only "assign a grade"
-    // interaction (standalone variant only).
-    is_graded: false,
+    is_graded: item.is_graded ?? false,
+    grade_badge_text: item.grade_badge_text ?? undefined,
   };
 }
 
@@ -138,6 +150,42 @@ const ResultsScreen: React.FC = () => {
   const [results, setResults] = useState<SearchResultItem[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+
+  // --- Ingredient filter (status + category) — see
+  // src/utils/ingredientFilters.ts for the FilterType/matchesFilter
+  // definitions and src/components/IngredientFilter.tsx for the popover
+  // UI this state feeds. 'ALL' is both the default and the "show
+  // everything, no filtering applied" value, per spec.
+  const [ingredientFilter, setIngredientFilter] = useState<FilterType>('ALL');
+
+  /**
+   * `results` filtered by `ingredientFilter` — scoped to ingredient-type
+   * rows only. `matchesFilter`'s status/category logic (graded/ungraded,
+   * "looks like a vitamin by name") has no meaning for a product row, so
+   * rather than leaving every product visible regardless of the active
+   * ingredient filter (which would silently mix "filtered" and
+   * "unfiltered" rows in the same list with no visual distinction), any
+   * non-'ALL' filter narrows the list down to matching ingredient rows
+   * only — a deliberate, documented scope decision for this being an
+   * "Ingredient Filter" specifically, not a general results filter.
+   * 'ALL' (the default) always returns every row unchanged, products
+   * included, exactly like before this feature existed.
+   */
+  const filteredResults = useMemo(() => {
+    if (ingredientFilter === 'ALL') {
+      return results;
+    }
+    return results.filter(
+      (item) => item.type === 'ingredient' && matchesFilter(toIngredient(item), ingredientFilter)
+    );
+  }, [results, ingredientFilter]);
+
+  // How many currently-loaded rows match the active filter — feeds
+  // IngredientFilter's active-indicator badge (e.g. "Filter: Vitamins
+  // (10)"). `undefined` while results are still loading so the badge
+  // shows the label alone rather than a misleading "(0)" before the
+  // first fetch resolves.
+  const activeFilterCount = isLoading ? undefined : filteredResults.length;
 
   // Single-expansion accordion for standalone ingredient rows in this
   // list (ingredients nested inside a ProductCard have their own,
@@ -236,13 +284,10 @@ const ResultsScreen: React.FC = () => {
 
       <View style={styles.titleRow}>
         <Text style={styles.headerTitle}>{headerText}</Text>
-        {/* Visual placeholder only — not wired to any filtering
-            behavior yet. */}
-        <Ionicons
-          name="filter"
-          size={20}
-          color={colors.brown}
-          accessibilityLabel="Filter (coming soon)"
+        <IngredientFilter
+          activeFilter={ingredientFilter}
+          onChange={setIngredientFilter}
+          activeCount={activeFilterCount}
         />
       </View>
     </View>
@@ -279,7 +324,7 @@ const ResultsScreen: React.FC = () => {
           // behavior — Footer simply becomes visible once the user
           // scrolls past the last card, same as every other screen.
           style={styles.flatList}
-          data={results}
+          data={filteredResults}
           keyExtractor={(item) => `${item.type}-${item.id}`}
           ListHeaderComponent={listHeader}
           // Footer is rendered as genuine list content here — not as a
@@ -352,7 +397,11 @@ const ResultsScreen: React.FC = () => {
           }}
           ListEmptyComponent={
             <View style={styles.centered}>
-              <Text style={styles.emptyText}>No results found.</Text>
+              <Text style={styles.emptyText}>
+                {ingredientFilter === 'ALL'
+                  ? 'No results found.'
+                  : 'No ingredients match this filter.'}
+              </Text>
             </View>
           }
         />

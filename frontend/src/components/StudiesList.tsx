@@ -410,9 +410,27 @@ const StudiesList: React.FC<StudiesListProps> = ({
                   </View>
 
                   <ScrollView style={styles.modalAbstractScroll}>
+                    {/* Phase 31 — standardized grade-modal formatting:
+                        every category header now shows "(earned/max pts)",
+                        not just the earned score, matching
+                        ScientificConclusionsList.tsx's rubric modal and
+                        the task spec's `[Category] ([Score]/[Max] pts)`
+                        format. Max values are docs/paper_grading_rubric.json's
+                        own `max_score` per category — hardcoded here the
+                        same way ScientificConclusionsList.tsx already
+                        hardcodes its own rubric's /30, /25, /25, /20,
+                        rather than threading the rubric JSON through as a
+                        prop for four display-only literals.
+
+                        Phase 32 — rubric v1.6 rebalance: study_type 40 ->
+                        45, journal_reputation 15 -> 10 (sample_methodology
+                        and funding_bias unchanged at 40/5) — these two
+                        literals below were updated to match; see
+                        docs/paper_grading_rubric.json and
+                        paper_grader.py's own v1.6 docstring notes. */}
                     <View style={styles.rubricSection}>
                       <Text style={styles.rubricSectionLabel}>
-                        Study Design ({activeRubricModalItem.rubric_evaluation.study_type_score} pts)
+                        Study Design ({activeRubricModalItem.rubric_evaluation.study_type_score}/45 pts)
                       </Text>
                       <Text style={styles.rubricSectionValue}>
                         {activeRubricModalItem.rubric_evaluation.study_type}
@@ -421,7 +439,7 @@ const StudiesList: React.FC<StudiesListProps> = ({
 
                     <View style={styles.rubricSection}>
                       <Text style={styles.rubricSectionLabel}>
-                        Journal Rigor ({activeRubricModalItem.rubric_evaluation.journal_score} pts)
+                        Journal Rigor ({activeRubricModalItem.rubric_evaluation.journal_score}/10 pts)
                       </Text>
                       <Text style={styles.rubricSectionValue}>
                         {activeRubricModalItem.rubric_evaluation.journal_reputation}
@@ -431,7 +449,7 @@ const StudiesList: React.FC<StudiesListProps> = ({
                     <View style={styles.rubricSection}>
                       <Text style={styles.rubricSectionLabel}>
                         Methodology &amp; Sample (
-                        {activeRubricModalItem.rubric_evaluation.sample_score} pts)
+                        {activeRubricModalItem.rubric_evaluation.sample_score}/40 pts)
                       </Text>
                       <Text style={styles.rubricSectionValue}>
                         {activeRubricModalItem.rubric_evaluation.sample_info}
@@ -440,8 +458,8 @@ const StudiesList: React.FC<StudiesListProps> = ({
 
                     <View style={styles.rubricSection}>
                       <Text style={styles.rubricSectionLabel}>
-                        Funding &amp; Bias ({activeRubricModalItem.rubric_evaluation.funding_score}{' '}
-                        pts)
+                        Funding &amp; Bias ({activeRubricModalItem.rubric_evaluation.funding_score}
+                        /5 pts)
                       </Text>
                       <Text style={styles.rubricSectionValue}>
                         {activeRubricModalItem.rubric_evaluation.funding_status}

@@ -25,6 +25,42 @@ resource_fetcher.py — which already owns every `VerifiedResource` ORM
 object's construction/`session.add()`/flush lifecycle — doesn't have to
 hand a half-built row back and forth across a module boundary just to
 get it graded.
+
+**Phase 39 — deliberately NOT a domain-based Grade A bypass.** The Phase
+39 NIH extraction overhaul task asked for "Auto-Grade Inheritance:
+Automatically assign Grade A to all conclusions extracted from verified
+NIH URLs." This module does NOT implement that as a hard bypass — doing
+so would break the one guarantee every Grade-A/B-gated consumer in this
+codebase depends on: `general_info_extractor.py`'s `ELIGIBLE_GRADES =
+("A", "B")` gate (itself an explicit, repeatedly-stated project
+requirement: "NEVER accept Grade C, D, or E sources for General
+Information fields") and `conclusion_grader.py`'s server-derived
+`confidence_grade`/`total_score` scoring both exist specifically so a
+grade always reflects real, checked evidence quality — never an
+unearned label. A hard "domain == nih.gov -> Grade A" rule would let a
+genuinely thin, stale, or malformed NIH page (a 404 interstitial, a
+redirect landing page, a page that failed to parse) inherit the same
+trust as a comprehensive, well-cited fact sheet, silently degrading the
+exact fields (`general_info.description`/`general_info.daily_dosage`,
+Scientific Claims) this phase's own task was trying to improve the
+quality of.
+
+Instead, `_build_prompt` below adds an honest, rubric-aligned nudge: when
+the resource's URL resolves to a confirmed NIH/NLM domain (see
+`_is_nih_domain` below — a small local duplicate of
+`resource_fetcher.py::is_nih_domain`, not a cross-import, since
+`resource_fetcher.py` already imports THIS module and a reverse import
+would be circular), the prompt explicitly reminds Gemini that
+`docs/resource_grading_rubric.json`'s own `publisher_authority` rubric
+already names NIH by example as its Tier 1 (30-35/35) case — so a
+genuine, well-cited, comprehensive NIH page should reliably clear the
+Grade A band (80-100 total) through the SAME honest, evidence-based
+scoring every other resource goes through, rather than skipping that
+scoring entirely. In practice this means a real NIH fact sheet should
+still land at Grade A almost every time (satisfying the spirit of "Auto-
+Grade Inheritance" for the resources it's actually meant to help), while
+a broken/thin one is still caught rather than blindly trusted. See
+docs/Architecture.md's Phase 39 section for the full reasoning.
 """
 
 from __future__ import annotations
@@ -34,6 +70,7 @@ import logging
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional, TypedDict
+from urllib.parse import urlparse
 
 from google import genai
 from google.genai import types
@@ -42,6 +79,37 @@ from pydantic import BaseModel, Field
 from app.core.config import get_settings
 
 logger = logging.getLogger(__name__)
+
+# Phase 39 — small, local duplicate of
+# resource_fetcher.py::_NIH_DOMAIN_SUFFIXES/is_nih_domain. NOT a
+# cross-import: resource_fetcher.py already imports `grade_resource` from
+# THIS module (`from app.services.resource_grader import
+# ResourceGradingError, grade_resource`), so importing resource_fetcher.py
+# back here would be circular. See the module docstring's "Phase 39"
+# paragraph above for what this is used for (an honest prompt nudge, not a
+# grade bypass).
+_NIH_DOMAIN_SUFFIXES = ("nih.gov", "medlineplus.gov")
+
+
+def _is_nih_domain(url: Optional[str]) -> bool:
+    """True iff `url`'s hostname is (or is a subdomain of) an official
+    NIH/NLM property. Parses the hostname from the URL itself (this
+    module only ever receives a `url` string in `resource_metadata`, not
+    a separate pre-parsed `domain` field) — falsy/unparseable input
+    returns `False` rather than raising.
+    """
+    if not url:
+        return False
+    try:
+        hostname = (urlparse(url).netloc or "").lower().rstrip(".")
+    except ValueError:
+        return False
+    if not hostname:
+        return False
+    for suffix in _NIH_DOMAIN_SUFFIXES:
+        if hostname == suffix or hostname.endswith("." + suffix):
+            return True
+    return False
 
 # backend/app/services/resource_grader.py -> parents[2] == backend/ ->
 # parents[3] == repo root. Same absolute-path-resolution reasoning as
@@ -255,6 +323,26 @@ def _build_prompt(resource_metadata: Dict[str, Optional[str]], rubric: Dict[str,
         or "No page content available beyond the title/publisher below."
     )
 
+    # Phase 39 — see module docstring's "Phase 39" paragraph for why this
+    # is an honest scoring nudge, not a grade bypass: still asks Gemini to
+    # score every category from the actual content, just reminds it what
+    # the rubric itself already says about this domain category.
+    nih_hint = ""
+    if _is_nih_domain(url):
+        nih_hint = (
+            "\nNote: this URL resolves to an official NIH/NLM domain. "
+            "The rubric's own `publisher_authority` category names "
+            "'NIH' explicitly as its Tier 1 (30-35/35) example — score "
+            "`publisher_authority` accordingly UNLESS the page content "
+            "itself gives you a concrete reason not to (e.g. it's "
+            "actually a broken/near-empty page, not a genuine fact "
+            "sheet). This does not change how any other category should "
+            "be scored — `evidence_citations`, "
+            "`comprehensiveness_currency`, and `transparency_bias` must "
+            "still be judged strictly from what the page content "
+            "actually shows, same as any other resource.\n"
+        )
+
     return (
         "Evaluate the following online reference resource against the "
         "rubric below. Be strict and evidence-based — only award points "
@@ -267,7 +355,8 @@ def _build_prompt(resource_metadata: Dict[str, Optional[str]], rubric: Dict[str,
         f"Resource Title: {resource_title}\n"
         f"URL: {url}\n"
         f"Publisher: {publisher}\n"
-        f"Page Snippet/Text: {page_snippet_or_text}\n\n"
+        f"Page Snippet/Text: {page_snippet_or_text}\n"
+        f"{nih_hint}\n"
         "Rubric categories:\n"
         f"{_format_rubric_for_prompt(rubric)}\n\n"
         "Note: `transparency_bias` ranges from -10 to 15 — the only "

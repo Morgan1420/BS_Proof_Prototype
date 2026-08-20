@@ -1,3 +1,29 @@
+/**
+ * @deprecated Phase 29 — removed from IngredientCard.tsx's "Scientific
+ * Information" section to eliminate UI duplication/confusion against
+ * `ScientificConclusionsList.tsx`, which is now the single source of
+ * truth for "what is this ingredient good for" content. This file is
+ * left in place (not deleted) per this codebase's "deprecate, don't
+ * delete" convention for retired modules (see `MultiSourceUsesList.tsx`,
+ * deprecated the same way in Phase 24), and because destructive file
+ * operations require explicit user action rather than being run
+ * automatically. It is not imported or rendered anywhere in the app —
+ * `IngredientCard.tsx` no longer imports `RecommendedUsesList`. Do not
+ * import from this file; do not add new features here.
+ *
+ * Note this is a DIFFERENT component from `MultiSourceUsesList.tsx`:
+ * that one rendered the Phase 23/24 Ingredient-level
+ * `scientific_conclusions` array under its pre-rename name; this one
+ * renders the still-active, unrelated Phase 5 per-paper `PaperConclusion`
+ * data (see `IngredientCard.tsx`'s `conclusions` prop doc-comment) — the
+ * backend data this component reads (`PaperConclusion` rows via
+ * `conclusion_grader.py::process_paper_conclusions`) is NOT deprecated
+ * and still runs every grade request: it remains genuine input evidence
+ * for `synthesize_ingredient_summary`'s (Stage 2) synthesis of
+ * `scientific_conclusions` itself. Only this component's own dedicated
+ * UI list panel was removed, not the underlying data or its backend
+ * pipeline.
+ */
 import React, { useEffect, useMemo, useState } from 'react';
 import { View, Text, Pressable, StyleSheet, Modal, ScrollView } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';

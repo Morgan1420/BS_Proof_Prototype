@@ -51,6 +51,23 @@ class SearchResultItem(BaseModel):
     amount/unit/daily_value_percentage from ProductIngredientLink. Left
     as an empty list for `type == "ingredient"` results, since a
     standalone ingredient result isn't tied to one product's dosage.
+
+    **Phase 38 fix.** `is_graded`/`grade_badge_text` were missing from
+    this schema entirely — GET /api/v1/supplements/search (which backs
+    both the Library screen's "Ingredients" explore card and every
+    standalone IngredientCard rendered from ResultsScreen) had no way to
+    report an ingredient's real, already-persisted grading status, so the
+    frontend had nothing to read for it and defaulted every result to
+    "ungraded" (see frontend/src/screens/ResultsScreen.tsx::toIngredient's
+    old hardcoded `is_graded: false`). This was misdiagnosed as a
+    backend/DB persistence bug — `Ingredient.is_graded` was in fact being
+    correctly committed and never reset (see
+    app/services/grading.py::grade_ingredient,
+    app/db.py's non-destructive init_db()) — but the search/browse
+    endpoint simply never surfaced it, so every reload/browse looked like
+    a fresh revert to ungraded even though GET /api/v1/ingredients/{id}
+    (used by the ingredient-detail fetch) already returned the correct
+    value the whole time.
     """
 
     id: int
@@ -69,6 +86,13 @@ class SearchResultItem(BaseModel):
         default=None,
         description="How many products currently link to this ingredient.",
     )
+    # Phase 38 — real, persisted grading status (app/models/supplement.py
+    # Ingredient.is_graded/grade_badge_text), same fields
+    # IngredientDetailResponse already exposes. `None`/absent for
+    # `type == "product"` results, same convention as
+    # recommended_daily_dosage/scientific_data/product_count above.
+    is_graded: Optional[bool] = None
+    grade_badge_text: Optional[str] = None
 
 
 class SearchResponse(BaseModel):

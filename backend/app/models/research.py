@@ -5,13 +5,13 @@ up across those papers — Phase 5, see
 app/services/conclusion_grader.py), and VerifiedResource (one row per
 official government/regulatory reference link — Phase 7, see
 app/services/resource_fetcher.py). VerifiedResource also carries
-`extracted_data` (Phase 17 — see app/services/resource_extractor.py), a
-per-resource structured-claims JSON payload extracted independently of
-every other resource, specifically to stop dense peer-reviewed abstracts
-from crowding thin web snippets out of the final synthesis prompt — see
-that field's own docstring below, and
-app/services/conclusion_grader.py's module docstring for how Stage 2
-consumes it.
+`extracted_conclusions`/`extraction_failure_reason` (Phase 19/20,
+deterministic since Phase 21 — see app/services/resource_parser.py), a
+per-resource list of short factual conclusions extracted independently
+of every other resource — see that field's own docstring below.
+`extracted_data` (Phase 17, deprecated Phase 21 — see that field's own
+docstring) is the now-unused predecessor shape, kept only for backward
+compatibility with rows persisted before Phase 21.
 
 ResearchPaper rows are populated by app/services/paper_search.py, which
 queries PubMed, Europe PMC, Semantic Scholar, and OpenAlex per
@@ -38,7 +38,7 @@ avoids bloating the M2M schema module with an unrelated concern.
 from datetime import datetime, timezone
 from typing import List, Optional
 
-from sqlalchemy import JSON, Column
+from sqlalchemy import JSON, Column, String
 from sqlmodel import Field, Relationship, SQLModel
 
 from app.models.supplement import Ingredient
@@ -353,6 +353,24 @@ class VerifiedResource(SQLModel, table=True):
     # simply omits the snippet for those rather than showing an empty
     # or placeholder string.
     summary: Optional[str] = Field(default=None)
+    # --- Phase 21: deterministic conclusion parsing
+    # (app/services/resource_parser.py::parse_resource_conclusions) ---
+    # The `id` of whichever docs/verified_resource_apis.json entry
+    # produced this row — e.g. "pubchem_pug_rest", "usda_fooddata" —
+    # recorded at fetch time in app/services/resource_fetcher.py.
+    # `domain` alone isn't a reliable enough key for this: it identifies
+    # the *hostname a link resolved to*, not which of the six configured
+    # sources actually fetched it (in principle two different config
+    # entries could resolve to overlapping domains). `api_id` is the
+    # authoritative dispatch key resource_parser.py's
+    # parse_resource_conclusions() switches on to pick the right
+    # provider-specific parsing rules, so it's stored directly rather
+    # than re-derived from `domain` on every read. Nullable — `None` for
+    # any row persisted before this column existed (Phase 7-21 rows);
+    # such a row simply never got api_id-driven parsing and keeps
+    # whatever extracted_conclusions/extraction_failure_reason it already
+    # had (or lacks) from an earlier phase.
+    api_id: Optional[str] = Field(default=None, sa_column=Column(String))
 
     # --- Phase 8: automated resource grading
     # (app/services/resource_grader.py) ---
@@ -389,75 +407,136 @@ class VerifiedResource(SQLModel, table=True):
 
     # --- Phase 17: Two-Stage Extraction Pipeline
     # (app/services/resource_extractor.py) ---
-    # Set once, right after a resource is first persisted by
-    # fetch_verified_resources_for_ingredient() (or, for resources
-    # already persisted before this feature existed, backfilled the next
-    # time the ingredient is re-graded — see
-    # app/services/paper_analysis_pipeline.py::analyze_ingredient_papers's
-    # Stage 1 step). Never re-extracted afterward once successfully
-    # populated — same "an evaluation doesn't change once assigned"
-    # convention as `grade`/`score`/`reasoning_summary` above.
+    # **Deprecated as of Phase 21 — see that phase's note on
+    # `extracted_conclusions` below.** `resource_extractor.py`'s Gemini
+    # call (the only thing that ever populated this column) was retired
+    # in favor of `app/services/resource_parser.py`'s deterministic
+    # parser, which does not produce this four-field shape at all (only
+    # `extracted_conclusions`/`extraction_failure_reason`). This column
+    # is kept, unmigrated, purely for backward compatibility with rows
+    # persisted before Phase 21 — `conclusion_grader.py`'s Stage 2
+    # synthesis (`_format_resources_for_prompt`) still reads it when
+    # present and still has its own pre-existing fallback to a resource's
+    # raw `summary` text when it's `None`, so an old row with real
+    # `extracted_data` keeps benefiting from it, while every resource
+    # fetched after Phase 21 simply has this stay `None` forever (falling
+    # back to raw `summary` text in Stage 2, same as any other
+    # never-extracted row always could). Original Phase 17 documentation
+    # preserved below for historical context on why this shape existed.
     #
-    # Why this exists: feeding Gemini one single prompt mixing dense,
+    # Why this existed: feeding Gemini one single prompt mixing dense,
     # information-rich paper abstracts alongside short, thin web-resource
     # snippets caused it to consistently favor the papers and effectively
     # ignore the resources (a "lost-in-the-middle" context-dilution
     # effect) — see app/services/conclusion_grader.py's module docstring.
     # Extracting each resource's claims independently, *before* the final
-    # synthesis call, means Stage 2 receives a compact, uniformly-
+    # synthesis call, meant Stage 2 received a compact, uniformly-
     # structured, already-distilled block per resource — comparable in
     # information density to a paper's own extracted PaperConclusion
-    # rows, so the two source types compete on equal footing rather than
+    # rows, so the two source types competed on equal footing rather than
     # the resource's raw, verbose (or, just as often, sparse) snippet
     # text competing directly against a paper's dense abstract.
-    #
-    # Nullable and stays `None` in two distinct, both-normal cases a
-    # caller must NOT treat as an error: (1) this resource hasn't been
-    # through Stage 1 extraction yet (a freshly-fetched resource, before
-    # analyze_ingredient_papers's Stage 1 step runs), or (2) Stage 1 ran
-    # but found the resource's `summary` too short/absent to extract
-    # anything meaningful from (see resource_extractor.py's
-    # `_MIN_SNIPPET_LENGTH_FOR_EXTRACTION` guard) — in that second case
-    # the stored value is a real (non-None) dict with every field
-    # explicitly null/empty, not a bare `None`, so it's still
-    # distinguishable from "not attempted yet" if that distinction is
-    # ever needed.
     #
     # Stored as a native JSON column (SQLAlchemy's `JSON` type, same
     # convention as ResearchPaper.rubric_evaluation above) with exactly
     # four keys — `official_stance` (str | None), `recommended_dose`
     # (str | None), `upper_limit_warning` (str | None), `key_takeaways`
-    # (list[str]) — mirroring resource_extractor.py's
-    # `ExtractedResourceClaims` TypedDict field-for-field. Additive
-    # column on a table that already existed in deployed (Phase 7/8)
-    # databases — needs the same `ALTER TABLE` migration treatment as
-    # `grade`/`score`/`reasoning_summary` above; see
-    # app/db.py::_migrate_verified_resource_columns.
+    # (list[str]).
     extracted_data: Optional[dict] = Field(default=None, sa_column=Column(JSON))
 
-    # --- Phase 19: extracted conclusions
-    # (app/services/resource_extractor.py::extract_claims_from_resource) ---
-    # 2-4 short, factual conclusions extracted using this resource's own
-    # provider-specific `extraction_instructions`
-    # (docs/verified_resource_apis.json, looked up by `domain` — see
-    # resource_extractor.py's `_find_extraction_instructions`) —
-    # deliberately a SEPARATE column from `extracted_data` above, even
-    # though both come out of the same Stage 1 Gemini call: `extracted_data`
-    # is Stage 2 synthesis's internal input shape (four fixed fields —
-    # see conclusion_grader.py's `_format_resources_for_prompt`, which
-    # reads its own specific keys and would need reshaping if this list
-    # were nested inside it instead), while `extracted_conclusions` is a
-    # flat, display-oriented list purpose-built for the frontend's
-    # "Extracted Conclusions" info-modal section (same shape/consumer as
-    # ResearchPaper.extracted_conclusions above — see that field's
-    # docstring for the "why one combined call, not two" reasoning,
-    # which applies here too: this reuses extract_claims_from_resource's
-    # existing Gemini call rather than issuing a second one per
-    # resource). e.g. `["RDA is 90mg/day", "Reduces duration of cold
-    # symptoms when taken early"]`. None until Stage 1 extraction runs
-    # for this resource (same None-until-processed convention as
-    # `extracted_data`).
+    # --- Phase 19: extracted conclusions; Phase 21: now populated
+    # deterministically, not by Gemini
+    # (app/services/resource_parser.py::parse_resource_conclusions) ---
+    # 2-4 short, factual conclusions about the ingredient, extracted from
+    # this resource's provider's raw API response via fast, rule-based
+    # JSON-key lookups and regex/keyword matching — see
+    # resource_parser.py's module docstring for the full per-provider
+    # rule set (dispatched on `api_id` above). Computed once per source
+    # per ingredient fetch, in app/services/resource_fetcher.py::
+    # fetch_verified_resources_for_ingredient (immediately after that
+    # source's raw payload is fetched, since every resource that same
+    # source contributes this call shares one underlying raw response —
+    # see that function's own docstring), NOT by a separate later
+    # pipeline pass — there is no more "Stage 1" extraction step in
+    # app/services/paper_analysis_pipeline.py as of Phase 21 (see that
+    # module's docstring for why the Gemini-based version documented
+    # under `extracted_data` above was retired: rate limits, latency, and
+    # a class of failures this rule-based replacement can't have at all —
+    # hallucinated output). Rendered under an "Extracted Conclusions"
+    # heading in the frontend's resource info modal
+    # (`src/components/VerifiedResourcesList.tsx`). Always set (never
+    # left `None`) for any resource fetched after Phase 21 — either a
+    # real, non-empty list, or an empty list paired with a reason in
+    # `extraction_failure_reason` below. Stays `None` only for resources
+    # persisted before Phase 21 that were never backfilled (the old
+    # Gemini-based Stage 1 backfill loop that used to do this on a later
+    # re-grade request no longer exists — see
+    # paper_analysis_pipeline.py's module docstring).
     extracted_conclusions: Optional[List[str]] = Field(default=None, sa_column=Column(JSON))
+
+    # --- Phase 20: extraction failure reason; Phase 21: now set by the
+    # deterministic parser, not Gemini
+    # (app/services/resource_parser.py::parse_resource_conclusions) ---
+    # A short, human-readable explanation for why `extracted_conclusions`
+    # came back empty, set whenever parse_resource_conclusions() returns
+    # an empty list — e.g. "No structured nutrient values, RDA limits, or
+    # safety keywords were found in the official payload.", or a
+    # `"Parser error processing payload: ..."` message if the raw
+    # response didn't match the shape that provider's parsing rules
+    # expect. Distinct from `extracted_conclusions` being merely absent
+    # because this resource predates Phase 21 and was never backfilled —
+    # this column stays `None` in that case too, same as
+    # `extracted_conclusions` itself, but gets a real string value
+    # specifically when parsing was attempted and came back empty, so the
+    # frontend's info modal (see
+    # src/components/VerifiedResourcesList.tsx's "Extracted Conclusions"
+    # section) can show an honest, specific reason instead of a generic
+    # "no conclusions yet" message. Plain `String` column (not
+    # `JSON`, unlike its siblings above) since it only ever holds one
+    # short sentence, never a structured/list value.
+    extraction_failure_reason: Optional[str] = Field(default=None, sa_column=Column(String))
+
+    # --- Phase 22: claim alignment / cross-referencing
+    # (app/services/resource_aligner.py::align_resource_conclusions_for_ingredient) ---
+    # One entry per string in `extracted_conclusions` above, classifying
+    # how that specific conclusion relates to this ingredient's existing
+    # paper evidence (`PaperConclusion.claim_summary` rows) — computed
+    # once per ingredient re-grade, AFTER paper conclusions and the
+    # Stage 2 ingredient summary have both been synthesized (see
+    # app/services/paper_analysis_pipeline.py's docstring for exactly
+    # where in the run this happens), by a single Gemini call per
+    # ingredient covering every resource's conclusions at once (batched,
+    # not one call per resource — see resource_aligner.py's module
+    # docstring for why).
+    #
+    # Stored as a native JSON array of plain dicts (not a stricter
+    # sub-model — same "loose dict, not a strict schema" convention as
+    # PaperConclusion.rubric_evaluation elsewhere in this module), each
+    # shaped:
+    #   {
+    #     "text": str,              # the conclusion itself (verbatim
+    #                                # from extracted_conclusions — never
+    #                                # regenerated/paraphrased by Gemini)
+    #     "alignment": str,         # "AGREES" | "CONTRADICTS" | "DISTINCT_NEW"
+    #     "target_claim": str|None, # the specific existing paper claim
+    #                                # this agrees/contradicts with; None
+    #                                # for DISTINCT_NEW
+    #     "notes": str|None,        # 1 short sentence explaining the
+    #                                # classification
+    #   }
+    #
+    # `None` until alignment has run at least once for this resource
+    # (same "None = not attempted yet" convention as `extracted_data`/
+    # `extracted_conclusions` above) — the frontend's info modal treats a
+    # missing/unclassified conclusion as an honest "not yet classified"
+    # state, not an error. An empty list `[]` is a real, valid result
+    # (this resource had no `extracted_conclusions` to classify in the
+    # first place). See resource_aligner.py's module docstring for the
+    # fallback behavior when the classification Gemini call itself fails
+    # (every conclusion defaults to DISTINCT_NEW with an explanatory
+    # note, never silently dropped and never guessed into AGREES/
+    # CONTRADICTS without real evidence).
+    aligned_conclusions: Optional[List[dict]] = Field(default=None, sa_column=Column(JSON))
 
     created_at: datetime = Field(default_factory=_utcnow, nullable=False)
 

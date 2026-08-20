@@ -38,7 +38,7 @@ backend/
         ├── research_keywords.py  # Gemini: generate_ingredient_keywords() (Phase 2)
         ├── paper_search.py       # Europe PMC/PubMed/Semantic Scholar/OpenAlex (async, concurrent): search_papers_for_ingredient() (Phase 2; search-only as of Phase 5 — grading moved to paper_analysis_pipeline.py)
         ├── paper_grader.py       # Gemini: grade_paper() — evaluates one paper against docs/paper_grading_rubric.json AND relevance-checks it against its target ingredient in the same call (Phase 3 grading, Phase 6 relevance); grade_single_paper() — on-demand/idempotent DB-aware wrapper for one already-stored paper, also sets ResearchPaper.status (Phase 4; also the per-paper grading step of the Phase 5 pipeline)
-        ├── conclusion_grader.py  # Gemini: process_paper_conclusions() — extracts one graded paper's findings and merges/creates PaperConclusion rows against docs/conclusion_grading_rubric.json (Phase 5); defensively gates on paper.status != DISCARDED_IRRELEVANT (Phase 6). Also: synthesize_ingredient_summary() — one ingredient-level call combining every graded paper AND every VerifiedResource into a single summary_description/main_consensus/recommended_uses (Phase 11)
+        ├── conclusion_grader.py  # Gemini: process_paper_conclusions() — extracts one graded paper's findings and merges/creates PaperConclusion rows against docs/conclusion_grading_rubric.json (Phase 5); defensively gates on paper.status != DISCARDED_IRRELEVANT (Phase 6). Also: synthesize_ingredient_summary() — one ingredient-level call combining every graded paper AND every VerifiedResource into a single summary_description/main_consensus/scientific_conclusions (Phase 11, field renamed from recommended_uses Phase 24; Phase 24 also adds a Python Direct Injection Safety Net guaranteeing every VerifiedResource conclusion appears in scientific_conclusions)
         ├── paper_analysis_pipeline.py  # analyze_ingredient_papers() — sequential per-paper grade + relevance-check + conclusion-synthesis loop with per-paper error isolation (Phase 5); discards/skips conclusion synthesis for DISCARDED_IRRELEVANT papers (Phase 6); after the loop, calls synthesize_ingredient_summary() once and persists summary_description onto Ingredient (Phase 11)
         ├── resource_fetcher.py   # Plain HTTP: fetch_verified_resources_for_ingredient() queries docs/verified_resource_apis.json's official gov/regulatory APIs by ingredient name, strictly domain-filters results, persists VerifiedResource rows (Phase 7); also grades each new one via resource_grader.py, sequentially (Phase 8)
         ├── resource_grader.py    # Gemini: grade_resource() — evaluates one already-fetched, already-domain-verified resource against docs/resource_grading_rubric.json (Phase 8); pure, no DB — called directly by resource_fetcher.py, no separate on-demand endpoint/pipeline module (unlike papers)
@@ -2726,6 +2726,2065 @@ the frontend (`services/api.ts`, `components/StudiesList.tsx`,
 `components/VerifiedResourcesList.tsx`, `components/IngredientCard.tsx`)
 both pass cleanly.
 
+## Extraction Failure Reasons for Verified Resources (Phase 20)
+
+Follow-up to Phase 19: when a `VerifiedResource`'s `extracted_conclusions`
+comes back empty, the resource info modal now explains *why*, via a new
+`extraction_failure_reason` column and a highlighted notice box in the
+frontend, instead of just showing an empty section. Scoped to
+`VerifiedResource` only — the task didn't ask for the equivalent on
+`ResearchPaper`/`paper_grader.py`, so that file wasn't touched.
+
+**Same file-location note as Phase 19.** The task again pointed at
+`IngredientCard.tsx` for the frontend display; the actual notice box was
+added to `VerifiedResourcesList.tsx`'s existing `activeInfoModalItem`
+Modal (the real resource info modal — see Phase 19's own note on this).
+`IngredientCard.tsx` got its doc comment extended to mention the new
+field, same as before.
+
+**Where reasons get set (`resource_extractor.py`).** `extract_claims_from_resource()`
+stays a pure function (no DB access — see module docstring) but now
+reports *why* whenever it returns/raises an empty result, via four new
+canned `_REASON_*` string constants matching the task's own examples
+almost verbatim:
+
+- **Short-snippet guard** (existing early-return path): now includes
+  `"extraction_failure_reason": _REASON_SHORT_SNIPPET` directly in its
+  returned dict.
+- **A successful Gemini call that genuinely found nothing** (not an
+  error — Gemini answered, there was just nothing to report): the final
+  return block now sets `extraction_failure_reason` to
+  `_REASON_NO_CONCLUSIONS_FOUND` whenever the capped `extracted_conclusions`
+  list ends up empty, `None` otherwise.
+- **An actual request/parse failure** (network error, unparsable
+  response, schema mismatch, or retries exhausted on a 429): these
+  already raised `ResourceExtractionError` before this phase. That
+  exception class gained an optional `.reason` attribute — set to
+  `_REASON_RATE_LIMIT` when the underlying failure is
+  `gemini_rate_limit.py`'s retries-exhausted `RuntimeError` (detected via
+  a `"rate limit"` substring match on the message, since that's the only
+  way this specific error ever reaches here) or `_REASON_PARSE_FAILURE`
+  for an empty/unparsable response; falls back to the exception's own
+  detailed message when a failure mode wasn't specifically categorized,
+  rather than leaving the reason blank.
+
+**Where reasons get persisted (`paper_analysis_pipeline.py`).** The
+Stage 1 loop now writes `resource.extraction_failure_reason` on both
+branches: on the caught-`ResourceExtractionError` path (from `.reason`,
+falling back to `str(exc)`), and on the success path (straight from the
+returned dict's `extraction_failure_reason` key, explicitly re-set to
+`None`/a reason on every successful call rather than left alone, in case
+this run is a retry of a resource that failed on the run before). A new
+`resources_flagged_failed_this_run` counter, alongside the existing
+`resources_extracted_this_run`, makes sure a commit actually happens even
+on a run where every resource failed (the failure branch never sets
+`extracted_data`, so those resources remain eligible for retry on a
+later run — same as before this phase — but the *reason* still needs
+saving now).
+
+**API exposure.** `extraction_failure_reason: Optional[str] = None` added
+to `VerifiedResourceResponse` (`backend/app/schemas/research.py`);
+`search.py`'s `get_ingredient_resources()` passes the ORM column straight
+through.
+
+**Frontend.** `VerifiedResource` (`src/services/api.ts`) gained an
+`extraction_failure_reason?: string | null` field.
+`VerifiedResourcesList.tsx`'s "Extracted Conclusions" section's empty-state
+branch (previously plain fallback text) is now a bordered, tinted
+`extractionFailureNotice` box rendering
+`"No conclusions extracted because " + (item.extraction_failure_reason || "insufficient text was provided by the official source.")`
+— handling `null`/`undefined` gracefully via `||`, per the task's own
+constraint, so a resource that hasn't been through Stage 1 extraction yet
+(where the backend reason is itself `null`) still gets a sensible generic
+message rather than a blank/broken string.
+
+**Verification.** `python3 -m py_compile` on every touched backend file
+(`models/research.py`, `db.py`, `services/resource_extractor.py`,
+`services/paper_analysis_pipeline.py`, `schemas/research.py`,
+`services/search.py`) and `npx tsc --noEmit` on the frontend
+(`services/api.ts`, `components/VerifiedResourcesList.tsx`,
+`components/IngredientCard.tsx`) both pass cleanly.
+
+## Deterministic Resource Conclusion Parsing (Phase 21)
+
+Replaces the Gemini-based resource conclusion extraction from Phase 17/
+19/20 (`app/services/resource_extractor.py`) with a fast, zero-LLM,
+rule-based parser (`app/services/resource_parser.py`) — eliminates
+Gemini rate limits for this step entirely, executes essentially
+instantly, and structurally cannot hallucinate a claim the source
+payload never actually contained.
+
+**File-location deviation, same story as Phase 19/20.** The task named
+`app/services/paper_analysis_pipeline.py` as the integration point
+("Update paper_analysis_pipeline.py to call
+resource_parser.parse_resource_conclusions(resource, raw_api_data)
+locally"). The raw API payloads that function needs only ever existed
+inside `app/services/resource_fetcher.py`'s per-source query functions —
+by the time control used to reach `paper_analysis_pipeline.py`'s old
+Stage 1 step, a VerifiedResource row's raw response was long gone, only
+its already-parsed title/publisher/summary remained. So the actual call
+site is `resource_fetcher.py::fetch_verified_resources_for_ingredient`,
+right after each source's raw response is fetched — see that function's
+own Phase 21 docstring paragraph. `paper_analysis_pipeline.py`'s old
+Stage 1 loop was removed outright (there's nothing left for a later
+pipeline pass to do), and its module docstring now leads with an
+explanation of this exact deviation for anyone who comes looking for
+Stage 1 there expecting to find it, matching the same pattern already
+established for the frontend's Info Modal location in Phase 19/20.
+
+**`resource_parser.py`'s per-provider rules**, dispatched on `api_id`
+(the config entry `id` from `docs/verified_resource_apis.json`, now
+stored directly on each `VerifiedResource` row — see below):
+
+- `pubchem_pug_rest` — direct key lookup on
+  `InformationList.Information[].Description`/`.Title`.
+- `usda_fooddata` — the first matched food's `foodNutrients[]` (value/
+  amount + unitName + nutrientName), first 4 entries.
+- `health_canada_lnhpd` — `licences[]` (or the payload itself if already
+  a bare list) for `purpose_name`/`dose_subclause`/`risk_statement`.
+- `medlineplus_api`, `dailymed_api`, `europe_pmc` — a shared regex/
+  keyword fallback (sentence-split the stringified raw payload, keep
+  sentences mentioning a fixed set of health-claim keywords), since none
+  of these three has one reliable structured field to key off directly.
+- Any other/unrecognized `api_id` — returns an empty result with an
+  honest "no parser configured" reason rather than raising.
+
+Every branch caps at 4 results and deduplicates before returning — same
+"don't trust the input's own bound-following, enforce it here"
+philosophy as every rubric-based grader/extractor elsewhere in this
+codebase. Wrapped in one broad `try/except` so a parser bug or an
+unexpectedly-shaped payload degrades to an honest empty result with a
+`"Parser error processing payload: ..."` reason, never a crash — `extracted_conclusions`
+is guaranteed to always be a valid `list[str]`, per the task's own
+constraint.
+
+**One call per source, not per resource.** `raw_data` is one source's
+entire raw API response for one ingredient search, not a single
+resource's own snippet — and a single source query can produce more than
+one `VerifiedResource` row (up to `DEFAULT_MAX_RESULTS_PER_SOURCE`).
+`resource_fetcher.py` calls `parse_resource_conclusions()` once per
+source and applies the resulting `(conclusions, failure_reason)` pair to
+every resource that source contributes that call, rather than re-running
+the same parse per resulting row.
+
+**Plumbing raw payloads through `resource_fetcher.py`.** Every
+`_query_*` function (`_query_pubchem`, `_query_medlineplus`, `_query_usda`,
+`_query_dailymed`, `_query_europe_pmc`, `_query_generic` — used by
+`_query_health_canada`) now returns `(records, raw_payload)` instead of
+just `records`; `_run_source_query`/`_safe_query_async` propagate that
+tuple through their own retry/fallback logic; the renamed
+`_search_all_sources_async` (was `_search_all_records_async`) returns one
+`(api_id, records, raw_data)` tuple per source instead of one flattened
+list, specifically so `fetch_verified_resources_for_ingredient` can call
+the parser once per source with the right payload. None of the six
+per-source parsers' own internal request/parsing logic changed — only
+their return values gained a second element.
+
+**New column: `VerifiedResource.api_id`.** Records which
+`docs/verified_resource_apis.json` entry produced each row (e.g.
+`"pubchem_pug_rest"`) — the authoritative dispatch key
+`parse_resource_conclusions()` switches on. Not derived from `domain` at
+read time since `domain` identifies a resolved hostname, not which of
+the six configured sources fetched it. Nullable — `None` for any row
+persisted before this column existed.
+
+**Known, accepted side effect: `extracted_data` no longer populated.**
+The old Stage 1's four-field structured shape
+(`official_stance`/`recommended_dose`/`upper_limit_warning`/
+`key_takeaways`) was a Gemini-only concept the deterministic parser
+doesn't produce — the column stays on `VerifiedResource` for backward
+compatibility with pre-Phase-21 rows (Stage 2 synthesis still reads it
+when present), but nothing populates it going forward. Stage 2
+(`conclusion_grader.py::_format_resources_for_prompt`) already had its
+own fallback to a resource's raw `summary` text for the "never
+extracted" case, so this doesn't break synthesis, just means resources
+fetched after this phase feed it slightly less structured input than
+Phase 17-20 resources did.
+
+**`resource_extractor.py` deprecated, not deleted.** No longer imported
+or called anywhere in this codebase — its module docstring now leads
+with a deprecation notice. Left in place rather than removed, purely as
+historical reference for its rate-limiting/provider-instruction-lookup
+reasoning, per this session's general "communicate deviations clearly,
+don't destroy code the task didn't explicitly ask to delete" approach.
+Quality grading (`app/services/resource_grader.py::grade_resource`,
+Phase 8) is a distinct concern and is completely unaffected — still one
+Gemini call per resource, exactly as before this phase.
+
+**Verification.** `python3 -m py_compile` on every touched/new backend
+file (`models/research.py`, `db.py`, `services/resource_parser.py`
+[new], `services/resource_fetcher.py`, `services/paper_analysis_pipeline.py`,
+`services/resource_extractor.py`, `services/gemini_rate_limit.py`,
+`services/grading.py`, `services/search.py`, `schemas/research.py`)
+passes cleanly. No frontend files touched this phase — `extracted_conclusions`/
+`extraction_failure_reason` were already wired through the API and info
+modal in Phase 19/20 and need no changes on the frontend side to pick up
+values that now arrive via a different backend mechanism.
+
+## Resource Conclusion Extraction Depth & Claim Alignment (Phase 22)
+
+Two changes on top of Phase 21's deterministic parser, both scoped to
+`VerifiedResource` conclusions only (paper-side `PaperConclusion`
+synthesis, `conclusion_grader.py`, is unchanged this phase):
+
+**1. Uncapped extraction depth (`resource_parser.py`).** Every phase
+through 21 capped extraction at 4 results per resource (`_MAX_CONCLUSIONS
+= 4`, mirroring the old Gemini extractor's own `[:4]`). That cap is
+removed entirely: `_parse_usda` now loops over every returned nutrient
+(not just the first 3-4) and emits an extra `percentDailyValue`-based
+conclusion per nutrient when present; `_parse_health_canada` now also
+parses `approved_subclause` alongside the existing three monograph
+clauses; the free-text fallback (`_parse_free_text_fallback`, used for
+MedlinePlus/DailyMed/Europe PMC) captures every matching sentence instead
+of stopping at 4, over an expanded keyword list (`rda`, `warning`,
+`indication`, `contraindication`, `benefit`, `upper limit`, `mechanism`,
+`efficacy`, `interaction` added to the original `recommended`/`dosage`/
+`safety`/`indicated` set). De-duplication (`dict.fromkeys`, first-seen
+order preserved) is the only thing still enforced — an identical string
+appearing twice collapses to one entry, but every genuinely distinct
+statement survives, however many there are.
+
+**2. Claim alignment / cross-referencing
+(`backend/app/services/resource_aligner.py`, new file).** Classifies
+every string in a resource's `extracted_conclusions` against the
+ingredient's existing `PaperConclusion` claims as `AGREES` / `CONTRADICTS`
+/ `DISTINCT_NEW`, persisted onto a new `VerifiedResource.aligned_conclusions`
+JSON column (one entry per `extracted_conclusions` string, in the same
+order: `{text, alignment, target_claim, notes}`).
+
+- **One Gemini call per ingredient, not per resource.** Every resource's
+  conclusions for an ingredient are pooled into a single prompt and
+  classified together in one request — same "one call per grade request"
+  reasoning `conclusion_grader.py::synthesize_ingredient_summary` already
+  established (Phase 11), now doubly important since Phase 22's own
+  extraction-depth change (above) can make per-resource conclusion counts
+  much larger than the old 4-item cap allowed, which would have made
+  "one call per resource" a much worse rate-limit multiplier than it used
+  to be.
+- **Index-based mapping, never trusting echoed text.** The prompt assigns
+  every pooled conclusion and every existing claim a stable integer
+  index; Gemini's structured response (`Literal["AGREES", "CONTRADICTS",
+  "DISTINCT_NEW"]`, confirmed as an established working pattern in this
+  codebase's `response_schema` models via `conclusion_grader.py`'s own
+  `relationship`/`confidence_grade` fields) references conclusions/claims
+  by index only. The `text`/`target_claim` values actually persisted are
+  always looked up from the server's own original strings afterward,
+  never taken from Gemini's response — same anti-paraphrase-drift
+  reasoning behind `resource_parser.py` being deterministic in the first
+  place (Phase 21) and this codebase's index-based Phase 19 extraction
+  schemas.
+- **Deterministic short-circuit.** If an ingredient has zero active
+  `PaperConclusion` rows, every resource conclusion is trivially
+  `DISTINCT_NEW` by definition — there's nothing to agree/contradict
+  against — so `align_resource_conclusions_for_ingredient` classifies
+  everything that way directly, with no Gemini call at all. Both a
+  rate-limit optimization and the only *correct* answer for that case.
+- **Strict fallback on failure.** If the batched Gemini call itself fails
+  (rate limit exhausted past retry, malformed response, network error),
+  every conclusion for the ingredient falls back to `DISTINCT_NEW` with an
+  explanatory `notes` string (`"Alignment classification unavailable:
+  <reason>"`) — never guessed into `AGREES`/`CONTRADICTS` without real
+  model evidence, and never silently dropped. A resource with
+  `extracted_conclusions` always ends up with an equal-length
+  `aligned_conclusions` after this function runs, classified or
+  fallback-classified.
+- **Wired through `gemini_rate_limit.py`** (`throttle_gemini_call` +
+  `call_gemini_with_retry`), same as `paper_grader.py` — a new call site,
+  so (unlike `conclusion_grader.py`'s two call sites, a pre-existing,
+  documented gap) there was no reason to skip rate-limit protection here.
+
+**Pipeline wiring (`paper_analysis_pipeline.py`).**
+`align_resource_conclusions_for_ingredient` runs as a third step inside
+`analyze_ingredient_papers()`, after the per-paper conclusion loop AND
+Stage 2's `synthesize_ingredient_summary()` — so it always classifies
+against the freshest `PaperConclusion` set available for that run,
+including anything the same run's own paper grading just merged in.
+Never raises out of `analyze_ingredient_papers()` — the alignment
+function applies its own fallback internally, same best-effort philosophy
+as every other step in this pipeline.
+
+**Schema.** `VerifiedResource.aligned_conclusions: Optional[List[dict]]`
+(new JSON column, additive migration via `db.py`'s
+`_VERIFIED_RESOURCE_COLUMNS` tuple, same idempotent
+`ALTER TABLE ... ADD COLUMN` pattern as every prior additive column this
+session added). `None` until alignment has run at least once for a given
+resource (same "`None` = not attempted yet" convention as
+`extracted_conclusions`/`extraction_failure_reason`); an empty list `[]`
+is a real, valid result for a resource with no `extracted_conclusions` to
+classify. Exposed via a new `AlignedConclusionResponse` Pydantic model
+(`schemas/research.py`) and `VerifiedResourceResponse.aligned_conclusions`,
+passed straight through in `search.py::get_ingredient_resources`.
+
+**Frontend.** `src/services/api.ts` gains an `AlignedConclusion`
+interface plus `VerifiedResource.aligned_conclusions`. A new
+`src/utils/alignment.ts` module holds the alignment->color/label mapping
+(`ALIGNMENT_COLORS`/`ALIGNMENT_LABELS`: green `AGREES` / red
+`CONTRADICTS` / blue `DISTINCT_NEW`) — deliberately *not* sourced from
+`theme.ts`'s strict brand palette, same reasoning as `utils/grades.ts`'s
+`GRADE_COLORS`: these are semantic status-signal colors, not brand
+colors. **Same file-location story as Phase 19/20/21:** the task named
+`IngredientCard.tsx` as the badge-rendering target, but that component is
+still a pure passthrough with no modal code of its own (documented again
+in its own prop-doc comment) — the real rendering lives in
+`VerifiedResourcesList.tsx`'s existing "Extracted Conclusions" info-modal
+section, which now renders a colored badge (plus `target_claim`/`notes`
+text when present) beneath each conclusion bullet, keyed off
+`aligned_conclusions[index]` (parallel-indexed with
+`extracted_conclusions`, optional-chained since alignment may not have
+run yet — renders the bullet with no badge in that case, not an error).
+
+**Verification.** `python3 -m py_compile` on every touched/new backend
+file (`services/resource_parser.py`, `models/research.py`, `db.py`,
+`services/resource_aligner.py` [new], `services/paper_analysis_pipeline.py`,
+`schemas/research.py`, `services/search.py`) passes cleanly. A runtime
+smoke test of `resource_parser.py` confirmed uncapped extraction (6 USDA
+conclusions from 5 nutrients including the new `percentDailyValue` line;
+4 Health Canada conclusions including the new `approved_subclause` line).
+`npx tsc --noEmit` passes cleanly on the frontend
+(`services/api.ts`, `utils/alignment.ts` [new],
+`components/VerifiedResourcesList.tsx`, `components/IngredientCard.tsx`).
+
+## Multi-Source Confidence Rubric for Recommended Uses (Phase 23)
+
+Rescores the ingredient-level `recommended_uses` array produced by
+`app/services/conclusion_grader.py::synthesize_ingredient_summary`
+(Phase 11) against a new, real four-category rubric —
+`docs/multi_source_confidence_rubric.json` — instead of trusting a
+Gemini-picked letter grade directly, and persists the fully-scored
+result onto the `Ingredient` row for the first time (through Phase 22 it
+was computed but only ever returned for observability).
+
+**Scope: `recommended_uses` only, not `PaperConclusion`.** This
+codebase already has two differently-named, easily-confused "recommended
+uses" concepts:
+
+- `PaperConclusion` (Phase 5) — one row per synthesized cross-paper
+  claim, incrementally merged as papers are graded, scored by the
+  existing `docs/conclusion_grading_rubric.json` /
+  `process_paper_conclusions`, rendered by `RecommendedUsesList.tsx`
+  ("Recommended Uses List" in the UI). **Untouched this phase.**
+- `Ingredient.recommended_uses` (Phase 11, this phase) — the array
+  `synthesize_ingredient_summary`'s ONE combined papers+resources Gemini
+  call produces per grade request. This is what Phase 23 rescores and,
+  for the first time, persists.
+
+The task named `conclusion_grader.py` and described scoring "synthesized
+claims" combining paper AND regulatory evidence — that description
+matches `recommended_uses`, not the per-paper `PaperConclusion` table, so
+only the ingredient-level synthesis path changed. `RUBRIC_PATH`/
+`_load_rubric()` (the old rubric/loader) and `process_paper_conclusions`
+are both unchanged.
+
+**Rubric — `docs/multi_source_confidence_rubric.json` (v2.0).** Four
+categories summing to 100 points: `paper_evidence_quality` (0-30),
+`official_authority_backing` (0-25), `multi_source_consensus` (0-25),
+`claim_specificity` (0-20); five grade bands A (85-100) through E (0-29),
+contiguous, same shape/JSON-sanity conventions as every other rubric
+file in this repo. Loaded by a new, separate `_load_multi_source_rubric()`
+(own `@lru_cache` entry, own file path constant
+`MULTI_SOURCE_RUBRIC_PATH`) — deliberately not merged with the existing
+`_load_rubric()`, since the two rubrics govern two different tables.
+
+**Server-derived scoring, never Gemini's own grade.** Same "never trust
+Gemini's own bound-following" convention as every other rubric-based
+grader in this app (`paper_grader.py`, `process_paper_conclusions`):
+Gemini's structured response (`_RecommendedUseSchema`) supplies only the
+four raw category scores per claim, plus `supporting_study_count`/
+`supporting_resource_count`/`sources_summary`/`grade_justification` — it
+never supplies `confidence_grade` or `total_score` directly. The server
+clamps each category score to the rubric's own `max_score`, sums them
+into a clamped 0-100 `total_score`, and maps that to a `confidence_grade`
+via `_score_to_grade` against the new rubric's `grade_bands` — reusing
+the exact same `_clamp`/`_score_to_grade` helpers `process_paper_conclusions`
+already uses for its own (different) rubric.
+
+**Graceful single-source handling (task requirement).** The synthesis
+prompt explicitly instructs Gemini: a claim backed solely by papers
+should score `official_authority_backing_score` at or near 0 (not a
+penalty to compensate for elsewhere), and a claim backed solely by
+official resources should score `paper_evidence_quality_score` at or
+near 0 — never inflate one category to compensate for a genuinely absent
+source, and never fabricate support that isn't in the evidence just to
+avoid a low score.
+
+**`_format_resources_for_prompt` finally stops rendering dead data.**
+Through Phase 22, this function rendered `VerifiedResource.extracted_data`
+— the old Gemini-based Stage 1 field, which has been `None` for every
+resource fetched since Phase 21 retired that extractor (a known,
+accepted regression at the time). Every resource block had silently been
+falling back to raw `summary` text ever since. Phase 23 finally fixes
+this: it now renders `extracted_conclusions` (Phase 19/21, uncapped as of
+Phase 22) as one bullet per conclusion, each annotated with its
+`aligned_conclusions` classification (Phase 22 — AGREES/CONTRADICTS/
+DISTINCT_NEW) when available. This directly feeds the new
+`official_authority_backing`/`multi_source_consensus` categories real
+per-conclusion alignment signal instead of an almost-always-empty dict.
+
+**Persistence.** New `Ingredient.recommended_uses: Optional[List[dict]]`
+JSON column (`app/models/supplement.py`), additive migration via
+`db.py`'s `_INGREDIENT_GRADING_COLUMNS` tuple (same idempotent
+`ALTER TABLE ... ADD COLUMN` pattern as every prior additive column).
+`app/services/paper_analysis_pipeline.py` writes it in the SAME commit as
+`summary_description` (both come from the same Gemini call/result) —
+`None` until a grade request successfully synthesizes at least once, `[]`
+is a real "synthesis ran, nothing to recommend yet" result. Exposed via
+new `RecommendedUseScoreBreakdown`/`RecommendedUseResponse` Pydantic
+models (`schemas/research.py`) and
+`IngredientDetailResponse.recommended_uses`, passed straight through in
+`search.py::get_ingredient_detail`.
+
+**Frontend — a new, separate component, not a RecommendedUsesList.tsx
+extension.** `MultiSourceRecommendedUse`/`RecommendedUseScoreBreakdown`
+added to `src/services/api.ts`, with an extensive doc-comment on
+`MultiSourceRecommendedUse` explaining the naming collision with
+`PaperConclusion`/`RecommendedUsesList.tsx` above it. A new
+`src/components/MultiSourceUsesList.tsx` — same unified list-panel chrome
+(`CollapsibleSection`, `GradeCircleBadge`, `Pagination`, rubric + info
+modal pair) as the other three Scientific Information panels, same
+"sort by grade rank then score before paginating" rule — renders every
+`recommended_uses` claim with its total score, colored source badges
+(`sources_summary`), and a four-category rubric breakdown modal distinct
+from `RecommendedUsesList.tsx`'s own (different-shaped) rubric modal.
+Wired into `IngredientCard.tsx`'s "Scientific Information" section
+alongside the other three lists — same pure-passthrough/lazy-fetch-on-
+first-expand convention as `papers`/`conclusions`/`verified_resources`,
+now also refreshed by the post-grade re-fetch in `handleGradeRequest`.
+
+**Verification.** `python3 -m py_compile` on every touched/new backend
+file (`services/conclusion_grader.py`, `models/supplement.py`, `db.py`,
+`services/paper_analysis_pipeline.py`, `schemas/research.py`,
+`services/search.py`) passes cleanly, plus a JSON sanity check on
+`docs/multi_source_confidence_rubric.json` (category `max_score`s sum to
+100, `grade_bands` contiguous). `npx tsc --noEmit` passes cleanly on the
+frontend (`services/api.ts`, `components/MultiSourceUsesList.tsx` [new],
+`components/IngredientCard.tsx`).
+
+## Terminology Rename + Direct Injection Safety Net (Phase 24)
+
+Two changes, both scoped to the Phase 11/23 `Ingredient`-level synthesis
+path only — the unrelated, pre-existing `PaperConclusion`/
+`RecommendedUsesList.tsx` ("Recommended Uses List") path from Phase 5 is
+untouched, same scope boundary Phase 23 already drew.
+
+**1. Rename: "Recommended Uses" -> "Scientific Conclusions".** Every
+symbol on the `Ingredient`-level synthesis path was renamed end to end:
+
+- `Ingredient.recommended_uses` -> `Ingredient.scientific_conclusions`
+  (`app/models/supplement.py`) — additive migration only, per this
+  codebase's "never rename a column in place" convention. The new
+  `scientific_conclusions` JSON column was added via `db.py`'s existing
+  `ALTER TABLE ... ADD COLUMN` pattern; the old `recommended_uses` column
+  is left in the SQLite file, orphaned and no longer mapped by any Python
+  code. A new one-time, idempotent backfill
+  (`_backfill_scientific_conclusions_from_legacy_column` in `db.py`) runs
+  `UPDATE ingredients SET scientific_conclusions = recommended_uses WHERE
+  scientific_conclusions IS NULL AND recommended_uses IS NOT NULL` on
+  every startup, so any pre-Phase-24 database picks up its existing data
+  under the new column name without a destructive rename.
+- `RecommendedUseScoreBreakdown`/`RecommendedUseResponse` (`schemas/
+  research.py`) -> `ScientificConclusionScoreBreakdown`/
+  `ScientificConclusionResponse` (same fields; the latter deliberately
+  stays singular rather than the plural `ScientificConclusionsResponse`,
+  matching this codebase's existing one-model-per-list-item convention —
+  see `PaperConclusionResponse`/`VerifiedResourceResponse`).
+  `IngredientDetailResponse.recommended_uses` ->
+  `.scientific_conclusions`.
+- `conclusion_grader.py`: `_RecommendedUseSchema` ->
+  `_ScientificConclusionSchema`, `_IngredientSummarySchema.
+  recommended_uses` -> `.scientific_conclusions`,
+  `IngredientSummaryResult`'s key renamed to match. The synthesis prompt's
+  field references were renamed to match.
+- Frontend: `MultiSourceRecommendedUse`/`RecommendedUseScoreBreakdown`
+  (`services/api.ts`) -> `ScientificConclusion`/
+  `ScientificConclusionScoreBreakdown`;
+  `IngredientDetailResponse.recommended_uses` ->
+  `.scientific_conclusions`. New `src/components/
+  ScientificConclusionsList.tsx` replaces `MultiSourceUsesList.tsx` —
+  same unified list-panel chrome/sort/pagination as before, titled
+  "Scientific Conclusions List (Total: N)". `IngredientCard.tsx`'s state
+  (`recommendedUses`/`recommendedUsesLoading`/`recommendedUsesError`) was
+  renamed to `scientificConclusions`/`...Loading`/`...Error` in both the
+  mount-effect fetch AND the post-grade `handleGradeRequest` re-fetch.
+  **`MultiSourceUsesList.tsx` itself is deprecated, not deleted** — it
+  carries a `@deprecated` doc-comment header explaining it's superseded
+  and unimported, per this codebase's "deprecate, don't delete"
+  convention for retired modules (and because destructive file operations
+  need explicit user action). Its type import was updated to `import type
+  { ScientificConclusion as MultiSourceRecommendedUse } from
+  '../services/api'` purely so the orphaned file still satisfies `tsc
+  --noEmit` (which type-checks every file in the project regardless of
+  whether it's actually imported) — nothing else in that file changed.
+
+**2. Direct Injection Safety Net — guaranteed online-resource
+inclusion.** Even with Phase 23's explicit prompt instructions, Gemini
+was still empirically observed to omit some `VerifiedResource.
+extracted_conclusions` entries from its synthesized `scientific_conclusions`
+during merging. Rather than relying on prompt compliance alone, `
+synthesize_ingredient_summary` now runs a Python-only enforcement pass
+after Gemini's response is parsed and scored:
+
+- A new prompt instruction (#6) explicitly tells Gemini to map every
+  SOURCE 1 (resource) claim into a synthesized entry — merged into a
+  broader claim or preserved standalone — and not to silently drop a
+  narrow-but-specific one (e.g. an RDA figure or safety warning). This is
+  best-effort/complementary, **not** the actual guarantee.
+- The real guarantee is server-side: for every `VerifiedResource.
+  extracted_conclusions` string, a lightweight, stdlib-only (`re` module,
+  no NLP dependency) matcher — `_is_conclusion_represented` — checks
+  whether it's already represented in Gemini's synthesized claims, via
+  normalized substring matching (either direction) falling back to
+  significant-word (>=4 chars) overlap >=60%. Any resource conclusion
+  that fails this check is force-appended to `scientific_conclusions` as
+  its own standalone claim.
+- Injected claims are **never hardcoded** with a fixed grade/score —
+  they're run through the exact same `_clamp`/`_score_to_grade`
+  derivation as Gemini-scored claims, using fixed default category scores
+  (`paper_evidence_quality=0`, `official_authority_backing=20`,
+  `multi_source_consensus=12`, `claim_specificity=14`, each still
+  defensively clamped against the rubric's actual bounds) reflecting "no
+  paper evidence, high official-source weight, moderate consensus/
+  specificity." `grade_justification` reads "Direct regulatory
+  conclusion extracted from official source: {publisher or title}."
+  `sources_summary` is always exactly that one source. `supporting_
+  resource_count=1`, `supporting_study_count=0`.
+- The frontend needs no special-casing for injected entries —
+  `ScientificConclusionsList.tsx` renders every `ScientificConclusion`
+  through the identical row/modal code regardless of origin; the only
+  visible trace is the injected claim's distinctive
+  `grade_justification` text and single-entry `sources_summary`.
+
+**Verification.** `python3 -m py_compile` on every touched backend file
+(`models/supplement.py`, `db.py`, `schemas/research.py`, `services/
+search.py`, `services/conclusion_grader.py`, `services/
+paper_analysis_pipeline.py`) passes cleanly. `npx tsc --noEmit` passes
+cleanly on the frontend (`services/api.ts`, `components/
+ScientificConclusionsList.tsx` [new], `components/MultiSourceUsesList.tsx`
+[deprecated, kept type-correct], `components/IngredientCard.tsx`).
+
+## Fault-Tolerant Resource Fetching (Phase 25)
+
+`app/services/resource_fetcher.py` was hardened against unreliable NIH/
+gov endpoints (PubChem, MedlinePlus, DailyMed, USDA, Europe PMC, Health
+Canada), fixing four recurring failure modes:
+
+- **Header rejection.** A shared `DEFAULT_HEADERS` dict (User-Agent/
+  Accept/Accept-Language) is now sent on every request via the shared
+  `httpx.AsyncClient(headers=DEFAULT_HEADERS)`.
+- **Name ambiguity.** New `resolve_ingredient_search_terms(ingredient_name)`
+  returns an ordered list of search-term variants (chemical synonyms via
+  `_SYNONYM_MAP`, merged with the legacy `_CHEMICAL_NAME_FALLBACKS`).
+  `_safe_query_async` loops over up to `_MAX_SEARCH_TERM_ATTEMPTS = 3` of
+  these per provider, logging SUCCESS/FALLBACK_USED/FAILED per attempt.
+- **Unexpected payload formats.** Each provider's query function was
+  hardened individually — `_query_pubchem` (CID fallback chain),
+  `_query_medlineplus` (Connect JSON primary, wsearch XML fallback),
+  `_query_usda` (smaller `pageSize=5`, 403 logged via `on_status`),
+  `_query_dailymed` (capped to top 3 active matches).
+- **Hanging requests.** A new shared `fetch_with_resilience(client, url,
+  ...)` wraps every provider's HTTP call with `asyncio.wait_for` timeouts,
+  exponential-backoff retries on `_RETRYABLE_STATUS_CODES = (500, 502,
+  503, 504)`, and a `parse_mode` switch (`"json"`/`"raw"`) so non-JSON
+  callers (Phase 27, below) can reuse it too.
+
+All six providers still fan out concurrently via `asyncio.gather(...,
+return_exceptions=True)` — unchanged from Phase 10. Verified with
+`python3 -m py_compile app/services/resource_fetcher.py`.
+
+## Resource Conclusion Context & Zero-Value Filtering (Phase 26)
+
+`app/services/resource_parser.py`'s deterministic per-provider parsers
+(Phase 21/22) had two quality issues, both fixed without touching the
+zero-LLM, deterministic design:
+
+- **Missing subject/product context.** Every parser now prefixes its
+  conclusions with the specific product/compound/food they came from —
+  e.g. `PubChem Compound ('{compound_label}'): {description}`, `USDA Food
+  Reference ('{food_title}'): ...`, `Health Canada LNHPD ('{product_label}'):
+  ...`. A new `_parse_dailymed` function was added (DailyMed had
+  previously been routed through the generic free-text fallback) that
+  prefixes with the product label and deliberately does **not** fabricate
+  an "Indicated for..." claim from a bare SPL-on-file record.
+- **Zero-value/useless statements.** A new `_is_positive_number(value)`
+  helper rejects `None`/non-numeric/`<= 0` values; every parser that
+  previously emitted a conclusion built from a numeric `value`/`amount`/
+  `percentDailyValue` now gates that field through this helper first, so
+  a dose/percentage of 0 (or missing) no longer produces a contentless
+  line.
+
+`_STRUCTURED_PARSERS` now includes `"dailymed_api": _parse_dailymed`;
+`_FREE_TEXT_PROVIDERS` was narrowed to `("medlineplus_api",
+"europe_pmc")` accordingly. Verified with `python3 -m py_compile` plus a
+live smoke test (this module has no external dependencies) confirming
+zero-value filtering, product-context prefixing, and DailyMed's
+non-fabrication all behave correctly.
+
+## HTML Scraping + Gemini Extraction Fallback (Phase 27)
+
+A third, later-resort layer was added on top of Phase 21's deterministic
+parser and Phase 25's resilient fetching: when a `VerifiedResource`'s
+`extracted_conclusions` still comes back completely empty (the source
+API returned little more than a title/URL, no summary text), a new
+service fetches and scrapes that resource's own live webpage and asks
+Gemini to extract conclusions directly from the page content.
+
+**`app/services/html_resource_extractor.py` (new module).**
+
+- `async def fetch_and_clean_html(url, max_chars=8000) -> Optional[str]`
+  — genuinely async (real I/O). Reuses Phase 25's
+  `resource_fetcher.fetch_with_resilience(..., parse_mode="raw")` and
+  `DEFAULT_HEADERS` rather than a second bespoke retry implementation.
+  Parses the raw HTML with BeautifulSoup, strips junk tags
+  (`script`/`style`/`nav`/`footer`/`header`/`aside`/`form`/`svg`),
+  collapses whitespace, and caps the result at `max_chars`. Returns
+  `None` on any failure or if `beautifulsoup4` isn't installed (guarded
+  `try/except ImportError`, `_BS4_AVAILABLE` flag — the app never crashes
+  at startup if the dependency is missing, it just skips this fallback).
+- `def extract_conclusions_from_webpage(url, publisher, ingredient_name)
+  -> List[str]` — **deliberately synchronous**, not `async def`,
+  matching this codebase's strict "every Gemini call site is a plain sync
+  function, called from a `run_in_threadpool` worker thread" convention
+  (see `gemini_rate_limit.py`). Internally bridges to the async fetch via
+  `asyncio.run(fetch_and_clean_html(url))` — safe because this function
+  is only ever called from `paper_analysis_pipeline.py`, itself always
+  running off the event loop. Skips extraction (returns `[]`) if the
+  cleaned text is under `_MIN_CLEANED_TEXT_LENGTH_FOR_EXTRACTION = 200`
+  chars. The Gemini call is paced/retried through `gemini_rate_limit.py`
+  exactly like every other Gemini call site in this app. Every returned
+  conclusion is passed through `_ensure_publisher_prefix()`, which
+  case-insensitively prepends `"{publisher}: "` if Gemini's response
+  didn't already include it — server-side enforcement rather than relying
+  on prompt compliance, same philosophy as Phase 24's Direct Injection
+  Safety Net. Capped at `_MAX_WEBPAGE_CONCLUSIONS = 6`, deduplicated.
+  Never raises — any fetch/parse/Gemini failure is logged and degrades to
+  `[]`, consistent with this pipeline's best-effort philosophy.
+
+**Integration — `app/services/paper_analysis_pipeline.py`.** A new step
+runs inside `analyze_ingredient_papers()`, after the per-paper grading
+loop (so papers keep first claim on the run's Gemini quota) but before
+Stage 2 synthesis (so Stage 2, and the Phase 24 Direct Injection Safety
+Net inside it, both see the recovered data):
+
+- Filters `resources_available` (already queried earlier in the
+  function) down to those with an empty `extracted_conclusions`, capped
+  at a new `MAX_HTML_FALLBACK_RESOURCES_PER_RUN = 3` constant — same
+  rate-limit-pressure reasoning as the existing
+  `MAX_PAPERS_PER_GRADED_INGREDIENT`. Resources are attempted in query
+  order (no ranking); an ingredient with more than 3 such resources in
+  one run picks up the rest on a future grade request.
+- For each, calls `extract_conclusions_from_webpage(resource.url,
+  resource.publisher, ingredient_name)` inside its own try/except (log
+  and continue on failure, never abort the loop). On success, writes the
+  recovered list onto `resource.extracted_conclusions` and clears
+  `resource.extraction_failure_reason` back to `None`.
+  `session.commit()`s once after the loop (rollback + log on failure,
+  same "log, don't fail the grade request" pattern used throughout this
+  module).
+- New `PipelineResult` fields `resources_html_fallback_attempted` and
+  `resources_html_fallback_enriched` report how many resources were
+  tried vs. how many actually recovered at least one conclusion.
+- A resource still stuck at zero conclusions after this step falls back
+  to Stage 2's pre-existing raw-`summary`-text fallback, unchanged from
+  before this phase.
+
+**Dependency.** `beautifulsoup4>=4.12,<5.0` was added to
+`backend/requirements.txt`. Since package installation is never run
+automatically, install it manually:
+
+```bash
+pip install -r backend/requirements.txt
+```
+
+**Verification.** `python3 -m py_compile` on
+`app/services/html_resource_extractor.py` and
+`app/services/paper_analysis_pipeline.py` passes cleanly, plus a sanity
+grep confirming the new import, constant, `PipelineResult` fields, and
+fallback loop are all correctly wired.
+
+## Universal Conclusion Sanitizer & Metadata-Leak Fixes (Phase 28)
+
+Two remaining quality problems in `app/services/resource_parser.py`'s
+deterministic extraction (Phase 21/22/26) let raw API artifacts through
+as if they were genuine ingredient "conclusions":
+
+- **Raw JSON metadata leaking through Europe PMC.** `europe_pmc` was
+  previously routed through `_parse_free_text_fallback`, which
+  `str()`-ed the *entire* raw payload — envelope included
+  (`hitCount`/`nextCursorMark`/`version`) — before sentence-splitting
+  it, so that stringified-dict text could itself get kept as a
+  "sentence." Fixed with a new dedicated `_parse_europe_pmc` parser that
+  drills explicitly into `resultList.result[]` and reads each result's
+  own `abstractText`/`title` (HTML-stripped, prefixed with that result's
+  own title for context) — the envelope's pagination/versioning keys are
+  never touched. `europe_pmc` moved from `_FREE_TEXT_PROVIDERS` into
+  `_STRUCTURED_PARSERS`; only `medlineplus_api` still uses the
+  sentence-splitting fallback.
+- **DailyMed boilerplate.** `_parse_dailymed` (Phase 26) emitted a
+  factual-but-contentless "Structured Product Label on file with the
+  U.S. National Library of Medicine" line for every entry. That line is
+  now gone entirely — an entry is only turned into a conclusion when the
+  payload actually contains genuine indication/usage text (checked via a
+  best-guess set of field names); the current searchable `/spls.json`
+  endpoint never populates one, so this parser now commonly returns `[]`
+  for it, an honest empty result rather than padded boilerplate.
+
+**New universal safety net.** `is_valid_human_conclusion(text)` (public)
+rejects any string under 25 characters, anything starting with `{`/`[`
+(a stringified JSON object/array), and anything matching
+`BOILERPLATE_PATTERNS` — API pagination/metadata keys (`hitCount`,
+`nextPageUrl`, `nextCursorMark`, a `version':`-style key), DailyMed's
+retired boilerplate phrase, `SPL Image`/`Set ID:` labels, an
+`application/json` content-type string, or a bare URL.
+`parse_resource_conclusions()` now runs every provider's output — every
+structured parser and the remaining free-text fallback alike — through
+this filter as a final pass before returning, regardless of which parser
+produced it. If a provider's raw output is entirely filtered out this
+way (vs. producing zero candidates in the first place), the returned
+`failure_reason` is the more specific "No readable scientific statements
+found; provider returned metadata or generic label filings."
+
+**Verification.** `python3 -m py_compile app/services/resource_parser.py`
+passes cleanly. A live smoke test (this module has no external
+dependencies) confirmed: Europe PMC's envelope metadata never leaks into
+a conclusion even when abstract text is present; DailyMed with only
+label metadata returns `[]` while DailyMed with genuine indication text
+still surfaces it; `is_valid_human_conclusion` correctly rejects
+stringified dicts, short strings, bare URLs, and the retired DailyMed
+boilerplate phrase while accepting genuine prefixed conclusions; Phase
+26's USDA zero-value filtering and PubChem parsing are unaffected; and
+malformed/non-dict payloads degrade to an honest empty result without
+crashing.
+
+## Removal of the Legacy "Recommended Uses List" Panel (Phase 29)
+
+Investigation found that "Recommended Uses List" and "Scientific
+Conclusions List" were two genuinely different backend features that
+happened to render two visually similar list panels stacked directly on
+top of each other in the same "Scientific Information" section —
+`RecommendedUsesList.tsx` rendered per-paper `PaperConclusion` rows
+(Phase 5), while `ScientificConclusionsList.tsx` rendered the
+Ingredient-level, Multi-Source Confidence Rubric-scored
+`scientific_conclusions` array (Phase 11/23, renamed from
+`recommended_uses` in Phase 24). Both effectively said "here's what this
+ingredient may help with," just backed by different data and different
+scoring — genuine user-facing duplication/confusion, even though nothing
+was actually a stale duplicate under the hood.
+
+**Frontend.** `IngredientCard.tsx` no longer imports or renders
+`RecommendedUsesList` — `ScientificConclusionsList` is now the only
+"what is this ingredient good for" panel shown, alongside
+`VerifiedResourcesList` and `StudiesList`. The underlying `conclusions`
+state (`PaperConclusion[]`) is still fetched and kept, for two reasons
+that make it genuinely load-bearing, not dead code: it's still the
+fallback data source for `scientificSummary`'s client-side heuristic
+sentence (used when the backend hasn't produced a `summary_description`
+yet), and — more fundamentally — the backend's
+`synthesize_ingredient_summary` (Stage 2) still consumes those same
+`PaperConclusion` rows as input evidence when synthesizing
+`scientific_conclusions` itself (see below). `RecommendedUsesList.tsx`
+is left in place, deprecated with a doc-comment header (not deleted),
+matching the same "deprecate, don't delete" convention already used for
+`MultiSourceUsesList.tsx` in Phase 24.
+
+**Backend.** Confirmed, not changed: Phase 24 had already fully renamed
+every live `recommended_uses` field/alias in `app/schemas/research.py`,
+`app/services/conclusion_grader.py`, and `app/models/supplement.py` to
+`scientific_conclusions` — every remaining `recommended_uses`/
+`RecommendedUse` string in the backend is a historical docstring/comment
+documenting that Phase 24 rename, not live code. The only actual
+`recommended_uses` artifact still present is the orphaned, unmapped
+SQLite column `Ingredient.recommended_uses` (kept deliberately per this
+codebase's additive-only, never-drop migration convention — see Phase
+24's own notes in `db.py`) — it is not exposed by any endpoint or
+schema, so it isn't a source of the duplication being fixed here.
+`conclusion_grader.py::process_paper_conclusions` (the Phase 5
+per-paper `PaperConclusion` pipeline that feeds the now-removed frontend
+list) was deliberately left untouched: `synthesize_ingredient_summary`
+(Stage 2) queries those same active `PaperConclusion` rows as prompt
+input evidence when producing `scientific_conclusions` — removing that
+pipeline would have degraded the very feature this phase keeps as the
+single source of truth, not just removed dead code.
+
+**Verification.** `npx tsc --noEmit` passes cleanly on the frontend with
+no import of `RecommendedUsesList` anywhere in `src/`. `python3 -m
+py_compile` confirms the (unmodified) backend files this investigation
+touched still compile cleanly.
+
+## General Description Fallback for Keyword/Structured Misses (Phase 30)
+
+The user-facing annotation `"No conclusions extracted because No
+structured nutrient values, RDA limits, or safety keywords were found in
+the official payload..."` was appearing even when an official NIH/
+PubChem/MedlinePlus response contained genuinely useful, on-topic
+biological/scientific prose — the Phase 21 parsers are precise by
+design (a specific JSON field, or a fixed dosage/RDA/safety keyword
+list), so a real description that never happens to use one of those
+keywords or land in that exact field previously produced nothing.
+
+**`app/services/resource_parser.py::extract_general_description_fallback(provider_id,
+raw_data)`** (new, public) is a second, more permissive extraction pass
+— called only when the primary parser (structured or free-text) came
+back with zero conclusions after dedup + the Phase 28 sanitizer, never
+as a replacement for it. Three tiers, stopping at the first that
+produces anything: (1) `pubchem_pug_rest` re-reads the same
+`InformationList.Information[].Description` field with a lower bar (30+
+characters, prefixed `"PubChem Reference: "`); (2) `medlineplus_api`
+reads `feed.entry[].summary._value` (or `title._value`) from the
+Connect JSON shape, HTML-stripped, prefixed `"MedlinePlus Guidance: "`;
+(3) a generic text-splitter, for any provider including unrecognized
+ones — stringifies the whole payload, strips HTML/XML tags and JSON
+punctuation artifacts, sentence-splits, and keeps at most 2 sentences
+that independently clear `is_valid_human_conclusion`. Every returned
+conclusion is filtered through `is_valid_human_conclusion` both inside
+this function and again by its caller.
+
+**Two bugs found and fixed during testing, not present in the original
+task spec.** (1) Tier 3's generic splitter could leave raw `<tag>`
+markup sitting in a "sentence" (from MedlinePlus's XML wsearch fallback
+text, if that string ever reaches this tier) — `is_valid_human_conclusion`
+checks for JSON/boilerplate artifacts, not XML markup, so tier 3 now
+strips HTML/XML tags via the shared `_HTML_TAG_RE` before sentence-
+splitting. (2) Tier 3 stringifying a genuinely metadata-only payload
+(e.g. DailyMed's bare `{"setid": ..., "title": ...}` — exactly the kind
+of contentless record Phase 26/28 deliberately stop `_parse_dailymed`
+from resurfacing) could produce dict-key-value soup like `"data : setid
+: x , title : Foo"` that was long enough and boilerplate-pattern-free
+enough to otherwise pass `is_valid_human_conclusion`. Fixed by adding a
+new pattern to `BOILERPLATE_PATTERNS` that rejects two-or-more
+`word:`-style labels separated by a comma — verified against every
+existing prefixed-conclusion format in this module (all single-colon)
+to confirm zero false positives.
+
+**Integration — `parse_resource_conclusions()`.** After the primary
+parser's output is deduped and sanitized, if the result is empty the
+function calls `extract_general_description_fallback(api_id, raw_data)`,
+dedupes and sanitizes its output the same way, and uses it if non-empty
+— `resource.extracted_conclusions`/`extraction_failure_reason` are set
+from whichever tier ultimately produced something, with no changes
+needed in `resource_fetcher.py` (it already just applies whatever tuple
+this function returns). `_REASON_NO_CONCLUSIONS_FOUND` and
+`_REASON_NO_READABLE_CONCLUSIONS` were both reworded to reflect that the
+general fallback was also attempted before either is returned — a
+resource only gets an `extraction_failure_reason` now if the primary
+parser AND all three fallback tiers found nothing readable.
+
+**Verification.** `python3 -m py_compile app/services/resource_parser.py`
+passes cleanly. A live smoke test confirmed: PubChem/MedlinePlus general
+prose is recovered via tiers 1/2; MedlinePlus's Connect JSON entries
+with no dosage/RDA/safety keywords (previously a hard failure) now
+surface real biological content; XML markup no longer leaks through
+tier 3; DailyMed's metadata-only payload correctly still finds nothing
+(both before and after the dict-soup fix — confirming the fix didn't
+just move the leak elsewhere); every Phase 21/22/26/28 structured-parser
+and boilerplate-rejection behavior (USDA zero-value filtering, Europe
+PMC envelope-metadata exclusion, PubChem/prefixed-conclusion formats)
+is unaffected.
+
+## Grade Breakdown Modal Standardization (Phase 31)
+
+Audited all three currently-rendered grade breakdown modals — StudiesList.tsx's
+Rubric & Comments Modal ("Study Rubric Modal"), VerifiedResourcesList.tsx's
+Rubric & Comments Modal ("Online Resource Grade Modal"), and
+ScientificConclusionsList.tsx's Rubric & Score Breakdown Modal
+("Scientific Conclusion Grade Modal") — against a requested unified
+design pattern (bold orange title + X close; grade badge + "XX / 100"
+score with no "confidence" wording; category headers formatted
+`[Category] ([Score]/[Max] pts)` with an explanation line beneath, dotted
+orange separators between blocks; a single-justification fallback using
+the same header/separator styling when no per-category breakdown
+exists). Note: the task's reference styling (`className="..."`, Tailwind
+utility classes) doesn't apply here — this is a React Native/Expo app
+using `StyleSheet.create`, not a web/Tailwind stack, so the intent was
+translated into this codebase's existing `colors.orange`/`typography`/
+`spacing` token conventions rather than copied literally.
+
+**Finding: two of the three already matched almost exactly.**
+VerifiedResourcesList.tsx's modal needed zero changes — its header/score
+row is the literal reference the task cites, and it already used its
+"AI Reviewer Notes" section (single-justification case, since
+VerifiedResource has no per-category rubric — see resource_grader.py's
+design docstring) with the exact same `modalSection`/dotted-separator
+styling as a category block would use. ScientificConclusionsList.tsx's
+four category headers already used the `[Category] ([Score]/[Max] pts)`
+format (`docs/multi_source_confidence_rubric.json`'s own `/30`, `/25`,
+`/25`, `/20` max_score values, hardcoded to match).
+
+**Two targeted fixes, both confirmed necessary:**
+
+1. **`StudiesList.tsx`** — the four rubric category headers ("Study
+   Design", "Journal Rigor", "Methodology & Sample", "Funding & Bias")
+   showed only the earned score (`"Study Design (36 pts)"`), not the max
+   — now `"Study Design (36/40 pts)"`, using
+   `docs/paper_grading_rubric.json`'s own `max_score` per category
+   (study_type=40, journal_reputation=15, sample_methodology=40,
+   funding_bias=5). The per-category explanation line beneath each
+   header (`rubric_evaluation.study_type`/`.journal_reputation`/
+   `.sample_info`/`.funding_status`) and the dotted orange separators
+   were already correct — only the header text changed.
+2. **`ScientificConclusionsList.tsx`** — the score row read `"{score} /
+   100 confidence"`; the trailing word is now removed, matching the
+   other two modals' exact `"XX / 100"` format. The underlying
+   `confidence_grade`/`total_score` field names on the `ScientificConclusion`
+   type (`services/api.ts`) are unchanged — only the displayed label.
+   Also added a code comment (no behavior change) documenting why this
+   modal's four category blocks show no per-category explanation text:
+   `ScientificConclusionScoreBreakdown` is numbers-only (no free-text
+   field per category the way `rubric_evaluation` has for papers) —
+   Gemini never produces one for this rubric, so nothing was fabricated;
+   the modal's existing single "Grade Justification" section (already
+   styled identically to a category block) satisfies the spec's
+   single-justification fallback pattern at the whole-modal level
+   instead.
+
+**`IngredientCard.tsx` needed no changes.** Confirmed by inspection (and
+consistent with that file's own extensive "pure passthrough, owns no
+modal markup itself" docstring note from Phase 19/20) — it renders
+`StudiesList`/`ScientificConclusionsList`/`VerifiedResourcesList` and
+each of those independently owns its own modal state/JSX; there is no
+modal-related code in `IngredientCard.tsx` itself to standardize.
+
+**Out of scope, deliberately:** `RecommendedUsesList.tsx`'s own rubric
+modal (still has the "confidence" wording and a differently-shaped
+Evidence Strength/Cross-Paper Consensus/Claim Specificity rubric) was
+left untouched — that component was deprecated and un-rendered in Phase
+29 (superseded by `ScientificConclusionsList.tsx`), so its modal is no
+longer visible to any user; editing dead code wasn't warranted.
+
+**Verification.** `npx tsc --noEmit` passes cleanly — no prop interface
+changes were needed for either fix (both are display-string edits within
+existing JSX).
+
+## Paper Grading Rubric v1.6 — Category Rebalance + Validated Low-Bias Funding Rule (Phase 32)
+
+`docs/paper_grading_rubric.json` bumped to v1.6: `study_type` (Study
+Design / Hierarchy) max raised 40 -> 45; `journal_reputation` (Journal /
+Publisher Rigor) max lowered 15 -> 10, keeping its `-5` penalty floor;
+`sample_methodology` and `funding_bias` unchanged at 40 and 5. Category
+maxes still sum to exactly 100 (45+10+40+5). `funding_bias`'s
+description/score_tiers were also updated: a paper whose abstract/
+metadata reports a validated low risk-of-bias assessment from a formal
+metric (AMSTAR 2 for systematic reviews, ROB2 for RCTs) now qualifies
+for this category's full +5, independent of its funding-source signal.
+
+**`backend/app/services/paper_grader.py`.** No arithmetic needed
+changing in `grade_paper()`'s clamping logic itself — `category_bounds`
+is already computed dynamically from the loaded rubric JSON
+(`category.get("max_score")`/`.get("min_score", 0)`), so the new 45/10
+bounds took effect automatically. What did need updating: the two
+`category_bounds.get(..., (fallback_min, fallback_max))` defensive
+fallback tuples (only ever used if a category were missing from the
+rubric entirely) now read `(0, 45)`/`(-5, 10)` instead of the stale
+`(0, 40)`/`(-5, 15)`; `_RubricEvaluationSchema.journal_score`'s and
+`funding_score`'s `Field` descriptions; `_build_prompt()`'s
+`journal_score`/`study_type_score` numeric-range instructions to Gemini
+(`-5 to 15` -> `-5 to 10`, `0 and 40` -> `0 and 45` for study_type); and
+several docstring version-history notes. `_format_rubric_for_prompt()`
+needed no change — it already renders each category's `max_score`/
+`score_tiers` straight from the loaded JSON, so v1.6's new tier text
+(including the funding_bias "OR validated low risk of bias via formal
+metrics" tier) reaches Gemini automatically.
+
+**New funding_bias instruction, `_build_prompt()`.** Added an explicit
+paragraph (same pattern as the existing "undisclosed funding defaults to
++2" and "unidentified publisher scores near-neutral" exceptions):
+whenever the abstract/metadata explicitly reports a validated low
+risk-of-bias assessment (e.g. "AMSTAR 2: low risk of bias", "ROB2: low
+risk"), Gemini is instructed to award the full `+5` for `funding_score`
+regardless of the funding-source signal — the validated assessment
+overrides rather than averages with funding-source-based scoring. This
+is a Gemini-prompt-level rule (there's no separate structured field
+carrying an AMSTAR2/ROB2 verdict for code to branch on deterministically
+— the paper-grading pipeline is Gemini-based, not a deterministic
+parser like `resource_parser.py`), consistent with how every other
+scoring exception in this rubric (funding defaults, journal neutrality)
+is already implemented as explicit natural-language prompt instruction
+rather than post-hoc code.
+
+**Frontend consequence caught and fixed.** `StudiesList.tsx`'s rubric
+modal (just updated in Phase 31 to show `(score/max pts)` per category)
+had hardcoded `/40` and `/15` literals for `study_type`/
+`journal_reputation` — now `/45`/`/10` to match v1.6. `sample_score`'s
+`/40` and `funding_score`'s `/5` were already correct (unchanged
+categories).
+
+**Verification.** A JSON sanity check confirmed the four category
+`max_score` values sum to exactly 100 and `grade_bands` still covers
+0-100 contiguously with no gaps/overlaps (unchanged from v1.5 — this
+phase only touched category weights, not grade bands). `python3 -m
+py_compile app/services/paper_grader.py` passes cleanly. Since
+`google-genai` isn't installed in this environment (consistent with
+every other Gemini-calling service verified this session via
+`py_compile` rather than a live import), a standalone script replicating
+`paper_grader.py`'s own `_clamp`/`category_bounds` logic against the
+real rubric JSON confirmed: bounds resolve to the new v1.6 values;
+an old-style overshoot value (e.g. `journal_score=15`, v1.5's old max)
+gets correctly clamped down to the new `10` ceiling; a full-marks
+scenario (45+10+40+5=100) maps to grade A. `npx tsc --noEmit` passes
+cleanly on the frontend after the `StudiesList.tsx` fix.
+
+## General Information: Description + Daily Dosage (Phase 33)
+
+Adds a "General Information" section to a standalone `IngredientCard`
+with two fields — **Description** and **Daily Dosage (Healthy Adult)** —
+each resolved under a strict, Grade-A/B-only source hierarchy:
+
+1. **Primary priority — verified online resources.** Every
+   `VerifiedResource` for the ingredient graded `A` or `B`, highest grade
+   first, ties broken by `score` descending.
+2. **Secondary priority — peer-reviewed papers.** Only consulted when no
+   Grade A/B resource has the field. Every `ResearchPaper` graded `A` or
+   `B`, same ordering.
+3. **Fallback — unavailable.** Neither collection has it -> the field is
+   marked `is_available=False`, everything else `None`. The frontend
+   renders a fixed notice: "No high-grade (Grade A or B) source available
+   containing this information." Grade C, D, and E sources are **never**
+   accepted for either field, per the task's own hard constraint.
+
+**New model column.** `Ingredient.general_info` (`app/models/supplement.py`)
+— a nullable JSON column storing the full two-field shape:
+
+```python
+{
+  "description": {
+    "text": Optional[str],
+    "source_name": Optional[str],       # e.g. "Health Canada" or "Smith et al. (2023)"
+    "source_type": Optional[str],       # "verified_resource" | "paper"
+    "source_grade": Optional[str],       # "A" | "B" — never C/D/E
+    "is_available": bool
+  },
+  "daily_dosage": { ... same four fields ... }
+}
+```
+
+Migrated additively via a new `("general_info", "JSON")` entry in
+`app/db.py`'s `_INGREDIENT_GRADING_COLUMNS` tuple — same "ADD COLUMN,
+never rename/drop" convention as every other Ingredient column added
+after the table already existed in deployed databases.
+
+**New service, `app/services/general_info_extractor.py`.** Its
+`extract_general_info(session, ingredient_id, ingredient_name)`:
+
+- Queries `VerifiedResource`/`ResearchPaper` with `grade in ("A", "B")`
+  directly in the DB `WHERE` clause — this, not a prompt instruction, is
+  what makes "never accepts Grade C/D/E" true: a lower-graded row is
+  never even placed in front of Gemini.
+- Sorts each collection A-before-B, then by score/grade_score descending,
+  and builds ONE combined, already-priority-ordered candidate list
+  (every verified resource, then every paper) — this ordering is what
+  encodes "resources before papers" into the prompt.
+- Makes exactly ONE Gemini call resolving BOTH fields together (each
+  field can independently pick a different winning candidate, or none).
+  **Deliberate deviation from the task's literal reference sketch**,
+  which describes two separate `resolve_field_fallback()` calls (one per
+  field) walking their own candidate lists one Gemini call at a time.
+  This module instead follows this codebase's established "one small
+  call per ingredient-level step" convention (same reasoning as
+  `conclusion_grader.py`'s Stage 2 synthesis being one call over every
+  paper/resource, not one call per source) — the prompt itself still
+  encodes the fallback hierarchy explicitly (candidates presented in
+  strict priority order, with an instruction to prefer the earliest
+  usable one), so the *outcome* matches the spec's per-field waterfall
+  even though the mechanism is a single call.
+- Gemini returns, per field, only `found: bool` + `source_index: int`
+  (an index into the candidate list it was given) — every
+  `source_name`/`source_type`/`source_grade` in the persisted result is
+  then copied straight from the real `_Candidate` at that index, **never**
+  from anything Gemini generated about the source itself. Same "never
+  trust the model's own bound-following" convention as every other
+  rubric-based grader in this codebase, applied here to source
+  attribution instead of a numeric score.
+- Deliberately synchronous, not `async def` (the task's literal
+  signature) — same reasoning as every other Gemini-calling service in
+  this codebase (see `gemini_rate_limit.py`'s module docstring); wired
+  through `throttle_gemini_call()`/`call_gemini_with_retry()` like every
+  other *new* Gemini call site this session (unlike `conclusion_grader.py`'s
+  pre-existing, still-unwired calls — see that module's own "known gap"
+  note).
+- Never raises — any Gemini/parse failure degrades to a fully
+  "unavailable" result for both fields, logged but not propagated.
+- Always returns a full result (never `None`) — even zero Grade A/B
+  candidates produces an honest "unavailable" result rather than skipping
+  persistence entirely, so the frontend always has something concrete to
+  render. Zero candidates also skips the Gemini call outright (nothing to
+  extract from).
+
+**Field-name correction from the task's literal spec.** The task's
+reference pseudocode filters via `getattr(r, 'confidence_grade', None)`
+for both resources and papers — but neither `VerifiedResource` nor
+`ResearchPaper` has a `confidence_grade` attribute (that field only
+exists on the unrelated `PaperConclusion`/`ScientificConclusion` models).
+Both expose their letter grade as plain `.grade` — `general_info_extractor.py`
+filters on that real field name instead.
+
+**Pipeline integration.** `paper_analysis_pipeline.py::analyze_ingredient_papers`
+calls `extract_general_info` LAST — after paper grading, the Phase 27
+HTML fallback, Stage 2 synthesis, AND Phase 22 resource alignment have
+all finished — so it sees the freshest possible Grade A/B state, then
+persists the result onto `Ingredient.general_info` in its own commit,
+separate from the Stage 2 `summary_description`/`scientific_conclusions`
+commit (a General Information failure shouldn't roll back an already-
+successful Stage 2 synthesis, or vice versa). A new
+`PipelineResult.general_info_generated: bool` field tracks whether the
+commit succeeded, mirroring `ingredient_summary_generated`.
+
+**Also corrected: the task's literal file-location spec.** The task's
+"Database & Schema Updates" section names `backend/app/models/research.py`
+for the Ingredient model change, but `Ingredient` itself has always lived
+in `app/models/supplement.py` (`research.py` holds `ResearchPaper`/
+`VerifiedResource`/`PaperConclusion`) — the column was added there
+instead, consistent with every other Ingredient-level column added this
+session.
+
+**API/schema exposure.** `GeneralInfoFieldResponse`/`GeneralInfoResponse`
+(`app/schemas/research.py`) mirror the persisted shape field-for-field;
+`IngredientDetailResponse.general_info: Optional[GeneralInfoResponse]`
+added (None until a grade request has run this extraction at least
+once); `app/services/search.py::get_ingredient_detail` passes
+`ingredient.general_info` straight through (a plain dict Pydantic
+validates on the way out, same convention as `scientific_conclusions`).
+Not yet added to `GradeIngredientResponse` — same "frontend re-fetches
+ingredient detail" convention as every other Stage-2-adjacent field.
+
+**Frontend.** `GeneralInfoField`/`GeneralInfo` types added to
+`src/services/api.ts`, plus `IngredientDetailResponse.general_info`.
+`IngredientCard.tsx`: new `generalInfo`/`generalInfoLoading`/
+`generalInfoError` state (same lazy-fetch-on-first-expand convention as
+`scientificConclusions`/`verifiedResources`), populated by the same
+`fetchIngredientDetail` call as every other Scientific Information field
+and refreshed after a grade request the same way. The old static
+`GENERAL_INFORMATION_PLACEHOLDER` text inside the "General Information"
+`StandaloneInfoSection` was replaced with two `GeneralInfoCard` rows
+("Description", "Daily Dosage (Healthy Adult)") — each renders the
+resolved `text`, or the fixed unavailable notice when `is_available` is
+`false`, or a "not generated yet" message when the field hasn't loaded at
+all; a resolved field additionally shows a `[Grade X - Source Name]`
+badge beneath its body text.
+
+**Verification.** `python3 -m py_compile` across every backend `.py` file
+passes cleanly (`general_info_extractor.py` cannot be live-imported in
+this sandbox — `google-genai` isn't installed here, same known
+environment limitation noted in every prior phase's Gemini-calling
+module). `npx tsc --noEmit` passes cleanly on the frontend.
+
+## Ungraded Card Lock + Ingredient List Filtering (Phase 34)
+
+Two independent frontend-only changes, both scoped to standalone
+ingredient results on `ResultsScreen`.
+
+**1. Ungraded card lock (`IngredientCard.tsx`).** A standalone
+ingredient card can no longer be expanded until it's been graded — an
+ungraded card has no papers/resources/conclusions/general info to show
+yet, so expanding into it before that point only ever revealed an
+empty/placeholder-only body. `isLocked = variant === 'standalone' &&
+!isGraded` gates the header row's `Pressable` via its `disabled` prop
+(`isGraded` is the component's existing local state, already kept in
+sync with a real grade request completing — not the `ingredient.is_graded`
+prop directly, which is only ever its initial seed value). Nested-variant
+cards (ingredients rendered inside a `ProductCard`) are never locked —
+grading has no meaning there today.
+
+Visual cues, both applied to a locked card:
+- The trailing chevron is swapped for a lock icon (`Ionicons
+  name="lock-closed"`).
+- A small inline label — "Grade ingredient to unlock scientific
+  analysis" — renders beneath the ingredient name, in a new
+  `standaloneNameColumn` wrapper (the name and this label now stack
+  vertically; `flex: 1` moved from `standaloneName` onto this new wrapper
+  so the pair together still claims the header row's remaining space).
+
+**Deliberately NOT hover-gated**, unlike the task's literal "show a lock
+icon... when hovering" wording — touch devices have no hover state at
+all, so gating the lock affordance's visibility on it would make it
+undiscoverable on mobile. Both cues are always visible on a locked card;
+`onHoverIn`/`onHoverOut` (safe to wire unconditionally — react-native-web
+fires them for pointer devices, native touch simply never triggers them)
+only add a small brightness bump to the inline label for mouse users, as
+a progressive enhancement on top of the always-visible base affordance.
+
+The **"Assign Grade" button remains tappable on a locked card** with no
+extra plumbing needed — `GradeBadge` was already a `Pressable` nested
+inside the header row's own `Pressable` before this phase, and React
+Native's touch-responder system resolves a tap to the innermost
+interactive element under it regardless of the outer `Pressable`'s
+`disabled` state, so `disabled={isLocked}` on the header row never
+prevents `GradeBadge`'s own `onPress` from firing.
+
+**2. Ingredient list filtering.** The task named
+`src/components/IngredientList.tsx` as a possible integration point —
+no such file exists in this codebase; the actual list owner is
+`ResultsScreen.tsx` (a single `FlatList` rendering both `ProductCard` and
+standalone `IngredientCard` rows), which already had a static,
+non-functional `Ionicons name="filter"` placeholder icon in its header
+(see that icon's own "Visual placeholder only" comment, now removed).
+This phase wires a real, functional filter there instead of inventing a
+new `IngredientList.tsx` the rest of the app doesn't otherwise have.
+
+New files:
+- **`src/utils/ingredientFilters.ts`** — `FilterType` (`'ALL' | 'GRADED'
+  | 'UNGRADED' | 'VITAMINS' | 'ENZYMES' | 'COLLAGEN' | 'OTHER'`),
+  `matchesFilter(ingredient, filter)`, `FILTER_LABELS`, and
+  `FILTER_GROUPS` (the popover's grouped, ordered option list: `ALL`
+  alone, then Status, then Category, per spec). Category classification
+  is client-side keyword matching on `ingredient.name` (the task's own
+  spec'd fallback — this codebase's `Ingredient` model genuinely has no
+  category/tag column to read instead). **One correction from the task's
+  literal reference implementation:** its `matchesFilter` also checks
+  `ingredient.overall_grade` for the `GRADED`/`UNGRADED` cases — no such
+  field exists anywhere in this codebase (not on the backend `Ingredient`
+  model, not on the frontend `Ingredient` interface); only `is_graded`
+  does, so the `overall_grade` check was dropped rather than referencing
+  a field that would always be `undefined`.
+- **`src/components/IngredientFilter.tsx`** — the filter button +
+  popover. Implemented as a `Modal` (transparent, fade, dismiss-on-
+  backdrop-tap) rather than a true anchored/measured dropdown, matching
+  this codebase's existing info/rubric modal pattern
+  (`StudiesList.tsx`/`VerifiedResourcesList.tsx`/
+  `ScientificConclusionsList.tsx`) rather than hand-rolling a
+  `measure()`-based anchor position React Native has no built-in
+  primitive for. Shows an active-filter badge on the trigger button
+  itself (e.g. "Filter: Vitamins (10)") whenever the selected filter
+  isn't `'ALL'`. **Styled from `theme.ts`'s existing palette, not the
+  task's literal Tailwind classes** (`bg-amber-50`/`border-orange-300`/
+  `text-orange-900`) — this is a React Native/Expo app with no Tailwind
+  compiler (same deviation this session has made for every
+  Tailwind-flavored UI spec, e.g. Phase 31's grade-modal
+  standardization). Mapped onto the closest existing tokens instead of
+  introducing new hex values: `bg-amber-50` -> `colors.offWhite`,
+  `border-orange-300` -> `colors.orange`, `text-orange-900` ->
+  `colors.brown`.
+
+**`ResultsScreen.tsx` integration.** New `ingredientFilter` state
+(`FilterType`, default `'ALL'`) replaces the old static filter icon with
+`<IngredientFilter activeFilter={ingredientFilter}
+onChange={setIngredientFilter} activeCount={activeFilterCount} />`. A
+`filteredResults` `useMemo` narrows the `FlatList`'s `data` (previously
+plain `results`): `'ALL'` returns every row unchanged (products
+included, exactly as before this feature existed); any other filter
+value narrows down to ingredient-type rows matching
+`matchesFilter(toIngredient(item), ingredientFilter)` only, dropping
+product rows entirely. This is a deliberate scope decision, documented
+inline: `matchesFilter`'s status/category logic has no meaning for a
+product row, so leaving products visible unfiltered alongside a filtered
+ingredient subset would mix "filtered" and "unfiltered" rows in the same
+list with no visual distinction. `activeFilterCount` (the badge's count)
+is `filteredResults.length`, `undefined` while still loading so the badge
+shows a bare label rather than a misleading "(0)" before the first fetch
+resolves. The empty-state message also now distinguishes "No results
+found." (`'ALL'`) from "No ingredients match this filter." (any other
+filter).
+
+**Verification.** `npx tsc --noEmit` passes cleanly on the frontend — no
+backend changes this phase.
+
+## Grade Button Three-State Redesign + `is_graded` Persistence Audit (Phase 35)
+
+Two parts: a Grade button visual/text redesign (three explicit states),
+and an end-to-end audit of `is_graded` state — both scoped to the
+**standalone** `IngredientCard` variant.
+
+**1. Grade button states (`GradeBadge.tsx`, used by `IngredientCard.tsx`).**
+`GradeBadge` is shared with `ProductCard` (whose own "grading" is still a
+local-only placeholder flip, out of scope here) — rather than change its
+default look for both consumers, this phase adds a set of new, optional
+props, all defaulting to `ProductCard`'s exact original behavior, that
+`IngredientCard.tsx` now opts into:
+
+- `prominent` (new) — switches the pill from the original compact
+  `darkGreen`, full-radius design to the spec'd one: `border-2
+  border-orange-500` -> `borderWidth: 2, borderColor: colors.orange`;
+  `px-4 py-2` -> `paddingHorizontal: spacing.md, paddingVertical:
+  spacing.sm`; `rounded-md` -> `borderRadius: 6` (replacing the original
+  full-pill radius); `font-semibold text-orange-900` -> `fontWeight:
+  '600', color: colors.brown`; `hover:bg-orange-100` -> a web-only
+  `onHoverIn`/`onHoverOut`-driven background tint (same "hover is a
+  harmless no-op on native touch" pattern Phase 34's locked-card label
+  already established). Mapped onto `theme.ts`'s existing palette rather
+  than introducing new hex values or a Tailwind compiler this Expo app
+  doesn't have — same deviation applied to every Tailwind-flavored spec
+  this session. **No CSS `transition-all` equivalent** — RN's
+  `StyleSheet` has no property-transition concept; the hover tint snaps
+  instantly rather than fading, a documented simplification rather than
+  reaching for `Animated`/`react-native-reanimated` over a purely
+  cosmetic hover effect.
+- **State A — ungraded, idle**: `idleLabel` (IngredientCard passes
+  `"Grade Ingredient"`, replacing the shared default `"Assign Grade"`
+  ProductCard still uses).
+- **State B — grading in progress**: `loadingLabel` (IngredientCard
+  passes `"Grading..."`, rendered next to the existing `ActivityIndicator`
+  spinner instead of the spinner alone) — click events already disabled
+  via the pill's existing `disabled={isLoading}`, unchanged.
+- **State C — already graded**: `regradeLabel` (IngredientCard passes
+  `"Grade Again"`). Previously an already-graded badge was a static,
+  non-interactive `View` showing the raw debug grade text (e.g. "14 / 14
+  / 14") — permanently inert once set. Providing `regradeLabel` now makes
+  it a `Pressable` again, reading `regradeLabel` (plus a small "refresh"
+  glyph) instead of the raw grade text, calling `onRequestGrade` — which
+  is `IngredientCard`'s existing `handleGradeRequest`, already safe to
+  call more than once (see the audit below) — so re-grading Just Works
+  with no new plumbing. `ProductCard` never passes `regradeLabel`, so its
+  graded pill stays exactly as static/non-interactive as before.
+
+**2. `is_graded` persistence audit — no code changes needed; both layers
+were already correct.**
+
+- **Backend.** The task named `paper_analysis_pipeline.py`/
+  `models/research.py` as the files to check — neither actually owns
+  this: `Ingredient.is_graded` lives on `Ingredient`
+  (`app/models/supplement.py`, not `research.py`), and it's set by
+  `app/services/grading.py::grade_ingredient` (not
+  `paper_analysis_pipeline.py`, which only handles the paper/resource
+  grading sub-steps `grade_ingredient` calls into). Traced the full path:
+  `grade_ingredient` sets `ingredient.is_graded = True` and
+  `ingredient.grade_badge_text = ...` (lines ~148-149), `session.add`s
+  and `session.commit()`s, then `session.refresh(ingredient)` so the
+  in-memory object matches exactly what SQLite now holds — before
+  returning. The route (`POST /api/v1/ingredients/{id}/grade`,
+  `app/api/routes.py`) reads `ingredient.is_graded` off that same,
+  now-refreshed ORM object when building `GradeIngredientResponse` — so
+  the API response's `is_graded` is guaranteed to reflect the committed
+  DB state, never a stale pre-commit value. Confirmed correct, no change
+  needed.
+- **Frontend.** `IngredientCard.tsx`'s `handleGradeRequest` already calls
+  `setIsGraded(response.is_graded)` synchronously inside the
+  `gradeIngredient()` promise's `.then()` — a plain React state update,
+  which triggers an immediate re-render. Since `isLocked` (Phase 34) is
+  computed as `variant === 'standalone' && !isGraded` on every render
+  (not cached/memoized against a stale value), the accordion unlocks the
+  instant this state flips — no manual page refresh, no React Query/
+  global store needed for this to propagate (this app has neither; local
+  `useState` on the card itself is the only state layer, and it's
+  already sufficient here). `handleGradeRequest`'s only guard is
+  `isRequestingGrade` (blocks a second concurrent request while one is
+  in flight) — it is NOT gated on the ingredient's current `isGraded`
+  value, so tapping "Grade Again" on an already-graded card re-runs the
+  exact same request/state-update path with no special-casing required.
+  Confirmed correct, no change needed.
+
+**Also confirmed:** the task named `IngredientList.tsx` again (per Phase
+34's same finding — this file doesn't exist anywhere in this codebase;
+`ResultsScreen.tsx` is the real list owner, but this phase touched no
+list-level code at all, only `GradeBadge.tsx`/`IngredientCard.tsx`).
+
+**Verification.** `npx tsc --noEmit` passes cleanly on the frontend — no
+backend changes this phase (the backend half of this task was a
+verification-only audit, not a fix).
+
+## Grade Button Unresponsive Bug — Root Cause + Fix (Phase 36)
+
+A real regression, introduced by Phase 34's own accordion-lock feature —
+found by code audit (not live-tested; no running Expo/browser instance in
+this environment), reasoned from known React Native / React Native Web
+platform semantics rather than guessed at from the task's suggested
+fixes.
+
+**Root cause.** Phase 34 gated the standalone `IngredientCard` header's
+accordion toggle via `disabled={isLocked}` on its outer `Pressable`,
+where `isLocked = variant === 'standalone' && !isGraded`. On native iOS/
+Android this is harmless — RN's touch-responder system resolves a tap to
+whichever `Pressable` is deepest under the finger regardless of an
+ancestor's `disabled` state, so the nested `GradeBadge` `Pressable`
+(rendered inside that same header row) still claims its own taps
+independently. **React Native Web does not replicate that isolation the
+same way**: RNW's `Pressable` applies real CSS `pointer-events: none`-
+equivalent behavior to a `disabled` element, and CSS `pointer-events:
+none` on an ancestor cascades to its entire DOM subtree by default —
+silently swallowing clicks on `GradeBadge` too, specifically while
+`isLocked` is `true`. `isLocked` is only ever `true` for an **ungraded**
+ingredient — exactly the state a user is in when tapping "Grade
+Ingredient" for the very first time, which is exactly the button the bug
+report named specifically (not "Grade Again", the already-graded/
+re-grade case, which was never affected since `isLocked` is always
+`false` once graded). This matches the reported symptom precisely: the
+button appeared completely unresponsive on web, while presumably still
+having worked in earlier manual/native testing before Phase 34 shipped
+the lock.
+
+**Fix — two layers, both in `IngredientCard.tsx`/`GradeBadge.tsx`:**
+
+1. **`IngredientCard.tsx`** — removed `disabled={isLocked}` from the
+   header row `Pressable` entirely; replaced with `onPress={isLocked ?
+   undefined : onToggle}`. A `Pressable` with `onPress={undefined}`
+   genuinely does nothing when tapped, without touching `pointer-events`
+   (or any other property that could cascade to children) at all — same
+   "locked = tapping the header does nothing" behavior as before, just
+   implemented in a way that can never block a nested child's own tap
+   handling, on any platform. `accessibilityState={{ ..., disabled:
+   isLocked }}` is kept (pure a11y metadata, no bearing on this issue).
+2. **`GradeBadge.tsx`** — added a `handlePress` wrapper (used by both
+   Pressable branches that call `onRequestGrade`) that calls
+   `event.stopPropagation()` before invoking it. This addresses a
+   *second*, related web-specific risk the task's own diagnostic steps
+   correctly flagged: `GradeBadge` is always nested inside a larger
+   tappable header row, and on web a click on a nested element is a real
+   DOM event that bubbles up through ancestor `onClick` handlers by
+   default (unlike native's responder system, which has no such
+   bubbling) — without stopping it, tapping "Grade Again" on an
+   already-graded (fully enabled, non-`disabled`) card would ALSO fire
+   the header's own `onPress` on the same tap, toggling the accordion at
+   the same time as re-triggering grading. `event.stopPropagation()` is
+   a harmless no-op on native (RN's `GestureResponderEvent` still exposes
+   the method, but native's responder system doesn't use DOM bubbling in
+   the first place), so this is safe unconditionally.
+
+**Network/API layer — re-confirmed correct, no bug found.**
+`src/services/api.ts::gradeIngredient` sends `POST
+${API_BASE_URL}/api/v1/ingredients/${ingredientId}/grade` — traced
+against `app/main.py`'s router mounting
+(`app.include_router(ingredients_router, prefix="/api/v1")`,
+`ingredients_router = APIRouter(prefix="/ingredients")`) and the route's
+own decorator (`@ingredients_router.post("/{ingredient_id}/grade", ...)`
+in `app/api/routes.py`) — method and full path match exactly. No changes
+needed here; this was already correct (and unrelated to the actual bug).
+
+**Error surfacing.** Added `console.error('[Grading Error]:', error)` to
+`handleGradeRequest`'s existing `.catch()` block in `IngredientCard.tsx`,
+ahead of the pre-existing `Alert.alert('Grading failed', message)` —
+logs the full original error/stack trace for debugging, on top of the
+one-line message the Alert already shows the user. `Alert.alert` is kept
+as this app's error-surfacing mechanism (no toast library dependency
+exists in this codebase, and it's already the established convention
+used by every other failure path in this component) rather than
+introducing a one-off toast just for this call site.
+
+**Backend — re-confirmed correct, no changes needed.** Same conclusion as
+Phase 35's audit (unchanged since — no backend edits happened in Phases
+34-36): `grading.py::grade_ingredient` sets `is_graded=True`, commits,
+and refreshes before returning; the route builds its response off that
+now-refreshed object. A genuine pipeline-level failure (e.g. Gemini
+keyword generation failing outright) raises `GradingError`, which the
+route already converts to an HTTP 502 with a `detail` message —
+`gradeIngredient()` (api.ts) already surfaces that `detail` string as the
+thrown `Error`'s `.message`, which now also reaches the console via the
+logging added above, not just the Alert.
+
+**Verification.** `npx tsc --noEmit` passes cleanly on the frontend.
+
+## General Information Redesign: Scientific Claims + Strict Empty-State (Phase 37)
+
+Reworked the standalone `IngredientCard`'s "General Information" section
+(`frontend/src/components/IngredientCard.tsx`) around three requirements:
+drop the old, permanently-unimplemented "Grade Info" placeholder section;
+surface a new Grade A/B-only "Scientific Claims" sub-card sourced from
+data the ingredient already has (`scientific_conclusions`, no new backend
+work needed); and make every sub-card's visibility strictly conditional
+on having real Grade A/B content, collapsing to a single honest
+empty-state message when none of the three fields have anything at all.
+
+**1. "Grade Info" section removed.** The old `<StandaloneInfoSection
+title="Grade Info">` block (a static placeholder string,
+`GRADE_INFO_PLACEHOLDER`, that was never wired to real data since it was
+first stubbed in) was deleted outright, along with the constant itself.
+The header above it was already free of any letter-grade (A/B/C/D/E)
+badge — `GradeBadge` there is a status/action control ("Grade
+Ingredient"/"Grading..."/"Grade Again"), not a grade-value display — so
+no header changes were needed to satisfy "remove grade badges from the
+top-level header."
+
+**2. New "Scientific Claims" sub-card.** Added a `ScientificClaimsCard`
+component, rendered inside the same "General Information"
+`StandaloneInfoSection` as Description/Daily Dosage. It reuses this
+ingredient's already-fetched `scientificConclusions` array (the same data
+`ScientificConclusionsList` renders in the "Scientific Information"
+section below), client-side filtered to `confidence_grade === 'A' ||
+confidence_grade === 'B'` only and sorted with the shared
+`sortByGradeThenScore` helper (`utils/grades.ts`) — no new backend
+endpoint or field was needed since the ingredient's full conclusion list
+(with per-conclusion grades) was already exposed. The card only renders
+when at least one claim survives the filter (`hasHighGradeClaims`);
+each row shows the claim text plus a `Grade {A|B}` pill using the same
+`generalInfoSourceBadge` styling as the Description/Dosage cards' source
+attribution pills, for visual consistency.
+
+**3. Warm cream/tan container styling, applied uniformly.** All three
+sub-cards (Description, Daily Dosage, Scientific Claims) already shared
+one `styles.generalInfoCard` container style, so restyling it once
+applies everywhere automatically. Since this is RN/Expo with no Tailwind
+compiler, the spec's Tailwind example values (`bg-[#ede7d7]` /
+`bg-amber-100/50`, `border-amber-200/60`, `text-amber-900`/
+`text-orange-950`) were mapped onto `theme.ts`'s existing alpha-blended
+token convention rather than introducing new raw hex values:
+`backgroundColor: \`${colors.yellow}26\`` (a warm tan wash, the closest
+existing token to `#ede7d7`/amber-100), `borderColor: \`${colors.orange}55\``,
+`borderRadius: 12`, `padding: spacing.md` — and `colors.brown` (the
+palette's one dark warm brown/orange text token) for both card titles and
+body text, satisfying "warm dark orange/brown heading and body text"
+without inventing a new color.
+
+**4. Strict per-field conditional rendering + single combined
+empty-state.** `GeneralInfoCard` (Description/Daily Dosage) was
+simplified to a single required `field: GeneralInfoField` prop — no more
+`isLoading`/`errorMessage` props — and returns `null` outright if
+`!field.is_available || !field.text`. Three derived booleans
+(`isDescriptionAvailable`, `isDosageAvailable`, `hasHighGradeClaims`) each
+gate their own card's JSX in the parent. If none of the three has
+anything (`!hasAnyGeneralInfoContent`), a single fallback card renders in
+their place with the exact required copy: *"No high-confidence (Grade A
+or B) general information or scientific claims are currently available
+for this ingredient."* — replacing what used to be up to three separate
+per-field loading/error/unavailable messages. While `generalInfo`/
+`scientificConclusions` are still being fetched
+(`isGeneralInfoDataLoading`), a lightweight "Loading general
+information..." line renders instead of prematurely showing the
+empty-state message before the real data has had a chance to arrive.
+
+**Verification.** `npx tsc --noEmit` passes cleanly on the frontend.
+
+## "Ingredients Revert to Ungraded" Bug — Root Cause + Fix (Phase 38)
+
+A bug report described graded ingredients "reverting to ungraded" on
+every backend/web server restart, with diagnostic instructions aimed at
+`DATABASE_URL` config, startup `drop_all()`/seed calls, and pipeline
+commit handling. All of those were audited (`app/db.py`, `app/main.py`,
+`app/services/grading.py`, `app/services/storage.py`,
+`app/models/supplement.py`) and found correct: `DATABASE_URL` is a real
+persistent file (`backend/data/app.db`, confirmed present on disk, not
+`:memory:`), `init_db()`'s lifespan hook only does non-destructive
+`create_all()` plus additive `ALTER TABLE` migrations, no `drop_all()`
+call exists anywhere in the codebase, and
+`grading.py::grade_ingredient` correctly sets `is_graded=True`, commits,
+and refreshes before returning — none of that has ever been the problem.
+
+**Real root cause: a frontend/schema gap, not a persistence bug.**
+`GET /api/v1/supplements/search` (`app/services/search.py::search`,
+backing both the Library screen's "Ingredients" explore card and every
+standalone `IngredientCard` rendered from `ResultsScreen.tsx`) never
+returned an ingredient's grading status at all —
+`SearchResultItem` (`app/schemas/search.py`) had no `is_graded`/
+`grade_badge_text` fields, even though the sibling
+`IngredientDetailResponse` (`GET /api/v1/ingredients/{id}`) always has.
+`ResultsScreen.tsx::toIngredient` compensated by hardcoding
+`is_graded: false` on every mapped result, with a comment ("No real
+grading system on the backend yet") that had gone stale since Phase 2
+actually implemented persisted grading. Since `IngredientCard.tsx` seeds
+its local `isGraded` state from that initial (always-false) prop, and
+`isLocked = variant === 'standalone' && !isGraded` locks the accordion
+shut whenever `isGraded` is false, a truly-graded ingredient reloaded
+from search/browse looked ungraded AND was locked out of expanding —
+so it couldn't even self-correct via the detail-fetch effect that does
+have the real value, since that effect only runs once the card is
+expanded. Reproducible on any fresh reload/browse (not specifically tied
+to a server restart, though a restart is one easy way to trigger a
+reload).
+
+**Fix — four files:**
+
+1. **`app/schemas/search.py`** — added `is_graded: Optional[bool] = None`
+   and `grade_badge_text: Optional[str] = None` to `SearchResultItem`,
+   `None` for `type == "product"` results, same convention as
+   `recommended_daily_dosage`/`scientific_data`/`product_count`.
+2. **`app/services/search.py::search`** — the ingredient-branch
+   `SearchResultItem(...)` construction now passes
+   `is_graded=ingredient.is_graded, grade_badge_text=ingredient.grade_badge_text`
+   straight from the DB row, mirroring what `get_ingredient_detail`
+   already did.
+3. **`frontend/src/services/api.ts`** — added the matching
+   `is_graded?: boolean | null` / `grade_badge_text?: string | null`
+   fields to the `SearchResultItem` interface.
+4. **`frontend/src/screens/ResultsScreen.tsx::toIngredient`** — reads
+   `item.is_graded ?? false` / `item.grade_badge_text ?? undefined`
+   instead of hardcoding `is_graded: false`; the stale "no real grading
+   system" comment was removed and replaced with the actual history.
+
+**Defense-in-depth (not itself the root cause, but a real staleness gap
+found during the audit):** `IngredientCard.tsx`'s `fetchIngredientDetail`
+effect (fires once a standalone card is expanded) updated
+`papers`/`conclusions`/`verifiedResources`/`scientificConclusions`/
+`generalInfo` from the freshly-fetched detail response but never
+`isGraded`/`gradeBadgeText`, even though `IngredientDetailResponse`
+already carries both. Added `setIsGraded(detail.is_graded)` and
+`setGradeBadgeText(detail.grade_badge_text ?? PLACEHOLDER_GRADE_VALUE)`
+to that `.then()` block so an expanded card's grade status is always
+reconciled against the true DB value on every fetch, not just whatever
+it was initially seeded with or last set by its own grade response.
+
+**Verification.** `python3 -m py_compile` passes on both modified backend
+files; `npx tsc --noEmit` passes cleanly on the frontend.
+
+## NIH Resource Extraction Overhaul (Phase 39)
+
+Task scope: "information present in pinned NIH resources is missing from
+the Scientific Conclusions and General Information sections" — overhaul
+extraction for NIH-affiliated resources (PubChem, MedlinePlus, DailyMed —
+see scope note below on "NIH ODS"/"NCCIH") with exhaustive multi-section
+scanning, strict per-topic discrete conclusions, an NIH-specific Gemini
+extraction prompt for the HTML fallback path, an honest grading nudge,
+and verbose `[NIH Extractor]` observability logging.
+
+**Scope note — which "NIH resources" this app actually has.** The task
+named "NIH Office of Dietary Supplements" and "NCCIH" as examples. This
+app has never fetched from either domain (`ods.od.nih.gov`,
+`nccih.nih.gov`) — `docs/verified_resource_apis.json` configures exactly
+three NIH/NLM-affiliated sources: `pubchem_pug_rest` (PubChem),
+`medlineplus_api` (MedlinePlus), `dailymed_api` (DailyMed). This phase's
+work targets those three (the real, integrated sources) rather than
+building new fetch integrations for ODS/NCCIH from scratch, which would
+be new-source-onboarding work outside a "fix extraction for pinned
+resources" task. `resource_fetcher.py::is_nih_domain` is written broadly
+enough (`nih.gov` suffix + `medlineplus.gov`) that adding an ODS/NCCIH
+fetcher later would automatically pick up every NIH-specific behavior
+this phase adds, with no further changes needed.
+
+**1. Shared NIH-domain detection —
+`resource_fetcher.py::is_nih_domain(domain)`.** New `_NIH_DOMAIN_SUFFIXES
+= ("nih.gov", "medlineplus.gov")` + `is_nih_domain()`, alongside the
+existing `_is_verified_domain`. Two other modules need the same check but
+can't import this function directly without creating a circular import
+(`resource_fetcher.py` already imports FROM both `resource_grader.py` and
+`resource_parser.py`) — `resource_grader.py` gets a small local duplicate
+(`_is_nih_domain`, parses the hostname from the `url` string it already
+receives) and `resource_parser.py` uses a static `_NIH_API_IDS =
+("pubchem_pug_rest", "medlineplus_api", "dailymed_api")` tuple instead
+(that module's functions are pure and never receive a `domain`, only
+`api_id`/`raw_data` — and every one of those three api_ids always
+resolves to an NIH/NLM domain by construction).
+
+**2. MedlinePlus promoted to a real structured parser —
+`resource_parser.py::_parse_medlineplus`.** Through Phase 38, MedlinePlus
+was the one remaining provider routed through `_parse_free_text_fallback`
+— which `str()`-ed the ENTIRE raw payload (envelope included) and kept
+only the sentences that happened to contain a `_FALLBACK_KEYWORDS` term,
+collapsing a health topic's dosage detail, mechanism, and several
+distinct findings into whichever one or two sentences passed that
+filter. `_parse_medlineplus` instead reads each entry's own title/summary
+text directly (handles both of `_query_medlineplus`'s real shapes — the
+Connect JSON `dict` primary path and the wsearch XML `str` fallback path)
+and SENTENCE-SPLITS the summary into every individual statement over a
+length floor — one conclusion per sentence, each prefixed `"MedlinePlus
+('{title}'): "` — per the task's "do NOT summarize or merge separate
+health topics into a single sentence; create individual, standalone
+conclusion items" requirement. Mirrors the exact promotion pattern Phase
+26 (DailyMed) and Phase 28 (Europe PMC) already used.
+`_parse_free_text_fallback` itself is kept in the module (not deleted,
+its docstring updated to say so) purely for historical reference, same
+"document the retirement, don't silently delete" convention as
+`resource_extractor.py`'s own Phase 21 deprecation.
+
+**3. `[NIH Extractor]` verbose logging.** `parse_resource_conclusions`
+now accepts an optional `resource_url` (cosmetic only — one source-level
+raw payload commonly yields several `VerifiedResource` rows, so there's
+no single "the" URL to attribute a source-level parse to;
+`resource_fetcher.py`'s call site passes the first/highest-ranked
+record's URL) and logs `"[NIH Extractor] Parsed %d discrete
+conclusion(s) from NIH source: %s"` whenever `api_id in _NIH_API_IDS` and
+extraction succeeded — additive to, not a replacement for, the existing
+generic `FALLBACK_USED`/`SUCCESS` log lines. The same log line (same
+exact format string) also fires from
+`html_resource_extractor.py::extract_conclusions_from_webpage` when its
+`is_nih=True` HTML-fallback path succeeds (see below).
+
+**4. NIH-specific exhaustive extraction prompt for the HTML fallback —
+`html_resource_extractor.py`.** The Phase 27 HTML-scraping-plus-Gemini
+fallback (only reached when the deterministic Phase 21/39 parser above
+already found nothing for a resource) now takes an `is_nih: bool = False`
+keyword, threaded from `paper_analysis_pipeline.py` via
+`is_nih_domain(resource.domain)`. When `True`, it swaps in
+`_build_nih_webpage_prompt` — implementing the task's "Strict NIH
+Extraction & Parsing Guidelines" near-verbatim: explicit, numbered
+scanning instructions for (1) Recommended Intakes/Daily Dosage (exact
+RDA/AI/UL values with units and population context), (2)
+Description/Mechanism, (3) Health Effects & Scientific Conclusions — one
+standalone conclusion item per health topic/outcome, never merged, with
+inline context ("In postmenopausal women...", "At doses above 500mg...")
+— and (4) Safety/Side Effects/Interactions. Also raises the per-resource
+conclusions cap from `_MAX_WEBPAGE_CONCLUSIONS` (6, sized for an unknown/
+possibly-thin source) to `_MAX_WEBPAGE_CONCLUSIONS_NIH` (25) — a genuine
+NIH/NLM fact sheet routinely contains more independent facts than 6.
+Still returns the same flat `conclusions: List[str]` shape
+(`_WebpageConclusionsSchema`) as the generic prompt — see point 5 below
+for why no separate schema/wiring was needed to also improve
+`general_info`.
+
+**5. Why `general_info`/`scientific_conclusions` needed no new wiring.**
+Traced the full downstream path before writing any code:
+`general_info_extractor.py::_build_candidates` already builds each
+VerifiedResource candidate's evidence text from `resource.summary` +
+`resource.extracted_conclusions` joined together, gated on
+`ELIGIBLE_GRADES = ("A", "B")`; `conclusion_grader.py`'s Phase 24 "Direct
+Injection Safety Net" already guarantees every
+`VerifiedResource.extracted_conclusions` string ends up represented
+somewhere in `Ingredient.scientific_conclusions` (merged into a
+Gemini-synthesized claim or force-appended standalone) — domain-agnostic,
+already covering NIH sources with no changes needed. So richer, more
+exhaustive `extracted_conclusions` for NIH sources (points 2 and 4 above)
+automatically flows into BOTH `general_info` and `scientific_conclusions`
+once a resource is graded A/B — confirming the task's own "Persistence
+Verification" requirement ("ensure extracted NIH conclusions are appended
+directly to `ingredient.scientific_conclusions`... and not dropped due to
+deduplication or truncation") was already true before this phase (Phase
+22 removed every artificial cap on the deterministic parser's output;
+the safety net was built Phase 24) — this phase's job was making the
+*input* to that pipeline richer, not building new plumbing.
+
+**6. "Auto-Grade Inheritance" — deliberately NOT a hard bypass.** The
+task asked to "Automatically assign Grade A to all conclusions extracted
+from verified NIH URLs." Implementing that literally would break the one
+guarantee every Grade-A/B-gated consumer in this codebase depends on —
+`general_info_extractor.py`'s own explicit, repeatedly-stated requirement
+("NEVER accept Grade C, D, or E sources for General Information fields")
+only means anything if a grade always reflects real, checked evidence
+quality. A hard "domain == nih.gov -> Grade A" rule would let a broken/
+thin/redirected NIH page (a 404 interstitial, a near-empty stub) inherit
+the same trust as a genuine, comprehensive fact sheet — silently
+degrading the exact fields this phase was trying to improve. Instead,
+`resource_grader.py::_build_prompt` adds an honest, rubric-aligned nudge
+(`_is_nih_domain(url)`, a local duplicate — see point 1) reminding Gemini
+that `docs/resource_grading_rubric.json`'s own `publisher_authority`
+category already names NIH by example as its Tier 1 (30-35/35) case, so
+`publisher_authority` should reflect that UNLESS the page content itself
+gives a concrete reason not to — every other category
+(`evidence_citations`/`comprehensiveness_currency`/`transparency_bias`)
+is still scored strictly from actual page content, same as any other
+resource. In practice a genuine NIH fact sheet should still land at
+Grade A almost every time (satisfying the spirit of the request for the
+resources it's meant to help), while a broken one is still caught rather
+than blindly trusted.
+
+**7. Backend unit tests — `backend/tests/test_nih_extraction.py`
+(new).** No test suite existed in this repo before this phase, and
+`pytest` isn't installed in this environment (and per CLAUDE.md, this
+phase can't `pip install` it automatically) — written against Python's
+stdlib `unittest` instead, which needs nothing beyond the standard
+library. 14 tests cover `resource_parser.py::_parse_medlineplus` (both
+the Connect-JSON and wsearch-XML shapes, discrete-sentence splitting,
+missing-title fallback, single-entry-not-a-list tolerance, malformed/
+empty input), `parse_resource_conclusions`'s NIH dispatch and
+`[NIH Extractor]` log line (via `assertLogs`), and confirmation that the
+Phase 28 `is_valid_human_conclusion` sanitizer still applies to
+MedlinePlus's new structured output. Two further tests target
+`resource_fetcher.py::is_nih_domain` directly but are wrapped in
+`@unittest.skipUnless(importlib.util.find_spec("httpx") is not None,
+...)` since that module transitively requires `httpx`, not installed in
+this sandbox — they skip cleanly with a clear reason rather than
+erroring, and run for real in an environment with the project's
+`requirements.txt` actually installed. Run via (from `backend/`):
+
+    python3 -m unittest discover -s tests -p "test_*.py" -v
+
+All 14 tests pass (2 skipped for the reason above) as of this phase.
+
+**Verification.** `python3 -m py_compile` passes on every modified
+backend file; the new unit test suite passes (12 run, 2 skipped);
+`npx tsc --noEmit` passes cleanly on the frontend (no frontend files
+were touched this phase — the overhaul is entirely extraction-pipeline/
+backend-side, consumed by the already-existing General Information/
+Scientific Claims UI built in Phases 33/37).
+
+## Conclusion Refinement Pass — Noise Removal + Within-Resource Merge (Phase 40)
+
+Task scope: raw extraction (Phase 21/39 deterministic parsing + Phase 27
+HTML fallback) was reported to capture "up to 100+ items" containing
+generic boilerplate ("ask your doctor"), non-scientific fluff ("vitamins
+are important"), off-topic statements, and heavily redundant duplicates
+— add a Gemini-backed post-processing pass to clean this up before it
+becomes part of `Ingredient.scientific_conclusions`.
+
+**Traced the real pipeline before writing any code** — findings that
+shaped every design decision below:
+
+1. There is no pre-existing "flat list of 100+ raw conclusion strings"
+   variable anywhere in this codebase. The closest thing is each
+   `VerifiedResource.extracted_conclusions` column (a `list[str]`,
+   already deduplicated within itself by Phase 21/39's own `dict.
+   fromkeys` pass) — the "100+ items" framing describes the sum across
+   every resource for an ingredient, not one existing Python object.
+2. `Ingredient.scientific_conclusions` (the field the task's spec named
+   as the write target) already has an established, richer shape than
+   the task's proposed `{conclusion_text, grade, source_name, category}`
+   — it's `{claim, confidence_grade, total_score, score_breakdown,
+   supporting_study_count, supporting_resource_count, sources_summary,
+   grade_justification}`, built exclusively by `conclusion_grader.py::
+   synthesize_ingredient_summary`'s own server-side, rubric-based
+   scoring (Phase 23/24's Multi-Source Confidence Rubric — `confidence_
+   grade`/`total_score` are NEVER taken directly from Gemini, same "never
+   trust the model's own bound-following" convention every grader in
+   this codebase follows). Real, already-shipped frontend components
+   read this exact shape: `ScientificConclusionsList.tsx` and
+   `IngredientCard.tsx`'s Scientific Claims card (Phase 37), which
+   specifically filters on `confidence_grade === 'A' || 'B'`. Writing the
+   task's proposed schema into that field verbatim would silently break
+   both — wrong field names, and a letter grade with no rubric behind
+   it.
+3. `synthesize_ingredient_summary` already re-queries `VerifiedResource`/
+   `ResearchPaper`/`PaperConclusion` fresh from the DB every time it
+   runs — it accepts no candidate-list override parameter, so there's no
+   clean seam to inject an already-refined pool into that one Gemini
+   call without rewriting a large, already-correct, already-tested
+   module.
+4. Cross-resource duplicate/near-duplicate MERGING (task requirement
+   #3, "Group duplicate or highly overlapping claims... into a single
+   comprehensive statement") is already `synthesize_ingredient_summary`'s
+   own job, and has been since Phase 23/24 — it already reads every
+   resource/paper for an ingredient in one pass and merges overlapping
+   claims with real, server-computed scoring. A second, separate Gemini
+   call doing the same cross-source merge with no visibility into that
+   rubric would be redundant at best, contradictory at worst.
+
+**Resulting design — `backend/app/services/conclusion_refine_service.py`
+(new).** `refine_conclusions(raw_conclusions: List[str], ingredient_name:
+str) -> List[str]` makes ONE Gemini call to (1) drop boilerplate
+disclaimers/generic fluff/off-topic items and (2) merge near-duplicate
+paraphrases — scoped to ONE resource's own `extracted_conclusions` list
+at a time, not merged across resources (see point 4 above for why
+cross-resource merging is deliberately left to the existing Stage 2
+engine). Returns a plain `list[str]` — the exact same shape
+`VerifiedResource.extracted_conclusions` already stores, so nothing
+downstream needs to change. Never assigns a grade/category/source label
+(see point 2 above). Server-side safety net after Gemini responds: dedup
+(`dict.fromkeys`), re-run through `resource_parser.py::
+is_valid_human_conclusion` (the same Phase 28 sanitizer every other
+conclusion in this codebase passes through), capped at
+`_MAX_REFINED_CONCLUSIONS` (60). **Never raises** and falls back to the
+original, unrefined list unchanged on: too few items to bother (< 2),
+any Gemini request/parse failure, or Gemini claiming a total wipeout
+(zero items survive) — the last case treated as suspicious rather than a
+legitimate signal, since every raw item already cleared Phase 28's
+sanitizer to get into `extracted_conclusions` in the first place; a
+single refinement pass shouldn't be trusted enough to silently delete
+everything a resource had.
+
+**Pipeline integration —
+`paper_analysis_pipeline.py::analyze_ingredient_papers`.** Inserted as a
+new step "2b" — after step 2 (Phase 27 HTML fallback, so this also
+cleans up anything just recovered from a live webpage) and before step 3
+(Stage 2 synthesis), i.e. exactly where the task asked for it
+("immediately after the raw extraction phase finishes... before Stage 2
+synthesis"), just scoped per-`VerifiedResource` rather than to one global
+flat list (see point 1 above for why that's the real seam in this
+codebase). For every resource with a non-empty `extracted_conclusions`:
+refine it, replace the column if the result differs, commit (same
+"log, don't fail" try/except convention as every other step in this
+function — a commit failure here just means Stage 2 synthesizes from the
+original unrefined data instead, logged as a warning). Two new
+`PipelineResult` fields, `conclusions_refined_before`/
+`conclusions_refined_after`, track the ingredient-level sum across every
+resource touched this run, logged once via the task's own requested
+format: `"[ConclusionRefine] Consolidated conclusions from %d down to %d
+clean item(s) for ingredient id=%s (%r)."` Because Stage 2 (unchanged)
+reads this now-cleaner per-resource input immediately afterward,
+`Ingredient.scientific_conclusions` genuinely does end up less noisy and
+less redundant as a real, downstream effect of this pass — achieved
+through the existing, correctly-scoped synthesis engine rather than a
+parallel, schema-incompatible write path.
+
+**Backend tests — `backend/tests/test_conclusion_refine_service.py`
+(new).** Same stdlib-`unittest` approach as Phase 39's
+`test_nih_extraction.py` (no pytest in this environment). 9 tests cover
+the fast-path guards (missing ingredient name, empty input, below the
+2-item refinement threshold — all skip the Gemini call entirely, verified
+via `mock_get_client.assert_not_called()`), the full Gemini-call path
+with a mocked client/response (successful dedup+sanitize, a simulated
+Gemini failure falling back to the original list, a total-wipeout
+response also falling back, and the `_MAX_REFINED_CONCLUSIONS` cap), and
+the prompt builder's content. **All 9 are skip-guarded** (`@unittest.
+skipUnless(pydantic and google.genai both importable, ...)`) — this
+sandbox has neither package installed (confirmed:
+`python3 -c "import pydantic"` raises `ModuleNotFoundError` here, so
+even `conclusion_refine_service.py`'s own module-level imports can't
+resolve), so they skip cleanly with a clear reason rather than erroring,
+same pattern as Phase 39's `NihDomainDetectionTests`. Run via (from
+`backend/`, after `pip install -r requirements.txt`):
+
+    python3 -m unittest discover -s tests -p "test_*.py" -v
+
+**Verification.** `python3 -m py_compile` passes on every backend file
+(including the two new test files); the full test suite runs cleanly —
+12 tests from Phase 39 pass, 9 new Phase 40 tests + 2 pre-existing
+Phase-39 dependency-gated tests skip for the documented reason (0
+failures, 0 errors); `npx tsc --noEmit` passes cleanly on the frontend
+(no frontend files touched this phase — this is entirely a backend
+extraction-pipeline change, invisible to the UI beyond a quieter,
+less-redundant final `scientific_conclusions` list).
+
+## Clean Re-Grade Wipe — "Grade Again" (Phase 41)
+
+Task scope: clicking the standalone IngredientCard's "(grade again)"
+affordance should (1) purge the ingredient's prior research data on the
+backend before re-running the pipeline, rather than incrementally
+topping it up, and (2) actually show a loading animation on the
+frontend button while that request is in flight.
+
+**Traced the real "Grade Again" path before writing any code.** There is
+no separate re-grade endpoint or pipeline entrypoint — `GradeBadge.tsx`'s
+`regradeLabel` affordance (rendered by `IngredientCard.tsx` once
+`isGraded` is true) calls the exact same `onRequestGrade` →
+`handleGradeRequest` → `gradeIngredient(ingredient.id)` → `POST
+/api/v1/ingredients/{id}/grade` → `grading_service.grade_ingredient`
+path as a first-time grade. So "detect this is a repeat grade" has to
+happen inside `grade_ingredient` itself, keyed on the one signal that's
+already true at that point: `ingredient.is_graded`.
+
+**Backend — `backend/app/services/grading.py`.** Added
+`_purge_prior_research_data(session, ingredient)`, called (and
+committed as its own transaction) at the very top of `grade_ingredient`
+whenever `ingredient.is_graded` is already `True` on entry, before the
+existing keyword-generation/paper-search/resource-fetch/pipeline steps
+run — those steps are otherwise completely unchanged, so "fresh grade"
+and "re-grade" now differ only in whether this purge ran first. It
+deletes every `ResearchPaper`, `PaperConclusion`, and `VerifiedResource`
+row for the ingredient (bulk `delete()` statements, same convention as
+`storage.py::delete_all_data`), and resets `scientific_conclusions`,
+`general_info`, `summary_description`, `is_graded`, and
+`grade_badge_text` on the `Ingredient` row itself.
+
+**Two deliberate, documented deviations from the task's literal spec**
+(see the function's own docstring for the full reasoning):
+
+1. **A third table purged that the spec didn't name.** The spec said to
+   delete "Paper" and "Resource" records only. `PaperConclusion` (Phase
+   5) is a third table this same pipeline populates FROM the
+   `ResearchPaper` rows being deleted — `conclusion_grader.py::
+   process_paper_conclusions` merges each newly-graded paper's findings
+   into whichever *existing* `PaperConclusion` row its claim best
+   matches. Leaving old ones in place would both strand
+   `supporting_paper_ids` pointing at deleted paper ids, and cause the
+   fresh run to merge new findings into stale claims from the previous
+   run — the opposite of a clean wipe. So this table is purged too.
+2. **A spec'd field that doesn't exist.** The spec asked to reset
+   `ingredient.overall_grade`. This codebase has no such field — no
+   single top-level letter grade on `Ingredient` at all (grades live
+   per-`ResearchPaper`, per-`VerifiedResource`, per-conclusion, never
+   rolled up). The real analogous field, `grade_badge_text` (the debug
+   "N / N / N" pill text), is reset instead.
+
+`summary_description` is also reset, which the spec didn't mention
+either — it's the same kind of research-derived synthesis output as
+`scientific_conclusions`/`general_info` (all three come from the same
+pipeline run being purged), and the frontend prefers it over any
+client-computed fallback, so leaving it stale would show old synthesized
+text on top of a freshly-emptied papers/resources list mid-regrade.
+
+`paper_analysis_pipeline.py` needed no functional change — by the time
+`analyze_ingredient_papers` ever runs, `grading.py` has already purged
+and committed, so "every stored paper/resource for this run" already
+means the same thing whether it's a first-time grade or a tenth
+re-grade. A documentation-only note was added to that module's docstring
+explaining why, so a future reader doesn't need to re-derive it. Neither
+`app/api/routes.py`'s route body needed a code change either — only its
+docstring, since `grade_ingredient` (the service function) already owns
+the whole decision; the route stays a thin pass-through, matching this
+codebase's established "routes stay thin, orchestration lives in
+services" convention.
+
+**Frontend — the real bug.** `GradeBadge.tsx`'s already-graded branch
+(State C, `isGraded: true` + `regradeLabel` set) never read the
+`isLoading` prop at all — only the `!isGraded` branch (State B) checked
+it. Since `isGraded` stays `true` for the entire duration of a re-grade
+request (`IngredientCard.tsx`'s `handleGradeRequest` only flips it once
+the response comes back), every render during a "Grade Again" request
+fell into the graded branch, which unconditionally rendered the static,
+pressable "Grade Again" pill — no spinner, no disabled state — the whole
+time. `isRequestingGrade`/`isLoading` were already being tracked and
+passed down correctly the whole time; the bug was purely that
+`GradeBadge` never looked at the prop in that branch.
+
+Fixed by adding a State C-loading branch: when `isGraded && regradeLabel
+&& isLoading`, render a disabled `Pressable` with the same
+`ActivityIndicator` treatment as State B, labeled via a new
+`regradeLoadingLabel` prop (falls back to `loadingLabel` if not
+provided) so the button can read "Re-grading..." instead of reusing the
+first-grade "Grading..." wording. `IngredientCard.tsx` now passes
+`regradeLoadingLabel="Re-grading..."` alongside its existing
+`idleLabel`/`loadingLabel`/`regradeLabel` props.
+
+**Verification.** `python3 -m py_compile` passes across the whole
+backend (including `grading.py`/`routes.py`/`paper_analysis_pipeline.py`);
+`npx tsc --noEmit` passes cleanly on the frontend.
+
+## Europe PMC Extraction Overhaul (Phase 42)
+
+Task scope: Europe PMC (`api_id="europe_pmc"`, a real, active
+`VerifiedResource` source — see `docs/verified_resource_apis.json`) was
+saving article titles as fake "conclusions" (`Europe PMC ('Title'):
+Title.`) and leaking unescaped HTML entities
+(`[&lt;sup&gt;18&lt;/sup&gt;F]`) into stored conclusion text.
+
+**Root cause, traced before writing any code.**
+`resource_parser.py::_parse_europe_pmc` read `item.get("abstractText")
+or item.get("title")` — when a result had no `abstractText`, it silently
+used the TITLE as the "abstract" text, then prefixed that same title
+onto it again, producing exactly the reported `('Title'): Title.` shape.
+Separately, `_HTML_TAG_RE.sub("", abstract)` stripped real `<tag>`
+markup but never called `html.unescape()` first — some Europe PMC
+`abstractText` values arrive with their tags HTML-entity-escaped (the
+literal six characters `&lt;sup&gt;`, not a real `<` character), which
+the tag-stripping regex can never match, so the escaped soup passed
+straight through untouched.
+
+**Fix — fully deterministic, no new Gemini call.** This module
+(`resource_parser.py`) has been zero-LLM since Phase 21 specifically to
+avoid rate-limit/latency/hallucination costs (see its own top-of-file
+docstring) — the task's literal spec included a Gemini extraction prompt
+for Europe PMC text, but every fix needed here is achievable
+deterministically and reintroducing an LLM call for one provider would
+reopen a closed design decision without being asked to, and with no
+rate-limit budget allocated for a new per-result Gemini call at fetch
+time. So the fix stays entirely within the existing regex/string-
+processing architecture:
+
+1. **`_clean_html_text()`** (new, shared) — `html.unescape()` THEN
+   `_HTML_TAG_RE.sub("", ...)` THEN whitespace normalization, in that
+   order. Also applied to `_medlineplus_sentences` (Phase 39), which
+   read from the same class of upstream XML-sourced field and had the
+   same latent unescape-ordering gap, not previously reported broken but
+   fixed alongside its sibling rather than left with a copy of the same
+   bug.
+2. **`_HTML_TAG_RE` tightened** from `r"<[^>]+>"` to
+   `r"</?[A-Za-z][^<>]*>"` — the original pattern treated ANY literal
+   `<` as a tag opener, including a mathematical comparison like
+   `p<0.05` (common in abstracts), and being greedy (`[^>]+`) would then
+   consume everything up to the next real `>` anywhere later in the
+   string, silently deleting genuine sentence content in between.
+   Requiring a letter (or `/`) immediately after `<` still matches every
+   real tag this module encounters while no longer misfiring on numeric
+   comparisons.
+3. **Title fallback removed entirely** — `abstractText` is the only
+   field `_parse_europe_pmc` ever treats as source text now; a result
+   with none is skipped and logged (`"[Europe PMC] No abstract
+   conclusions found for title: {title}"`, per the task's own requested
+   line), never silently substituted with the title. Belt-and-suspenders:
+   `_is_near_duplicate_of_title()` (stdlib `difflib.SequenceMatcher`,
+   >=90% ratio) also drops any resulting sentence that reads as the
+   title restated, even from a genuine but degenerate abstract.
+4. **Per-finding extraction, not per-paper.** `_europe_pmc_sentences()`
+   splits each cleaned abstract into every individual sentence — the
+   task's "Each distinct finding MUST be its own standalone claim
+   string" — and, via `_split_europe_pmc_sections()`, prioritizes text
+   from inline `RESULTS:`/`CONCLUSIONS:`-style structured-abstract
+   sections when present, discarding `BACKGROUND:`/`METHODS:` setup
+   text; falls back to sentence-splitting the whole abstract when no
+   such sections are found (the common case for many journals), so an
+   unstructured abstract still yields multiple discrete findings instead
+   of one blob.
+5. **Tier 3 fallback excluded for `europe_pmc`.** Fixing (3) above
+   newly exposed a dormant bug in `extract_general_description_fallback`'s
+   generic Tier 3 (Phase 30): for a paper with no abstract, it would
+   `str()` the ENTIRE raw envelope (`{"resultList": {"result": [{"title":
+   ...}]}, "hitCount": ...}`) and — since `is_valid_human_conclusion`'s
+   boilerplate regex only catches comma-separated `key: value` chains,
+   not bare colon-separated ones — a fragment like `"resultList :
+   result : title : ..."` could slip through as a fake "conclusion,"
+   undermining the whole point of (3). `europe_pmc` is now explicitly
+   excluded from that tier — its own structured parser's empty result is
+   authoritative, not a gap to paper over.
+
+**Tests — `backend/tests/test_europe_pmc_extraction.py`** (new, 29
+tests, zero skips — this module has no third-party dependencies). Covers
+`_clean_html_text` (entity unescaping, real-tag stripping, the `p<0.05`
+false-positive-tag regression, combined entity+literal-`<`+real-tag
+text), `_is_near_duplicate_of_title`, `_split_europe_pmc_sections`/
+`_europe_pmc_sentences` (section prioritization, unstructured fallback,
+title-duplicate dropping), `_parse_europe_pmc` end to end (the exact
+reported bug's regression test, multi-result handling, the `[Europe
+PMC]` log line, malformed-payload fail-open behavior), the Tier 3
+exclusion via `parse_resource_conclusions`, and a confirmation
+`_medlineplus_sentences` picked up the same entity-unescaping fix.
+
+**Verification.** `python3 -m py_compile` clean across the backend;
+`python3 -m unittest discover -s tests -p "test_*.py"` — 51 tests, 41
+pass (29 new + 12 from Phase 39), 10 skip for the same documented
+missing-package reasons as before (unaffected by this phase); `npx tsc
+--noEmit` clean (no frontend changes — `VerifiedResource.
+extracted_conclusions`'s shape, `list[str]`, is unchanged).
+
 ## Frontend Structure
 
 ```
@@ -2755,7 +4814,8 @@ frontend/
     │   ├── ExternalLinkIconButton.tsx # Shared "🌐" open-in-new-tab row action used by StudiesList/VerifiedResourcesList (Phase 9)
     │   ├── StudiesList.tsx       # Paginated (5/page) "List of Studies (Total: N)" panel — ResearchPaper rows, rubric + info modals, external-link button (Phase 2, unified Phase 9)
     │   ├── RecommendedUsesList.tsx    # "Recommended Uses List" — paginated (5/page) PaperConclusion list, graded C+, sorted A->E then score before paginating (Phase 12), rubric + info modals (Phase 5, unified Phase 9)
-    │   ├── VerifiedResourcesList.tsx  # "Verified Online Resources" — official government/regulatory reference links (Phase 7), grade/score badges (Phase 8), sorted A->E then score before paginating (Phase 12), paginated (5/page) with rubric + info modals (Phase 9)
+    │   ├── ScientificConclusionsList.tsx  # "Scientific Conclusions List" — paginated (5/page) Ingredient.scientific_conclusions list (Phase 11), rescored against the 4-category Multi-Source Confidence Rubric + persisted (Phase 23), guaranteed to include every VerifiedResource conclusion via the Phase 24 server-side Direct Injection Safety Net, sorted A->E then score before paginating, rubric + info modals — a DIFFERENT component/data source from RecommendedUsesList.tsx above despite similar naming (see that file's own doc-comment); renamed Phase 24 from MultiSourceUsesList.tsx, which is deprecated in place (not deleted) alongside it
+    │   ├── VerifiedResourcesList.tsx  # "Verified Online Resources" — official government/regulatory reference links (Phase 7), grade/score badges (Phase 8), sorted A->E then score before paginating (Phase 12), paginated (5/page) with rubric + info modals (Phase 9); info modal's "Extracted Conclusions" section now also renders a colored Agrees/Contradicts/Distinct-New badge per conclusion (Phase 22)
     │   ├── StudiesAnalysisBar.tsx     # UNUSED as of Phase 9 (no longer imported by IngredientCard.tsx) — its total-count/average-grade metrics moved into StudiesList's title bar and IngredientCard's summary sentence, respectively; left in place, not deleted
     │   ├── Pagination.tsx        # Shared prev/next + page indicator, used by all three Scientific Information lists
     │   └── GradeBadge.tsx        # Shared top-right grade pill/button (graded vs. ungraded), used by ProductCard + standalone IngredientCard
@@ -2768,7 +4828,8 @@ frontend/
     │   └── api.ts                # API_BASE_URL, uploadSupplementImage(), fetchSuggestions(), searchSupplements(), fetchProductDetail(), fetchIngredientDetail(), gradeIngredient(), resetDatabase()
     └── utils/
         ├── animations.ts          # animateCardToggle() — shared LayoutAnimation helper for accordion cards
-        └── grades.ts               # GRADE_COLORS, GRADE_RANK, getGradeRank(), isPaperGrade(), sortByGradeThenScore() (Phase 12) — shared grade-letter helpers (Phase 5)
+        ├── grades.ts               # GRADE_COLORS, GRADE_RANK, getGradeRank(), isPaperGrade(), sortByGradeThenScore() (Phase 12) — shared grade-letter helpers (Phase 5)
+        └── alignment.ts            # ALIGNMENT_COLORS, ALIGNMENT_LABELS, getAlignmentColor(), getAlignmentLabel() — resource-conclusion claim-alignment badge helpers (Phase 22)
 ```
 
 ### Navigation

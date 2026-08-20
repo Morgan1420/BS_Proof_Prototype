@@ -30,15 +30,38 @@ Kept as its own service (rather than inlined in the route) so the whole
 pipeline can be unit-tested / reused without going through FastAPI, same
 reasoning as app/services/storage.py::save_scan being separate from the
 /scan route.
+
+--- Phase 41: clean re-grade wipe ("Grade Again") ---
+`grade_ingredient` is called by the exact same POST
+/api/v1/ingredients/{id}/grade route (app/api/routes.py) whether this is
+an ingredient's FIRST grade request or a repeat one triggered by tapping
+the standalone IngredientCard's "Grade Again" affordance (see
+src/components/GradeBadge.tsx's `regradeLabel` prop and
+src/components/IngredientCard.tsx's `handleGradeRequest` — both call
+the identical `gradeIngredient(ingredient.id)` client function, no
+separate endpoint). Before this phase, a repeat call only ever ADDED to
+what was already stored — every write path here is dedup-on-insert
+(search_papers_for_ingredient/fetch_verified_resources_for_ingredient)
+or merge-into-existing (analyze_ingredient_papers's conclusion
+synthesis) — correct behavior for "pick up new evidence since last
+time," but not what a dedicated "Grade Again" button is asking for: a
+genuinely fresh pull, not an incremental top-up that can still carry a
+paper whose findings have since been retracted or a synthesized claim
+that should no longer be the top consensus. See
+`_purge_prior_research_data`'s own docstring below for exactly what gets
+wiped, and for two deliberate documented deviations from this feature's
+task spec (a third table purged that the spec didn't name, and one
+spec'd field — `ingredient.overall_grade` — that doesn't exist anywhere
+in this codebase's schema).
 """
 
 from __future__ import annotations
 
 import logging
 
-from sqlmodel import Session, func, select
+from sqlmodel import Session, delete, func, select
 
-from app.models.research import ResearchPaper
+from app.models.research import PaperConclusion, ResearchPaper, VerifiedResource
 from app.models.supplement import Ingredient
 from app.services.paper_analysis_pipeline import analyze_ingredient_papers
 from app.services.paper_search import search_papers_for_ingredient
@@ -53,6 +76,77 @@ logger = logging.getLogger(__name__)
 
 class GradingError(RuntimeError):
     """Raised when the grading pipeline can't produce a result at all."""
+
+
+def _purge_prior_research_data(session: Session, ingredient: Ingredient) -> None:
+    """Wipes every ResearchPaper / PaperConclusion / VerifiedResource row
+    tied to `ingredient.id`, and resets every research-derived field on
+    `ingredient` itself, right before `grade_ingredient` below re-runs
+    the pipeline from scratch for an ingredient that's already been
+    graded once — see the "Phase 41" paragraph in this module's
+    docstring for why a repeat grade request needs this at all.
+
+    **Two deliberate, documented deviations from this feature's task
+    spec** (investigated against the real schema before writing this,
+    same "implement against reality" convention as every prior phase in
+    this codebase — see docs/Architecture.md):
+
+    1. **A third table purged that the spec didn't name.** The spec
+       said "Delete existing associated Paper records. Delete existing
+       associated Resource records." — it didn't mention
+       `PaperConclusion` (Phase 5 — app/models/research.py), a third
+       table this exact pipeline populates FROM the ResearchPaper rows
+       being deleted here (app/services/conclusion_grader.py::
+       process_paper_conclusions merges each newly-graded paper's
+       findings into whichever *existing* PaperConclusion row its claim
+       best matches). Leaving old PaperConclusion rows in place would
+       both strand `supporting_paper_ids`/`contradicting_paper_ids`
+       pointing at now-deleted ResearchPaper ids, and — worse — cause
+       the fresh pipeline run to merge new findings into stale claims
+       from the previous run instead of starting genuinely clean,
+       directly undermining the "clean wipe" the user asked for. So this
+       table is purged too.
+    2. **A spec'd field that doesn't exist.** The spec said to reset
+       `ingredient.overall_grade`. There is no such field — this
+       codebase has no single top-level letter grade on Ingredient at
+       all (see app/models/supplement.py's docstring: grades live per-
+       ResearchPaper, per-VerifiedResource, and per-conclusion, never
+       rolled up to one Ingredient-level grade). The real analogous
+       field is `grade_badge_text` (the debug "N / N / N" pill text
+       `grade_ingredient` sets at the end of every successful run) —
+       reset to `None` here instead.
+
+    Also resets `summary_description` (Phase 11 —
+    app/services/conclusion_grader.py::synthesize_ingredient_summary),
+    which the spec didn't mention either — it's the same kind of
+    research-derived synthesis output as `scientific_conclusions`/
+    `general_info` (all three come out of the same pipeline run being
+    purged here), and the frontend prefers it over any client-computed
+    fallback (see IngredientCard.tsx's `scientificSummary`) — leaving a
+    stale one in place would show old synthesized text on top of a
+    freshly-emptied papers/resources list while the re-grade is in
+    flight.
+
+    Does NOT touch `Ingredient.name`/`recommended_daily_dosage`/
+    `product_count`/`is_mock` — none of those are research-pipeline
+    output; all are scan-derived/canonical fields entirely out of scope
+    here (see app/services/storage.py).
+
+    Flushed onto `session` but not committed — the caller commits this
+    as its own transaction (see `grade_ingredient` below) before
+    starting the fresh pipeline run, so a purge that fails partway
+    rolls back cleanly rather than leaving the ingredient half-wiped.
+    """
+    session.exec(delete(PaperConclusion).where(PaperConclusion.ingredient_id == ingredient.id))
+    session.exec(delete(ResearchPaper).where(ResearchPaper.ingredient_id == ingredient.id))
+    session.exec(delete(VerifiedResource).where(VerifiedResource.ingredient_id == ingredient.id))
+
+    ingredient.scientific_conclusions = None
+    ingredient.general_info = None
+    ingredient.summary_description = None
+    ingredient.is_graded = False
+    ingredient.grade_badge_text = None
+    session.add(ingredient)
 
 
 def grade_ingredient(session: Session, ingredient: Ingredient) -> int:
@@ -70,6 +164,14 @@ def grade_ingredient(session: Session, ingredient: Ingredient) -> int:
     progress from rate limiting or a transient failure mid-loop is never
     rolled back.
 
+    **Phase 41:** if `ingredient.is_graded` is already `True` on entry
+    (a "Grade Again" repeat request, not a first-time grade), this first
+    purges every prior ResearchPaper/PaperConclusion/VerifiedResource
+    row and research-derived Ingredient field for it, committing that
+    wipe as its own transaction, before falling through into the exact
+    same fresh-pipeline steps below — see `_purge_prior_research_data`'s
+    own docstring for the full reasoning.
+
     Args:
         session: An open SQLModel session.
         ingredient: The Ingredient row to grade (already fetched by the
@@ -80,16 +182,29 @@ def grade_ingredient(session: Session, ingredient: Ingredient) -> int:
         newly-added ones from this call).
 
     Raises:
-        GradingError: if Gemini keyword generation fails outright, the
-            post-search commit fails, or the final commit fails.
-            Paper-search failures for individual sources/keywords (see
-            paper_search.py's `_safe_query_async`) and per-paper
-            grading/conclusion-synthesis failures (see
-            analyze_ingredient_papers) are all handled internally and
-            never raise — a partial result is preferred over failing the
-            whole request because one source, one paper, or one Gemini
-            call hiccupped.
+        GradingError: if the pre-regrade purge commit fails, Gemini
+            keyword generation fails outright, the post-search commit
+            fails, or the final commit fails. Paper-search failures for
+            individual sources/keywords (see paper_search.py's
+            `_safe_query_async`) and per-paper grading/conclusion-
+            synthesis failures (see analyze_ingredient_papers) are all
+            handled internally and never raise — a partial result is
+            preferred over failing the whole request because one
+            source, one paper, or one Gemini call hiccupped.
     """
+    if ingredient.is_graded:
+        # Clean re-grade wipe — see _purge_prior_research_data's own
+        # docstring and this module's "Phase 41" docstring paragraph.
+        _purge_prior_research_data(session, ingredient)
+        try:
+            session.commit()
+        except Exception as exc:
+            session.rollback()
+            raise GradingError(
+                f"Failed to clear prior research data before re-grading "
+                f"'{ingredient.name}': {exc}"
+            ) from exc
+
     try:
         keywords = generate_ingredient_keywords(ingredient.name)
     except KeywordGenerationError as exc:

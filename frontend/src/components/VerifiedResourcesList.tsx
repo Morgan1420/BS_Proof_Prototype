@@ -5,6 +5,7 @@ import { Ionicons } from '@expo/vector-icons';
 import { colors, spacing, typography } from '../theme';
 import type { VerifiedResource } from '../services/api';
 import { isPaperGrade, sortByGradeThenScore } from '../utils/grades';
+import { getAlignmentColor, getAlignmentLabel } from '../utils/alignment';
 import Pagination from './Pagination';
 import CollapsibleSection from './CollapsibleSection';
 import GradeCircleBadge from './GradeCircleBadge';
@@ -258,22 +259,71 @@ const VerifiedResourcesList: React.FC<VerifiedResourcesListProps> = ({
                       (docs/verified_resource_apis.json — see
                       VerifiedResource.extracted_conclusions's docstring
                       in backend/app/models/research.py). Null/empty
-                      renders an honest fallback rather than hiding the
-                      section. */}
+                      renders a highlighted notice box (Phase 20) with a
+                      dynamic, backend-supplied failure reason rather than
+                      hiding the section or showing a generic message. */}
                   <View style={[styles.modalSection, styles.modalSectionLast]}>
                     <Text style={styles.modalSectionLabel}>Extracted Conclusions</Text>
                     {activeInfoModalItem.extracted_conclusions &&
                     activeInfoModalItem.extracted_conclusions.length > 0 ? (
-                      activeInfoModalItem.extracted_conclusions.map((conclusion, index) => (
-                        <View key={index} style={styles.extractedConclusionRow}>
-                          <Text style={styles.extractedConclusionBullet}>{'•'}</Text>
-                          <Text style={styles.modalSectionValue}>{conclusion}</Text>
-                        </View>
-                      ))
+                      activeInfoModalItem.extracted_conclusions.map((conclusion, index) => {
+                        // Phase 22 — aligned_conclusions is parallel-
+                        // indexed with extracted_conclusions, same order
+                        // (see VerifiedResource.aligned_conclusions's
+                        // docstring in backend/app/models/research.py).
+                        // Optional-chained since alignment may not have
+                        // run yet for this resource — a missing entry
+                        // just renders the bullet with no badge, same
+                        // "null = not yet classified, not an error"
+                        // convention as grade/score above.
+                        const aligned = activeInfoModalItem.aligned_conclusions?.[index];
+                        return (
+                          <View key={index} style={styles.extractedConclusionItem}>
+                            <View style={styles.extractedConclusionRow}>
+                              <Text style={styles.extractedConclusionBullet}>{'•'}</Text>
+                              <Text style={styles.modalSectionValue}>{conclusion}</Text>
+                            </View>
+                            {aligned && (
+                              <View style={styles.alignmentRow}>
+                                <View
+                                  style={[
+                                    styles.alignmentBadge,
+                                    { backgroundColor: getAlignmentColor(aligned.alignment) },
+                                  ]}
+                                >
+                                  <Text style={styles.alignmentBadgeText}>
+                                    {getAlignmentLabel(aligned.alignment)}
+                                  </Text>
+                                </View>
+                                {(aligned.target_claim || aligned.notes) && (
+                                  <Text style={styles.alignmentNotesText}>
+                                    {aligned.target_claim
+                                      ? `Re: "${aligned.target_claim}"${
+                                          aligned.notes ? ' — ' : ''
+                                        }`
+                                      : ''}
+                                    {aligned.notes ?? ''}
+                                  </Text>
+                                )}
+                              </View>
+                            )}
+                          </View>
+                        );
+                      })
                     ) : (
-                      <Text style={styles.modalSectionValue}>
-                        No specific conclusions extracted for this source yet.
-                      </Text>
+                      // Phase 20 — extraction_failure_reason handled
+                      // null/undefined-safely via `||`, per spec: falls
+                      // back to a generic explanation when the backend
+                      // itself has no specific reason on record (e.g.
+                      // Stage 1 extraction hasn't even run yet for this
+                      // resource).
+                      <View style={styles.extractionFailureNotice}>
+                        <Text style={styles.extractionFailureNoticeText}>
+                          {'No conclusions extracted because ' +
+                            (activeInfoModalItem.extraction_failure_reason ||
+                              'insufficient text was provided by the official source.')}
+                        </Text>
+                      </View>
                     )}
                   </View>
                 </ScrollView>
@@ -470,6 +520,10 @@ const styles = StyleSheet.create({
     lineHeight: 19,
   },
   // --- "Extracted Conclusions" bullets (info modal, Phase 19) ---
+  extractedConclusionItem: {
+    gap: 4,
+    marginBottom: spacing.xs,
+  },
   extractedConclusionRow: {
     flexDirection: 'row',
     gap: 6,
@@ -477,6 +531,47 @@ const styles = StyleSheet.create({
   extractedConclusionBullet: {
     fontSize: typography.resultCardLabel,
     color: colors.orange,
+  },
+  // --- Claim alignment badges (info modal, Phase 22 — see
+  // utils/alignment.ts for the color/label mapping) ---
+  alignmentRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    flexWrap: 'wrap',
+    gap: 6,
+    paddingLeft: 14,
+  },
+  alignmentBadge: {
+    borderRadius: 10,
+    paddingHorizontal: spacing.xs,
+    paddingVertical: 2,
+  },
+  alignmentBadgeText: {
+    fontSize: 11,
+    fontWeight: '700',
+    color: '#FFFFFF',
+  },
+  alignmentNotesText: {
+    flex: 1,
+    fontSize: 12,
+    fontStyle: 'italic',
+    color: colors.orange,
+    lineHeight: 16,
+  },
+  // --- Extraction failure/empty-result notice box (info modal, Phase 20) ---
+  extractionFailureNotice: {
+    borderWidth: 1,
+    borderColor: colors.orange,
+    borderRadius: 8,
+    paddingHorizontal: spacing.sm,
+    paddingVertical: spacing.xs,
+    backgroundColor: `${colors.orange}18`,
+  },
+  extractionFailureNoticeText: {
+    fontSize: typography.resultCardLabel,
+    fontStyle: 'italic',
+    color: colors.orange,
+    lineHeight: 19,
   },
   modalSummaryText: {
     fontStyle: 'italic',

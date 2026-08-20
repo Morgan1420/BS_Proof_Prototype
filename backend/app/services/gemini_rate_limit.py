@@ -1,8 +1,10 @@
 """Shared Gemini rate-limit handling (Phase 18) — used by every
 Gemini-calling service that needs it: currently
-`app/services/paper_grader.py` (paper quality grading, Phase 3/6) and
+`app/services/paper_grader.py` (paper quality grading, Phase 3/6).
 `app/services/resource_extractor.py` (Stage 1 resource claims
-extraction, Phase 17).
+extraction, Phase 17) used this too, through Phase 20 — as of Phase 21
+that module is deprecated and no longer called by anything (see its own
+module docstring), so this is effectively its only live caller now.
 
 **Why this exists.** Under sustained grading traffic, this app was
 hitting the Gemini free-tier's requests-per-minute ceiling mid-pipeline

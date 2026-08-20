@@ -78,17 +78,81 @@ def _enable_sqlite_foreign_keys(dbapi_connection, connection_record) -> None:  #
 # added here after `is_graded`/`grade_badge_text` — nullable, so no
 # DEFAULT is needed, same reasoning as ResearchPaper's own nullable
 # `keywords`/`grade`/`grade_score` columns.
+#
+# `recommended_uses` (Phase 23 — Multi-Source Confidence Rubric,
+# docs/multi_source_confidence_rubric.json,
+# app/services/conclusion_grader.py::synthesize_ingredient_summary) was
+# added after `summary_description` — also nullable, same reasoning.
+# Phase 24 renamed it to `scientific_conclusions` (task: "Rename
+# recommended_uses fields and models to scientific_conclusions"). Rather
+# than an in-place column rename, `scientific_conclusions` is added here
+# as a NEW additive column — the old `recommended_uses` entry below is
+# kept (not removed from this tuple) purely so a database that already
+# has it stays recognized/no-op'd by the loop below; no Python code reads
+# or writes through it anymore (see Ingredient.scientific_conclusions's
+# own "Phase 24 rename, backward-compat" docstring paragraph in
+# app/models/supplement.py). `_backfill_scientific_conclusions_from_legacy_column()`
+# below, called right after the ADD COLUMN loop, one-time copies any
+# pre-Phase-24 row's `recommended_uses` data into the new column so
+# existing synthesized data isn't silently lost by the rename.
+#
+# `general_info` (Phase 33 — General Information: Description + Daily
+# Dosage, app/services/general_info_extractor.py::extract_general_info)
+# was added after `scientific_conclusions` — also nullable JSON, same
+# reasoning as every other column here. See
+# Ingredient.general_info's own docstring in app/models/supplement.py for
+# the full two-field shape and the strict Grade A/B-only source
+# hierarchy it's populated under.
 _INGREDIENT_GRADING_COLUMNS: tuple[tuple[str, str], ...] = (
     ("is_graded", "BOOLEAN DEFAULT 0 NOT NULL"),
     ("grade_badge_text", "VARCHAR"),
     ("summary_description", "TEXT"),
+    ("recommended_uses", "JSON"),
+    ("scientific_conclusions", "JSON"),
+    ("general_info", "JSON"),
 )
+
+
+def _backfill_scientific_conclusions_from_legacy_column(connection, existing_columns) -> None:
+    """Phase 24: one-time, idempotent data migration for the
+    `recommended_uses` -> `scientific_conclusions` rename (see
+    `_INGREDIENT_GRADING_COLUMNS`'s own comment above and
+    Ingredient.scientific_conclusions's docstring in
+    app/models/supplement.py for the full "why a new column, not an
+    in-place rename" reasoning).
+
+    Copies `recommended_uses` -> `scientific_conclusions` for exactly the
+    rows where that's still needed: `scientific_conclusions IS NULL AND
+    recommended_uses IS NOT NULL`. Safe to call on every startup — once a
+    row's `scientific_conclusions` is populated (either by this backfill
+    or by a fresh Phase 24+ synthesis run writing it directly), that
+    `WHERE` clause no longer matches it, so this becomes a true no-op
+    thereafter. Never overwrites a `scientific_conclusions` value that's
+    already been (re-)synthesized under the new column name, even if
+    `recommended_uses` still happens to hold older data from before the
+    rename.
+
+    A no-op entirely (not even attempted) on a database new enough to
+    never have had the old `recommended_uses` column at all, or old
+    enough that `scientific_conclusions` was just added this same run but
+    `recommended_uses` was too (a brand-new database, both created
+    together by create_all() — nothing to backfill from either way).
+    """
+    if "recommended_uses" not in existing_columns or "scientific_conclusions" not in existing_columns:
+        return
+    connection.exec_driver_sql(
+        "UPDATE ingredients SET scientific_conclusions = recommended_uses "
+        "WHERE scientific_conclusions IS NULL AND recommended_uses IS NOT NULL"
+    )
 
 
 def _migrate_ingredient_grading_columns() -> None:
     """Additive, idempotent migration: adds `is_graded`/`grade_badge_text`/
-    `summary_description` to an existing `ingredients` table if they're
-    missing.
+    `summary_description`/`recommended_uses`/`scientific_conclusions`/
+    `general_info` to an existing `ingredients` table if they're missing,
+    then (Phase 24) backfills `scientific_conclusions` from any legacy
+    `recommended_uses` data still present — see
+    `_backfill_scientific_conclusions_from_legacy_column`.
 
     `SQLModel.metadata.create_all()` (called just before this, in
     init_db()) only creates tables that don't exist *by name* yet — it
@@ -127,6 +191,15 @@ def _migrate_ingredient_grading_columns() -> None:
             connection.exec_driver_sql(
                 f"ALTER TABLE ingredients ADD COLUMN {column_name} {column_ddl}"
             )
+            existing_columns.add(column_name)
+
+        # Phase 24 — one-time backward-compat backfill for the
+        # recommended_uses -> scientific_conclusions rename. Runs against
+        # `existing_columns` as updated by the loop just above, so this
+        # also covers a database that had `scientific_conclusions` ADDed
+        # for the very first time in this same call.
+        _backfill_scientific_conclusions_from_legacy_column(connection, existing_columns)
+
         connection.commit()
 
 
@@ -204,16 +277,26 @@ _VERIFIED_RESOURCE_COLUMNS: tuple[tuple[str, str], ...] = (
     ("extracted_data", "JSON"),
     # Phase 19 — app/services/resource_extractor.py::extract_claims_from_resource.
     ("extracted_conclusions", "JSON"),
+    # Phase 20 — app/services/resource_extractor.py::extract_claims_from_resource.
+    # Plain TEXT (not JSON) — one short sentence, never a structured value.
+    ("extraction_failure_reason", "TEXT"),
+    # Phase 21 — app/services/resource_parser.py::parse_resource_conclusions
+    # dispatch key; app/services/resource_fetcher.py sets it at fetch
+    # time. Plain TEXT — one short config-id string (e.g.
+    # "pubchem_pug_rest"), never a structured value.
+    ("api_id", "TEXT"),
+    # Phase 22 — app/services/resource_aligner.py::align_resource_conclusions_for_ingredient.
+    ("aligned_conclusions", "JSON"),
 )
 
 
 def _migrate_verified_resource_columns() -> None:
     """Additive, idempotent migration: adds whichever of `grade`,
-    `score`, `reasoning_summary`, `extracted_data`, `extracted_conclusions`
-    are missing from an existing `verified_resources` table — same
-    reasoning and pattern as
-    _migrate_research_paper_columns() above. Safe to run on every
-    startup; a no-op once every column exists, including on a
+    `score`, `reasoning_summary`, `extracted_data`, `extracted_conclusions`,
+    `extraction_failure_reason`, `api_id`, `aligned_conclusions` are
+    missing from an existing `verified_resources` table — same reasoning
+    and pattern as _migrate_research_paper_columns() above. Safe to run
+    on every startup; a no-op once every column exists, including on a
     freshly-created database where create_all() already included all of
     them.
     """

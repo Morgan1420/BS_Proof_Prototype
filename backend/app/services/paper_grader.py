@@ -174,9 +174,10 @@ class _RubricEvaluationSchema(BaseModel):
     journal_score: int = Field(
         description=(
             "Points awarded for journal reputation, in the range -5 to "
-            "15 (negative values penalize a predatory publisher, vanity "
-            "press, unvetted pay-to-publish outlet, or fake peer review; "
-            "see the rubric's journal_reputation category)."
+            "10 (v1.6 — previously -5 to 15; negative values penalize a "
+            "predatory publisher, vanity press, unvetted pay-to-publish "
+            "outlet, or fake peer review; see the rubric's "
+            "journal_reputation category)."
         )
     )
     sample_info: str = Field(description="Description of the sample: human/animal/cell, size, diversity.")
@@ -187,7 +188,10 @@ class _RubricEvaluationSchema(BaseModel):
             "Points awarded for funding & bias, in the range -15 to 5 "
             "(defaults to a neutral +2 when funding isn't mentioned at "
             "all; negative values penalize only actively-indicated "
-            "industry-biased/suspicious funding; see the rubric's "
+            "industry-biased/suspicious funding; v1.6 — award the full "
+            "+5 whenever the abstract/metadata reports a validated low "
+            "risk-of-bias assessment via a formal metric such as AMSTAR "
+            "2 or ROB2, regardless of funding source; see the rubric's "
             "funding_bias category)."
         )
     )
@@ -344,18 +348,28 @@ def _build_prompt(
         "negative value (down to -15) only when the abstract/metadata "
         "actively indicates industry-biased, undisclosed-conflict, or "
         "suspicious commercial funding — never as a penalty for silence "
-        "alone.\n\n"
-        "`journal_score` ranges from -5 to 15. Award a positive value "
-        "(up to +15) scaled to the journal's reputation/rigor; when the "
+        "alone. Separately, and regardless of the funding-source signal "
+        "above: whenever the abstract/metadata explicitly reports a "
+        "validated low risk-of-bias assessment from a formal, recognized "
+        "metric — e.g. \"AMSTAR 2: low risk of bias\" for a systematic "
+        "review, or \"ROB2: low risk\" for an RCT — award the full "
+        "maximum **+5** for `funding_score`, even if funding is "
+        "industry-affiliated or unmentioned; a formally validated "
+        "low-bias assessment is itself the strongest available signal "
+        "against commercial/methodological bias, and should override the "
+        "funding-source-based scoring above rather than being averaged "
+        "with it.\n\n"
+        "`journal_score` ranges from -5 to 10. Award a positive value "
+        "(up to +10) scaled to the journal's reputation/rigor; when the "
         "publisher simply isn't identified in the metadata, score near "
-        "the neutral 0-1 tier (not the negative range — an unidentified "
+        "the neutral 0 tier (not the negative range — an unidentified "
         "publisher is not the same as a known-bad one); and award a "
         "negative value (down to -5) only when the abstract/metadata "
         "actively identifies a predatory publisher, vanity press, "
         "unvetted pay-to-publish outlet, or fake/absent peer review — "
         "never merely for the publisher being unnamed.\n\n"
         "`study_type_score` must be a non-negative integer between 0 and "
-        "40. `sample_score` must be a non-negative integer between 0 and "
+        "45. `sample_score` must be a non-negative integer between 0 and "
         "40.\n\n"
         "Also extract `extracted_conclusions`: 2 to 4 short, factual "
         "findings this paper's title/abstract actually states about the "
@@ -396,9 +410,12 @@ def grade_paper(paper_metadata: Dict[str, Optional[str]], ingredient_name: str) 
         philosophy as every category-score clamp below. Every
         category score is clamped to that category's `(min_score,
         max_score)` range — plain `0` to `max_score` for `study_type`
-        (`0`-`40` as of v1.5) / `sample_methodology`, but `funding_bias`
-        (`-15` to `5`) and `journal_reputation` (`-5` to `15` as of
-        v1.5, previously `-5` to `20`) are both penalty scales rather
+        (`0`-`45` as of v1.6, previously `0`-`40` in v1.5) /
+        `sample_methodology` (unchanged, `0`-`40`), but `funding_bias`
+        (`-15` to `5` — v1.6 also awards the full `+5` for a validated
+        low risk-of-bias metric, see `_build_prompt`) and
+        `journal_reputation` (`-5` to `10` as of v1.6, `-5` to `15` in
+        v1.5, `-5` to `20` before that) are both penalty scales rather
         than a plain 0-to-max score — in case Gemini's raw output
         overshoots either bound. `total_score` is the sum of
         those clamped category scores (funding's and/or journal's
@@ -458,19 +475,23 @@ def grade_paper(paper_metadata: Dict[str, Optional[str]], ingredient_name: str) 
     # v1.2) penalty for industry-biased/suspicious funding; the prompt
     # also defaults this one to a neutral +2 — not 0 — when funding
     # simply isn't mentioned, so undisclosed funding no longer drags an
-    # otherwise strong paper down — see _build_prompt above), and
-    # journal_reputation ranges -5 to 15 as of v1.5 (previously -5 to 20,
-    # with the 5-point difference moved to study_type's max, 35 -> 40 —
-    # penalty for an actively identified predatory/blacklisted publisher;
-    # an unidentified one still scores near-neutral 0-1, not negative —
-    # see _build_prompt).
+    # otherwise strong paper down; v1.6 additionally instructs Gemini to
+    # award this category's full +5 whenever a validated low
+    # risk-of-bias metric (AMSTAR 2/ROB2) is reported — see
+    # _build_prompt above), and journal_reputation ranges -5 to 10 as of
+    # v1.6 (previously -5 to 15 in v1.5, -5 to 20 before that — v1.6
+    # moved this category's remaining 5-point difference onto
+    # study_type's max, 40 -> 45, per the task's category-weight
+    # rebalance — penalty for an actively identified predatory/
+    # blacklisted publisher; an unidentified one still scores near-
+    # neutral 0, not negative — see _build_prompt).
     category_bounds = {
         category["id"]: (category.get("min_score", 0), category["max_score"])
         for category in rubric.get("categories", [])
     }
 
-    study_min, study_max = category_bounds.get("study_type", (0, 40))
-    journal_min, journal_max = category_bounds.get("journal_reputation", (-5, 15))
+    study_min, study_max = category_bounds.get("study_type", (0, 45))
+    journal_min, journal_max = category_bounds.get("journal_reputation", (-5, 10))
     sample_min, sample_max = category_bounds.get("sample_methodology", (0, 40))
     funding_min, funding_max = category_bounds.get("funding_bias", (-15, 5))
 

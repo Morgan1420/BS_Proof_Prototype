@@ -208,6 +208,12 @@ def get_ingredient_resources(
             # Phase 19 — resource.extracted_conclusions is already a plain
             # list[str] (or None); passes straight through.
             extracted_conclusions=resource.extracted_conclusions,
+            # Phase 20 — same straight pass-through.
+            extraction_failure_reason=resource.extraction_failure_reason,
+            # Phase 22 — resource.aligned_conclusions is a plain
+            # list[dict] (or None); Pydantic validates each dict into an
+            # AlignedConclusionResponse on the way out.
+            aligned_conclusions=resource.aligned_conclusions,
         )
         for resource in session.exec(stmt).all()
     ]
@@ -234,9 +240,19 @@ def get_ingredient_detail(
         is_graded=ingredient.is_graded,
         grade_badge_text=ingredient.grade_badge_text,
         summary_description=ingredient.summary_description,
+        # Phase 23, renamed Phase 24 — ingredient.scientific_conclusions is
+        # a plain list[dict] (or None); Pydantic validates each dict into a
+        # ScientificConclusionResponse on the way out, same pass-through
+        # convention as VerifiedResourceResponse.aligned_conclusions above.
+        scientific_conclusions=ingredient.scientific_conclusions or [],
         papers=get_ingredient_papers(session, ingredient.id),
         conclusions=get_ingredient_conclusions(session, ingredient.id),
         verified_resources=get_ingredient_resources(session, ingredient.id),
+        # Phase 33 — ingredient.general_info is already a plain dict (or
+        # None); Pydantic validates it into a GeneralInfoResponse on the
+        # way out, same pass-through convention as scientific_conclusions
+        # above.
+        general_info=ingredient.general_info,
     )
 
 
@@ -342,6 +358,14 @@ def search(
                     recommended_daily_dosage=ingredient.recommended_daily_dosage,
                     scientific_data=ingredient.scientific_data,
                     product_count=ingredient.product_count,
+                    # Phase 38 — surface the real, persisted grading status
+                    # here too (previously only get_ingredient_detail did),
+                    # so a browse/search result reflects the same DB state
+                    # as GET /api/v1/ingredients/{id} instead of silently
+                    # looking "ungraded" until the card is individually
+                    # expanded.
+                    is_graded=ingredient.is_graded,
+                    grade_badge_text=ingredient.grade_badge_text,
                 )
             )
 

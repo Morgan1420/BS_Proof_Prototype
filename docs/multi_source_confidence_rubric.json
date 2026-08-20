@@ -1,40 +1,13 @@
 {
   "version": "2.0",
   "description": "Multi-source conclusion confidence rubric for the Phase 5 conclusion-synthesis pipeline (app/services/conclusion_grader.py). Synthesizes and scores individual claims across both peer-reviewed research papers and official verified online resources (NIH, EFSA, USDA, Health Canada, DailyMed). Four weighted categories sum to a maximum of 100 points, mapped to letter grades A-E.",
-
   "grade_bands": [
-    { 
-      "grade": "A", 
-      "min_score": 85, 
-      "max_score": 100, 
-      "label": "Very high confidence — strong clinical trial consensus fully backed by official health/regulatory agency authorization" 
-    },
-    { 
-      "grade": "B", 
-      "min_score": 70, 
-      "max_score": 84, 
-      "label": "High confidence — solid empirical evidence or official monograph authorization with minor research gaps" 
-    },
-    { 
-      "grade": "C", 
-      "min_score": 50, 
-      "max_score": 69, 
-      "label": "Moderate confidence — plausible but limited paper evidence; recognized ingredient without explicit health claim authorization" 
-    },
-    { 
-      "grade": "D", 
-      "min_score": 30, 
-      "max_score": 49, 
-      "label": "Low confidence — weak study design, inconsistent data, or flagged by authorities for insufficient efficacy evidence" 
-    },
-    { 
-      "grade": "E", 
-      "min_score": 0, 
-      "max_score": 29, 
-      "label": "Very low confidence — minimal evidence, contradicted by studies, or flagged with toxicity/safety warnings by official agencies" 
-    }
+    { "grade": "A", "min_score": 85, "max_score": 100, "label": "Very high confidence — strong clinical trial consensus fully backed by official health/regulatory agency authorization" },
+    { "grade": "B", "min_score": 70, "max_score": 84, "label": "High confidence — solid empirical evidence or official monograph authorization with minor research gaps" },
+    { "grade": "C", "min_score": 50, "max_score": 69, "label": "Moderate confidence — plausible but limited paper evidence; recognized ingredient without explicit health claim authorization" },
+    { "grade": "D", "min_score": 30, "max_score": 49, "label": "Low confidence — weak study design, inconsistent data, or flagged by authorities for insufficient efficacy evidence" },
+    { "grade": "E", "min_score": 0, "max_score": 29, "label": "Very low confidence — minimal evidence, contradicted by studies, or flagged with toxicity/safety warnings by official agencies" }
   ],
-
   "categories": [
     {
       "id": "paper_evidence_quality",
